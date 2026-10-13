@@ -285,8 +285,10 @@ class TransportTests(unittest.TestCase):
             def check(mocks):
                 manifest = {'version': release['tag_name'], 'parts': []}
                 with patch.object(manage, 'download', return_value=Path(directory) / 'manifest.json') as download, \
-                        patch.object(manage.setup, 'read_manifest', return_value=(manifest, Path(directory))):
+                        patch.object(manage.setup, 'read_install_manifest',
+                                     return_value=(manifest, Path(directory))) as reader:
                     manage.fetch_release(release, directory)
+                reader.assert_called_once_with(str(Path(directory) / 'manifest.json'))
                 self.assertEqual(download.call_args.args[3], checksum)
                 args = mocks[3].call_args.args[0]
                 self.assertEqual(args[args.index('--url') + 1], 'https://example.test/SHA256SUMS')

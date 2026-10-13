@@ -15,7 +15,7 @@ import common
 import manage
 import setup
 import package_release
-from phone_profile import ARCHIVES, LEGACY_PINS
+from phone_profile import ARCHIVES, LEGACY_PINS, profile
 from patch_flutter import PROFILES
 import test_manager
 
@@ -23,8 +23,10 @@ R2 = 'v0.2.1-a17-hyperos4-hongkong-r2'
 R3 = 'v0.2.2-a17-hyperos4-hongkong-r3'
 R4 = 'v0.2.3-a17-hyperos4-hongkong-r4'
 R5 = 'v0.2.4-a17-hyperos4-hongkong-r5'
+R6 = 'v0.2.5-a17-hyperos4-hongkong-r6'
 OLD = 'OS4.0.17.0.XFRCNXM'
 NEW = '4.0.18.0.XFRCNXM'
+LATEST = '4.0.24.0.XFRCNXM'
 
 
 def r3_manifest(value):
@@ -37,6 +39,115 @@ def r3_manifest(value):
 
 
 class PhoneUpgradeTests(unittest.TestCase):
+    def test_registered_new_source_requires_the_full_forward_manifest_contract(self):
+        from apply_boot_service_fix import receipt
+        helper = test_manager.ManagerTests()
+        with tempfile.TemporaryDirectory() as directory:
+            path, original = helper.bundle(Path(directory) / 'bundle')
+            previous = r3_manifest(original)
+            target = copy.deepcopy(previous)
+            target.update(version=R6, hyperos=LATEST)
+            target['build'].update(hyperos=LATEST, archive_sha256=ARCHIVES[LATEST],
+                                   boot_service_fix=receipt())
+            target['compatibility'].pop('upgrade_from')
+            target['compatibility'].update(minimum_installer='1.2.3',
+                                           upgrade_policy=manage.FORWARD_UPGRADE_POLICY)
+            path.write_text(json.dumps(target))
+            parsed, _ = setup.read_manifest(str(path))
+            from patch_boot_services import image_receipts
+            for version in (NEW, LATEST):
+                for recipe in image_receipts():
+                    value = copy.deepcopy(target)
+                    value.update(version=R5 if version == NEW else R6, hyperos=version)
+                    value['build'].update(hyperos=version, archive_sha256=ARCHIVES[version],
+                                          boot_service_fix=recipe)
+                    path.write_text(json.dumps(value))
+                    with self.subTest(source=version, recipe=recipe['targets']['services']['before']):
+                        self.assertEqual(setup.read_manifest(str(path))[0], value)
+                    if version == NEW and recipe != image_receipts()[0]:
+                        value['compatibility']['minimum_installer'] = '1.2.2'
+                        path.write_text(json.dumps(value))
+                        with self.assertRaises(RuntimeError):
+                            setup.read_manifest(str(path))
+            for version in ('v0.2.0-a17-hyperos4-hongkong-r1', R2, R3, R4, R5):
+                source = copy.deepcopy(original if version in (
+                    'v0.2.0-a17-hyperos4-hongkong-r1', R2) else previous)
+                source['version'] = version
+                with self.subTest(source=version):
+                    manage.compatible(source, parsed)
+            for mutate in ('old-format', 'wrong-family', 'wrong-archive', 'missing-recipe',
+                           'bad-recipe', 'bad-recipe-type', 'partial-recipe',
+                           'old-installer', 'previous-installer', 'missing-runtime', 'missing-preflight',
+                           'unknown-policy', 'unregistered-source', 'invalid-tag'):
+                bad = copy.deepcopy(target)
+                if mutate == 'old-format':
+                    bad['format'] = 2
+                elif mutate == 'wrong-family':
+                    bad['compatibility']['userdata_family'] = setup.PAD_FAMILY
+                elif mutate == 'wrong-archive':
+                    bad['build']['archive_sha256'] = ARCHIVES[NEW]
+                elif mutate == 'missing-recipe':
+                    del bad['build']['boot_service_fix']
+                elif mutate == 'bad-recipe':
+                    bad['build']['boot_service_fix']['probe_sha256'] = 'f' * 64
+                elif mutate == 'bad-recipe-type':
+                    bad['build']['boot_service_fix']['schema'] = True
+                elif mutate == 'partial-recipe':
+                    del bad['build']['boot_service_fix']['targets']['services']
+                elif mutate == 'old-installer':
+                    bad['compatibility']['minimum_installer'] = '1.2.1'
+                elif mutate == 'previous-installer':
+                    bad['compatibility']['minimum_installer'] = '1.2.2'
+                elif mutate == 'missing-runtime':
+                    bad['compatibility']['runtime_in_bundle'] = False
+                elif mutate == 'missing-preflight':
+                    del bad['compatibility']['module_upgrade_preflight']
+                elif mutate == 'unknown-policy':
+                    bad['compatibility']['upgrade_policy'] = 'unchecked-ota'
+                elif mutate == 'unregistered-source':
+                    bad['hyperos'] = bad['build']['hyperos'] = '4.0.999.0.XFRCNXM'
+                else:
+                    bad['version'] = 'v0.2.5-custom'
+                path.write_text(json.dumps(bad))
+                with self.subTest(mutate=mutate), self.assertRaises(RuntimeError):
+                    setup.read_manifest(str(path))
+            path.write_text(json.dumps(previous))
+            self.assertEqual(setup.read_manifest(str(path))[0], previous)
+            future_revision = copy.deepcopy(target)
+            future_revision['version'] = 'v0.9.9-a17-hyperos4-hongkong-r999'
+            path.write_text(json.dumps(future_revision))
+            manage.compatible(parsed, setup.read_manifest(str(path))[0])
+
+    def test_new_source_release_metadata_preserves_recipe_and_selects_r6(self):
+        from patch_boot_services import image_receipts
+        recipe = image_receipts()[-1]
+        build = {'source': common.OS4_SOURCE, 'hyperos': LATEST, 'android_api': 37,
+                 'archive_sha256': ARCHIVES[LATEST], 'adb_authentication': True,
+                 'flutter_render_fix': 6, 'native_quickstep_identity': True,
+                 'preinstalled_apps': {'apps': ['fixture']}, 'avd_defaults': {'fixture': True},
+                 'boot_service_fix': recipe, 'rear_display': {'source': LATEST},
+                 'lockscreen_video_fix': {'audited': True}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'local').mkdir()
+            file = root / 'local/build.json'
+            file.write_text(json.dumps(build))
+            metadata = package_release.release_metadata(root, 'os4-official')
+            self.assertEqual(metadata['build']['boot_service_fix'], recipe)
+            self.assertEqual(metadata['build']['rear_display'], build['rear_display'])
+            self.assertEqual(metadata['build']['lockscreen_video_fix'], build['lockscreen_video_fix'])
+            self.assertEqual(metadata['compatibility']['upgrade_policy'], manage.FORWARD_UPGRADE_POLICY)
+            from bundle_runtime import PROTOCOL_MINIMUM
+            self.assertEqual(metadata['compatibility']['minimum_installer'], PROTOCOL_MINIMUM)
+            self.assertNotIn('upgrade_from', metadata['compatibility'])
+            self.assertEqual(package_release.default_release_version('os4-official', metadata), R6)
+            del build['boot_service_fix']
+            file.write_text(json.dumps(build))
+            with self.assertRaisesRegex(RuntimeError, 'boot-service repairs'):
+                package_release.release_metadata(root, 'os4-official')
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported official'):
+                package_release.default_release_version('os4-official', {'hyperos': '4.0.999.0.XFRCNXM'})
+
     def test_forward_policy_accepts_supported_old_and_future_revisions(self):
         from apply_boot_service_fix import receipt
         helper = test_manager.ManagerTests()
@@ -106,7 +217,8 @@ class PhoneUpgradeTests(unittest.TestCase):
             (root / 'local/build.json').write_text(json.dumps(build))
             metadata = package_release.release_metadata(root, 'os4-official')
             self.assertEqual(metadata['build']['boot_service_fix'], receipt())
-            self.assertEqual(metadata['compatibility']['minimum_installer'], '1.2.2')
+            from bundle_runtime import PROTOCOL_MINIMUM
+            self.assertEqual(metadata['compatibility']['minimum_installer'], PROTOCOL_MINIMUM)
             self.assertNotIn('upgrade_from', metadata['compatibility'])
             self.assertEqual(metadata['compatibility']['upgrade_policy'], manage.FORWARD_UPGRADE_POLICY)
             self.assertEqual(package_release.default_release_version('os4-official', metadata), R5)
@@ -203,7 +315,8 @@ class PhoneUpgradeTests(unittest.TestCase):
             metadata = package_release.release_metadata(root, 'os4-official')
             self.assertEqual(metadata['hyperos'], NEW)
             self.assertEqual(metadata['compatibility'], {
-                'minimum_installer': '1.2.2', 'userdata_family': 'os4-hongkong-api37-ranchu-4k',
+                'minimum_installer': '1.2.3', 'install_protocol': 'verified-bundle-runtime-v1',
+                'userdata_family': 'os4-hongkong-api37-ranchu-4k',
                 'upgrade_from': [R2], 'runtime_in_bundle': True,
                 'module_upgrade_preflight': manage.MODULE_UPGRADE_PREFLIGHT})
             source.write_text(json.dumps({**build, 'archive_sha256': 'f' * 64}))
@@ -398,7 +511,8 @@ class PhoneUpgradeTests(unittest.TestCase):
                 self.assertTrue((root / 'local/upgrade-pending.json').is_file())
                 (root / 'avd/Test_temp.avd/userdata-qemu.img').write_bytes(b'staging changed data')
                 raise RuntimeError('injected staging failure')
-            with patch('phone_profile.profile_from_build', return_value={'archive_sha256': ARCHIVES[NEW]}), \
+            with patch('phone_profile.profile_from_build', side_effect=lambda build:
+                       profile(build['hyperos'].removeprefix('OS'))), \
                     patch('userdata_resize.check_dependencies', return_value={}), \
                     patch.object(manage, 'prepare_module_upgrade', side_effect=fail_stage) as stage:
                 with self.assertRaisesRegex(RuntimeError, 'injected staging'):
@@ -419,7 +533,7 @@ class PhoneUpgradeTests(unittest.TestCase):
             root = folder / 'instance'
             before = helper.legacy(root, original)
             with patch.object(setup, 'ROOT', root), \
-                    patch('phone_profile.profile_from_build', return_value={'archive_sha256': ARCHIVES[NEW]}):
+                    patch('phone_profile.profile_from_build', return_value=profile(NEW)):
                 with self.assertRaisesRegex(RuntimeError, 'Installer 1.2.0 Upgrade'):
                     setup.install_bundle(str(path))
             self.assertEqual((root / 'images/system.img').read_bytes(), b'old firmware')
@@ -476,7 +590,7 @@ class PhoneUpgradeTests(unittest.TestCase):
                 value = r3_manifest(original)
                 value['compatibility'][field] = invalid
                 path.write_text(json.dumps(value))
-                with patch('phone_profile.profile_from_build', return_value={'archive_sha256': ARCHIVES[NEW]}):
+                with patch('phone_profile.profile_from_build', return_value=profile(NEW)):
                     with self.assertRaisesRegex(RuntimeError, 'r3 upgrade'):
                         setup.read_manifest(str(path))
 

@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -24,7 +25,7 @@ import setup
 from https_transport import secure_urlopen
 from common import REPO_ROOT, avd_home, host_check, port_free, sdk_path, sha256
 
-VERSION = '1.2.2'
+VERSION = '1.2.3'
 MODULE_UPGRADE_PREFLIGHT = 'phone-owned-module-guards-v1'
 FORWARD_UPGRADE_POLICY = 'same-family-forward-v1'
 REPOSITORY = 'NEORUAA/HyperOS-AVD'
@@ -235,7 +236,7 @@ def fetch_release(release, cache):
             raise RuntimeError('Ambiguous manifest checksum.')
         checksum = matches[0]
     manifest_path = download(entry['browser_download_url'], cache / 'manifest.json', entry['size'], checksum)
-    manifest, _ = setup.read_manifest(str(manifest_path))
+    manifest, _ = setup.read_install_manifest(str(manifest_path))
     if manifest['version'] != release['tag_name']:
         # OS3 r1 used v0.1.0 as its bundle version; only that known legacy mapping is accepted.
         if (manifest['version'], release['tag_name']) != ('v0.1.0', 'v0.1.0-a16-hyperos3-fuxi-r1'):
@@ -537,7 +538,7 @@ def family(manifest):
     return None
 
 
-def compatible(old, new):
+def compatible(old, new, *, firmware_specific=True):
     if not family(old) or family(old) != family(new):
         raise RuntimeError('Incompatible userdata family. Install a separate AVD for this image.')
     for field in ('images/encryptionkey.img',):
@@ -555,11 +556,11 @@ def compatible(old, new):
     if policy:
         if policy != FORWARD_UPGRADE_POLICY or new.get('variant') != 'os4-official':
             raise RuntimeError('Unknown release upgrade policy; update the installer.')
-        from phone_profile import profile_from_build
-        # Revision numbers do not identify firmware or userdata compatibility.
-        # Both source and destination must have supported, pinned OTA profiles.
-        profile_from_build(old.get('build', {}))
-        profile_from_build(new.get('build', {}))
+        if firmware_specific:
+            from phone_profile import profile_from_build
+            # Firmware authentication belongs to the verified target runtime.
+            profile_from_build(old.get('build', {}))
+            profile_from_build(new.get('build', {}))
     if migration:
         if migration != MODULE_UPGRADE_PREFLIGHT:
             raise RuntimeError('Unknown release module migration; update the installer.')
@@ -643,7 +644,29 @@ def validate_owned_module(module_id, prop, manifest, system_prop='', has_system=
         raise RuntimeError('Unknown owned module schema: ' + module_id)
 
 
-def guarded_modules(config, directory, incremental, target_hyperos=None):
+def audit_legacy_startup(config, module):
+    """Reject unguarded early controls when skipping frozen source generations."""
+    script = 'set -e\n'
+    for directory in (Path(module), *Path(module).parents):
+        path = shlex.quote(str(directory))
+        script += f'test -d {path}\ntest ! -L {path}\n'
+    for name in ('post-mount.sh', 'boot-completed.sh', 'sepolicy.rule', 'zygisk', 'system',
+                 'initrc', 'uninstall.sh',
+                 'post-fs-data.sh.next', 'service.sh.next'):
+        path = shlex.quote(module + '/' + name)
+        script += f'test ! -e {path}\ntest ! -L {path}\n'
+    for name in ('module.prop', 'manifest.json', 'post-fs-data.sh', 'service.sh', 'system.prop'):
+        path = shlex.quote(module + '/' + name)
+        script += (f'test ! -L {path}\n'
+                   f'if [ -e {path} ]; then test -f {path}; test "$(stat -c %h {path})" = 1; fi\n')
+    try:
+        common.adb(config, 'shell', 'su -W -c ' + shlex.quote(script),
+                   capture_output=True, text=True, check=True, timeout=30)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError('Unknown or aliased historical startup controls are preserved: ' + module) from error
+
+
+def guarded_modules(config, directory, incremental, target_hyperos=None, *, strict=False):
     """Gate stale early mounts without removing manifests, serials or flags."""
     def guest(command):
         return common.adb(config, 'shell', 'su -W -c ' + shlex.quote('set -e\n' + command),
@@ -653,14 +676,16 @@ def guarded_modules(config, directory, incremental, target_hyperos=None):
         module = '/data/adb/modules/' + module_id
         if guest(f'if [ -d {module} ]; then echo yes; fi') != 'yes':
             continue
+        if strict:
+            audit_legacy_startup(config, module)
         prop = guest(f'cat {module}/module.prop')
         saved = json.loads(guest(f'cat {module}/manifest.json'))
         auto = guest(f'if [ -e {module}/system ]; then echo yes; fi') == 'yes'
         properties = guest(f'if [ -f {module}/system.prop ]; then cat {module}/system.prop; fi')
         validate_owned_module(module_id, prop, saved, properties, auto)
         if (module_id == 'hyperos_avd_xiaomi_camera' and saved['revision'] == 1
-                and target_hyperos == '4.0.18.0.XFRCNXM'):
-            raise RuntimeError('XiaomiCamera revision 1 cannot migrate to OS4.0.18.0. '
+                and target_hyperos not in (None, '4.0.17.0.XFRCNXM')):
+            raise RuntimeError('XiaomiCamera revision 1 cannot migrate to OS' + target_hyperos + '. '
                                'Recover or start the existing r2 firmware and update its camera '
                                'bridge to revision 2 before retrying Upgrade. '
                                'Firmware and module disable/remove flags were not changed.')
@@ -718,9 +743,175 @@ def prepare_module_upgrade(root, old, new, name, port, sdk, folder):
     if (old.get('variant') != 'os4-official' or profile['hyperos'] != '4.0.17.0.XFRCNXM'
             or new.get('hyperos') != '4.0.18.0.XFRCNXM'):
         raise RuntimeError('Unsupported firmware pair for owned module migration.')
+    _stage_module_upgrade(root, old, new, name, port, sdk, folder, profile, legacy=True)
+
+
+def firmware_upgrade_profiles(old, new):
+    """Authenticate a forward source change independently of release revisions."""
+    from phone_profile import profile_from_build
+    if any(value.get('variant') != 'os4-official' for value in (old, new)):
+        raise RuntimeError('Unsupported firmware family for owned module migration.')
+    selected = tuple(profile_from_build(value.get('build', {})) for value in (old, new))
+    if any(value.get('hyperos') != profile['hyperos'] for value, profile in zip((old, new), selected)):
+        raise RuntimeError('Firmware manifest and source profile disagree.')
+    order = lambda profile: tuple(int(part) for part in profile['hyperos'].split('.')[:4])
+    if order(selected[0]) >= order(selected[1]):
+        raise RuntimeError('Unsupported firmware pair: only registered forward sources may migrate.')
+    return selected
+
+
+def prepare_firmware_upgrade(root, old, new, name, port, sdk, folder):
+    """Retain the frozen bootstrap; audit adaptive owners for later source changes."""
+    before, after = firmware_upgrade_profiles(old, new)
+    if (before['hyperos'], after['hyperos']) == ('4.0.17.0.XFRCNXM', '4.0.18.0.XFRCNXM'):
+        return prepare_module_upgrade(root, old, new, name, port, sdk, folder)
+    return _stage_module_upgrade(root, old, new, name, port, sdk, folder, before, legacy=False)
+
+
+def audit_module_inventory(config, directory, manifest):
+    """Reject added early entry points while retaining mutable module choices."""
+    from apply_flutter_fix import root as guest
+    allowed = {name.split('/')[0] for name in manifest['files_sha256']}
+    allowed |= {'manifest.json', 'SHA256SUMS', 'disable', 'remove', 'cache', 'state',
+                'features.disabled', 'runtime.log', 'runtime.log.next'}
+    if any(not re.fullmatch('[A-Za-z0-9_.-]+', name) for name in allowed):
+        raise RuntimeError('Invalid firmware staging module inventory.')
+    # These exact leases are produced by an already authenticated Core runtime,
+    # not arbitrary added module controls. Apps has no corresponding root lease.
+    core = manifest.get('id') == 'hyperos_avd_native_compat'
+    script = f'''directory={shlex.quote(directory)}
+inventory_fail() {{ printf '%s\\n' "Unreviewed module content preserved: $1" >&2; exit 1; }}
+inventory_regular() {{
+    [ ! -L "$1" ] && [ -f "$1" ] &&
+        [ "$(stat -c %h "$1")" = 1 ] && [ "$(stat -c %u:%g "$1")" = 0:0 ] || inventory_fail "$1 (type or ownership)"
+}}
+'''
+    if core:
+        script += '''inventory_core_lock() {
+    local path=$1 field value
+    case "${path##*/}" in
+        service.lock.guard)
+            inventory_regular "$path"
+            [ "$(stat -c %s "$path")" = 0 ] || inventory_fail "$path (nonempty guard)"
+            return ;;
+    esac
+    [ ! -L "$path" ] && [ -d "$path" ] &&
+        [ "$(stat -c %u:%g "$path")" = 0:0 ] || inventory_fail "$path (type or ownership)"
+    for field in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+        [ -e "$field" ] || [ -L "$field" ] || continue
+        case "${field##*/}" in pid|boot) ;; *) inventory_fail "$field (unknown lease field)" ;; esac
+        inventory_regular "$field"
+        value=$(cat "$field")
+        case "${field##*/}" in
+            pid)
+                case "$value" in ''|*[!0-9]*) inventory_fail "$field (invalid PID)" ;; esac
+                [ "${#value}" -le 10 ] && [ "$value" -gt 0 ] &&
+                    [ "$(stat -c %s "$field")" = "$((${#value} + 1))" ] || inventory_fail "$field (invalid PID)" ;;
+            boot)
+                printf '%s\\n' "$value" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' &&
+                    [ "$(stat -c %s "$field")" = 37 ] || inventory_fail "$field (invalid boot identity)" ;;
+        esac
+    done
+}
+'''
+    leases = 'service.lock|service.lock.guard) inventory_core_lock "$entry" ;; ' if core else ''
+    script += f'''for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    case "${{entry##*/}}" in {leases}{'|'.join(sorted(allowed))}) ;; *) inventory_fail "$entry (unknown top-level entry)" ;; esac
+done'''
+    guest(config, script)
+
+
+def audit_firmware_modules(config, old, workspace, *, guarded_ids=()):
+    """Authenticate existing controls without invalidating their migration receipts."""
+    from apply_flutter_fix import root as guest
+    import apply_native_compat as core
+    import apply_app_compat as apps
+    import app_compat_migration as legacy_apps
+    from app_compat_catalog import catalog_files, previous_manifests
+    from core_legacy import ROLES, inspect_legacy
+    from native_module_history import checksum_for
+    from package_native_module import module_files
+
+    # A pending KSU owner can activate before the new host context is supplied.
+    # Keep it intact and reject the switch instead of adopting or cancelling it.
+    identifiers = sorted(set(ROLES) | set(legacy_apps.MODULES) | {core.MODULE_ID, apps.MODULE_ID})
+    for identifier in identifiers:
+        pending = '/data/adb/modules_update/' + identifier
+        if guest(config, f'if [ -e {pending} ] || [ -L {pending} ]; then echo pending; fi'):
+            raise RuntimeError('Firmware migration preserves a pending KernelSU owner: ' + identifier)
+
+    receipt = []
+    native = core._module(config, core.MODULE)
+    if native is not None:
+        if not native['flags']:
+            saved = core._manifest(config, native)
+            current = module_files()
+            expected = json.loads(current['manifest.json'])
+            checksum = (hashlib.sha256(current['SHA256SUMS']).hexdigest()
+                        if saved == expected else checksum_for(saved))
+            if checksum is None:
+                raise RuntimeError('Unknown Core controls are preserved; firmware was not switched.')
+            core._verify_assets(config, core.MODULE, checksum)
+            audit_module_inventory(config, core.MODULE, saved)
+        receipt.append({'id': core.MODULE_ID, 'flags': native['flags'], 'mode': 'content-adaptive'})
+
+    catalog = apps.recipes()
+    current = json.loads(catalog_files(catalog)['manifest.json'])
+    reviewed = [current, *previous_manifests()]
+    app = apps._inspect(config, '/data/adb/modules/' + apps.MODULE_ID, apps.MODULE_ID,
+                        allowed_revisions={str(value['revision']) for value in reviewed})
+    if app is not None:
+        if not app['flags']:
+            for expected in reviewed:
+                try:
+                    apps._saved(config, app, expected)
+                except apps.CatalogMismatch:
+                    continue
+                audit_module_inventory(config, app['directory'], expected)
+                break
+            else:
+                raise RuntimeError('Unknown Apps controls are preserved; firmware was not switched.')
+        receipt.append({'id': apps.MODULE_ID, 'flags': app['flags'], 'mode': 'content-adaptive'})
+
+    # Exact frozen legacy owners already gate by source firmware or native/APK
+    # content. Leave their hooks unchanged so Core/Apps can import their choices
+    # and retire the complete directories after normal activation.
+    build = old.get('build', {})
+    context = {'boot_services': build.get('boot_service_fix'),
+               'rear': build.get('rear_display_wake_fix')}
+    for item in inspect_legacy(guest, config, context):
+        if item['id'] in guarded_ids:
+            continue
+        if item['status'] != 'audited' and item['reason'] != 'legacy-lifecycle-choice':
+            raise RuntimeError('Unknown legacy Core owner is preserved: ' + item['id'])
+        receipt.append({'id': item['id'], 'mode': item['status'], 'reason': item['reason']})
+    planned = legacy_apps.plan(config, catalog=catalog, workspace=workspace)
+    for item in planned['preserved']:
+        if item['module'] in guarded_ids:
+            continue
+        if item['reason'] in ('pending', 'unknown-or-custom'):
+            raise RuntimeError('Unknown legacy Apps owner is preserved: ' + item['module'])
+    receipt += [{'id': item['id'], 'flags': item['flags'], 'mode': 'audited-legacy'}
+                for item in planned['modules'] if item['id'] not in guarded_ids]
+    receipt += [{'id': item['module'], 'flags': item['reason'], 'mode': 'preserved'}
+                for item in planned['preserved'] if item['module'] not in guarded_ids]
+    return receipt
+
+
+def _stage_module_upgrade(root, old, new, name, port, sdk, folder, profile, *, legacy):
+    """Run the verified old image only inside the existing backup transaction."""
     # Never execute modified old firmware/tool inputs as an upgrade helper.
-    for relative in ('images/system.img', 'images/kernel-ranchu', 'images/ramdisk.img',
-                     'tools/ksud-aarch64-linux-android'):
+    required = {'images/system.img', 'images/kernel-ranchu', 'images/ramdisk.img',
+                'tools/ksud-aarch64-linux-android'}
+    if not legacy:
+        required.update(path for path in old.get('files', {}) if path.startswith('images/'))
+    for relative in sorted(required):
+        path = Path(relative)
+        if path.is_absolute() or '..' in path.parts:
+            raise RuntimeError('Invalid installed staging input path: ' + relative)
+        if not legacy and (not (root / relative).is_file() or (root / relative).is_symlink()):
+            raise RuntimeError('Aliased installed staging input is preserved: ' + relative)
         expected = old.get('files', {}).get(relative, {}).get('sha256')
         if not expected or sha256(root / relative) != expected:
             raise RuntimeError('Installed staging input differs from its release: ' + relative)
@@ -731,6 +922,11 @@ def prepare_module_upgrade(root, old, new, name, port, sdk, folder):
                '-port', str(port), '-no-window', '-no-snapshot-load', '-no-snapshot-save',
                '-accel', 'on', '-gpu', 'host', '-memory', current.get('hw.ramSize', '6144'),
                '-cores', current.get('hw.cpu.ncore', '4'), '-crash-report-mode', 'never']
+    if not legacy:
+        from launch import vulkan_features
+        from rear_display_config import runtime_options
+        command += vulkan_features(old.get('build', {}))
+        command += runtime_options(old.get('build', {}))
     say('正在启动升级前镜像，隔离旧补丁；完整用户数据备份已保存。',
         'Starting the previous firmware to gate old patches; full userdata backup is saved.')
     log = folder / 'module-upgrade-emulator.log'
@@ -759,16 +955,26 @@ def prepare_module_upgrade(root, old, new, name, port, sdk, folder):
             raise RuntimeError('Upgrade staging connected to a different AVD.')
         validated_guest = True
         validate_upgrade_guest(config, profile['incremental'])
-        staging = folder / 'module-guards'
-        staging.mkdir()
-        receipt = guarded_modules(config, staging, profile['incremental'], new['hyperos'])
+        guarded = []
+        if legacy or profile['hyperos'] == '4.0.17.0.XFRCNXM':
+            staging = folder / 'module-guards'
+            staging.mkdir()
+            guarded = guarded_modules(config, staging, profile['incremental'], new['hyperos'],
+                                      **({'strict': True} if not legacy else {}))
+        if legacy:
+            receipt = guarded
+        else:
+            receipt = audit_firmware_modules(config, old, root,
+                **({'guarded_ids': {item['id'] for item in guarded}} if guarded else {}))
         # Retained users may have changed all three awake settings. Declare
         # them seeded before the new runtime boots; never rewrite their values.
         from os4_defaults import AWAKE_STAMP
         common.adb(config, 'shell', 'su -W -c ' + shlex.quote(
             f'touch {AWAKE_STAMP}\ntest -f {AWAKE_STAMP}'), check=True, timeout=30)
         json_write(folder / 'module-upgrade.json', {'schema': 1, 'name': name, 'port': port,
-            'from': old['version'], 'to': new['version'], 'guarded_modules': receipt,
+            'from': old['version'], 'to': new['version'],
+            **({'guarded_modules': receipt} if legacy else {'retained_modules': receipt,
+                **({'guarded_modules': guarded} if guarded else {})}),
             'preserved_defaults': {'awake_stamp': AWAKE_STAMP}})
         common.adb(config, 'shell', 'su -W -c sync', check=True, timeout=30)
     finally:
@@ -821,11 +1027,16 @@ def wrapper(root):
     file.write_text('''#!/bin/zsh
 cd "${0:A:h}" || exit 1
 exec python3 - "$PWD" <<'PYTHON'
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, subprocess, sys, tempfile
 root = pathlib.Path(sys.argv[1])
 state = json.loads((root / 'local/manager.json').read_text())
-os.environ['HYPEROS_AVD_WORKSPACE'] = str(root)
-raise SystemExit(subprocess.call([sys.executable, str(root / state['runtime'] / 'scripts/launch.py')], env=os.environ))
+env = dict(os.environ, HYPEROS_AVD_WORKSPACE=str(root))
+for name in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP'):
+    env.pop(name, None)
+with tempfile.TemporaryDirectory(prefix='python-launch-', dir=root / 'local') as cache:
+    env['PYTHONPYCACHEPREFIX'] = cache
+    result = subprocess.call([sys.executable, '-B', str(root / state['runtime'] / 'scripts/launch.py')], env=env)
+raise SystemExit(result)
 PYTHON
 ''')
     file.chmod(0o755)
@@ -938,6 +1149,91 @@ def switch(root, target, manifest, name, port, sdk, options, folder, camera=Fals
 
 
 def install(root, manifest_path, name, port, sdk, options, camera=False):
+    from bundle_runtime import has_protocol
+    manifest, _ = setup.read_install_manifest(str(manifest_path))
+    if has_protocol(manifest):
+        return install_via_runtime(root, manifest_path, manifest, name, port, sdk, options, camera)
+    return install_transaction(root, manifest_path, name, port, sdk, options, camera)
+
+
+def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options, camera=False):
+    """Stage all bytes before invoking the protocol's single fixed entrypoint."""
+    from bundle_runtime import ENTRYPOINT, INSTALL_PROTOCOL, manifest_digest, validate_envelope, verify_staged
+    validate_envelope(manifest)
+    root = Path(root).expanduser().resolve()
+    validate_name(name)
+    if type(port) is not int or port % 2 or not 5556 <= port <= 5682:
+        raise RuntimeError('Use a free even emulator console port between 5556 and 5682.')
+    hardware(int(options['hw.ramSize']) / 1024,
+             int(options['disk.dataPartition.size'][:-1]), int(options['hw.cpu.ncore']))
+    if version_key(manifest['compatibility']['minimum_installer']) > version_key(VERSION):
+        raise RuntimeError('This release needs a newer installer; download the latest stable Installer Release.')
+    from userdata_resize import check_dependencies
+    check_dependencies(sdk)
+    owner(root, name)
+    idle(root, name, port)
+    target = root / 'versions' / manifest['version']
+    with lock(root):
+        if (root / 'local/upgrade-pending.json').exists():
+            raise RuntimeError('An interrupted upgrade needs recovery first: use the Recover menu.')
+        saved = root / 'local/runtime.json'
+        if saved.exists():
+            previous = json.loads(saved.read_text())
+            if previous.get('name') != name or previous.get('port') != port:
+                raise RuntimeError('Upgrade must retain the instance name and console port.')
+        data = root / 'avd' / (name + '.avd')
+        if data.exists():
+            old_path = root / 'local/installed-release.json'
+            if not old_path.is_file():
+                raise RuntimeError('Existing userdata has no release manifest; migration refused.')
+            validate_userdata(sdk, data)
+            compatible(json.loads(old_path.read_text()), manifest, firmware_specific=False)
+            wanted = int(options['disk.dataPartition.size'][:-1]) * 1024**3
+            if any(data_size(sdk, p)['virtual-size'] > wanted for p in data.glob('userdata-qemu.img*')
+                   if p.name in ('userdata-qemu.img', 'userdata-qemu.img.qcow2')):
+                raise RuntimeError('Storage cannot shrink during an upgrade.')
+        if (root / 'versions').is_symlink() or target.is_symlink():
+            raise RuntimeError('Bundle staging directory must not be a symlink.')
+        if not (target / 'local/installed-release.json').is_file():
+            if target.exists():
+                raise RuntimeError('An incomplete version directory exists; inspect it before retrying: ' + str(target))
+            total = sum(item['size'] for item in manifest['files'].values())
+            if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
+                raise RuntimeError('Insufficient free storage for staging and archive validation.')
+            target.mkdir(parents=True)
+            with scope(target):
+                setup.stage_bundle(str(manifest_path))
+        verify_staged(target, manifest)
+    # The child obtains the normal instance lock and repeats ownership/idle
+    # checks. No inherited lock or environment flag can bypass its transaction.
+    with tempfile.TemporaryDirectory(prefix='bundle-install-', dir=root / 'local') as temporary:
+        temporary = Path(temporary)
+        request, report = temporary / 'request.json', temporary / 'report.json'
+        json_write(request, {'schema': 1, 'protocol': INSTALL_PROTOCOL, 'root': str(root),
+            'target': str(target), 'name': name, 'port': port, 'sdk': str(sdk),
+            'options': options, 'camera': camera, 'manifest_sha256': manifest_digest(manifest)})
+        env = os.environ.copy()
+        for key in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP'):
+            env.pop(key, None)
+        env['PYTHONPYCACHEPREFIX'] = str(temporary / 'bytecode')
+        env['HYPEROS_AVD_WORKSPACE'] = str(root)
+        verify_staged(target, manifest)
+        subprocess.run([sys.executable, '-B', str(target / ENTRYPOINT), '--request', str(request),
+                        '--report', str(report)], cwd=temporary, env=env, check=True)
+        if report.is_symlink() or not report.is_file():
+            raise RuntimeError('Verified runtime did not return an installation report.')
+        result = json.loads(report.read_text())
+        if (not isinstance(result, dict) or set(result) != {'schema', 'protocol', 'backup'}
+                or type(result['schema']) is not int or result['schema'] != 1
+                or result['protocol'] != INSTALL_PROTOCOL or not isinstance(result['backup'], str)):
+            raise RuntimeError('Invalid verified runtime installation report.')
+        folder = Path(result['backup'])
+        if folder.is_symlink() or folder.parent != root / 'backups' or not folder.is_dir():
+            raise RuntimeError('Invalid verified runtime backup location.')
+        return folder
+
+
+def install_transaction(root, manifest_path, name, port, sdk, options, camera=False):
     root = Path(root).expanduser().resolve()
     validate_name(name)
     manifest, _ = setup.read_manifest(str(manifest_path))
@@ -972,20 +1268,26 @@ def install(root, manifest_path, name, port, sdk, options, camera=False):
             if any(data_size(sdk, p)['virtual-size'] > wanted for p in data.glob('userdata-qemu.img*') if p.name in ('userdata-qemu.img', 'userdata-qemu.img.qcow2')):
                 raise RuntimeError('Storage cannot shrink during an upgrade.')
         root.mkdir(parents=True, exist_ok=True)
-        total = sum(item['size'] for item in manifest['files'].values())
-        if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
-            raise RuntimeError('Insufficient free storage for staging and archive validation.')
         target = root / 'versions' / manifest['version']
         if not (target / 'local/installed-release.json').is_file():
             if target.exists():
                 raise RuntimeError('An incomplete version directory exists; remove it after inspection: ' + str(target))
+            total = sum(item['size'] for item in manifest['files'].values())
+            if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
+                raise RuntimeError('Insufficient free storage for staging and archive validation.')
             target.mkdir(parents=True)
             with scope(target):
                 setup.install_bundle(str(manifest_path))
         else:
-            for path, info in manifest['files'].items():
-                if sha256(target / path) != info['sha256']:
-                    raise RuntimeError('Cached firmware differs from the release manifest.')
+            from bundle_runtime import has_protocol, verify_staged
+            if has_protocol(manifest):
+                verify_staged(target, manifest)
+            else:
+                # Frozen releases predate isolated Python caches. Preserve their
+                # original checksum contract; launches ignore in-place caches.
+                for path, info in manifest['files'].items():
+                    if sha256(target / path) != info['sha256']:
+                        raise RuntimeError('Cached firmware differs from the release manifest.')
         idle(root, name, port)
         folder = backup(root, name)
         if old is not None:
@@ -1000,7 +1302,7 @@ def install(root, manifest_path, name, port, sdk, options, camera=False):
         if old is not None and firmware_change(old, manifest):
             upgrade_transaction(root, folder, name, port)
             try:
-                prepare_module_upgrade(root, old, manifest, name, port, sdk, folder)
+                prepare_firmware_upgrade(root, old, manifest, name, port, sdk, folder)
             except BaseException:
                 # A still-running staging guest keeps the transaction pending;
                 # Recover is safe only after the user closes that owned AVD.
@@ -1017,12 +1319,19 @@ def start(instance, headless=False, skip_oobe=False):
     state = root / 'local/manager.json'
     runtime = root / json.loads(state.read_text())['runtime'] if state.is_file() else REPO_ROOT
     env = dict(os.environ, HYPEROS_AVD_WORKSPACE=str(root))
-    command = [sys.executable, str(runtime / 'scripts/launch.py')]
+    for key in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP'):
+        env.pop(key, None)
+    command = [sys.executable, '-B', str(runtime / 'scripts/launch.py')]
     if headless:
         command.append('--headless')
     if skip_oobe:
         command.append('--skip-oobe')
-    subprocess.run(command, env=env, check=True)
+    # A new external cache prefix also prevents Python from reading stale or
+    # unauthenticated caches left beside an installed runtime by older launchers.
+    (root / 'local').mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='python-launch-', dir=root / 'local') as cache:
+        env['PYTHONPYCACHEPREFIX'] = cache
+        subprocess.run(command, env=env, check=True)
 
 
 def pick_instance():
@@ -1244,7 +1553,7 @@ def main():
         start({'root': args.root.expanduser().resolve()}, args.headless, args.skip_oobe)
     elif args.command == 'install':
         root = args.root.expanduser().resolve()
-        variant = (setup.read_manifest(str(args.bundle.expanduser().resolve()))[0].get('variant', 'os3')
+        variant = (setup.read_install_manifest(str(args.bundle.expanduser().resolve()))[0].get('variant', 'os3')
                    if args.bundle else args.variant)
         ram = args.ram if args.ram is not None else {'os4-pad': 4, 'os4-official': 6}.get(variant, 2.5)
         settings = hardware(ram, args.storage, args.cores, variant=variant)

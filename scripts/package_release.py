@@ -523,10 +523,11 @@ def release_metadata(root, variant):
                 metadata['compatibility'].pop('upgrade_from')
                 metadata['compatibility']['upgrade_policy'] = FORWARD_UPGRADE_POLICY
     if metadata['format'] == 3:
-        from manage import VERSION
-        # New bundles require the verified encrypted-growth and TLS paths.
-        # Frozen published manifests retain their original installer minimum.
-        metadata['compatibility']['minimum_installer'] = VERSION
+        from bundle_runtime import INSTALL_PROTOCOL, PROTOCOL_MINIMUM
+        # The protocol baseline is immutable; a future source recipe or an
+        # unrelated installer update must not raise an image's minimum.
+        metadata['compatibility'].update(minimum_installer=PROTOCOL_MINIMUM,
+                                         install_protocol=INSTALL_PROTOCOL)
     return metadata
 
 

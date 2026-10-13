@@ -67,7 +67,8 @@ class PadReleaseTests(unittest.TestCase):
             (root / 'local/build.json').write_text(json.dumps(build_info()))
             value = package_release.release_metadata(root, 'os4-pad')
             self.assertEqual(value['source_device'], 'yingtian')
-            self.assertEqual(value['compatibility'], {'minimum_installer': '1.2.2',
+            self.assertEqual(value['compatibility'], {'minimum_installer': '1.2.3',
+                'install_protocol': 'verified-bundle-runtime-v1',
                 'userdata_family': 'os4-yingtian-api37-ranchu-4k', 'upgrade_from': [], 'runtime_in_bundle': True})
             for key in ('hwui', 'flutter_engine', 'display', 'identity_source_sha256'):
                 self.assertEqual(value['build'][key], build_info()[key])

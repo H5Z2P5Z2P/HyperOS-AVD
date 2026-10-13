@@ -44,7 +44,54 @@ def validate_memory(properties=None):
             raise RuntimeError('Use RAM 1024-65536 MiB.')
 
 
-def read_manifest(value):
+def validate_phone_manifest(manifest, build):
+    """Authenticate every phone source, retaining frozen published contracts."""
+    from phone_profile import modern_runtime, profile_from_build
+    from manage import MODULE_UPGRADE_PREFLIGHT, FORWARD_UPGRADE_POLICY
+    selected = profile_from_build(build)
+    if not modern_runtime(selected):
+        return
+    compatibility = manifest.get('compatibility', {})
+    minimum = compatibility.get('minimum_installer', '')
+    repaired = build.get('boot_service_fix') is not None
+    policy = compatibility.get('upgrade_policy')
+    forward = policy == FORWARD_UPGRADE_POLICY
+    frozen_source = selected['hyperos'] == '4.0.18.0.XFRCNXM'
+    if policy is not None and not forward:
+        raise RuntimeError('Unknown official OS4 forward upgrade policy.')
+    if repaired:
+        from patch_boot_services import image_receipt, validate_image_receipt
+        # The receipt identifies an audited producer and bytecode recipe, while
+        # the selected profile records this release's actual OTA provenance.
+        try:
+            validate_image_receipt(build['boot_service_fix'])
+        except RuntimeError as error:
+            raise RuntimeError('Invalid official OS4 r4 boot service profile.') from error
+        if not forward:
+            raise RuntimeError('Invalid official OS4 r4 boot service profile.')
+    elif forward or not frozen_source:
+        raise RuntimeError('Missing official OS4 r4 boot service profile.')
+    # Freeze the verified floor so a later installer bump cannot invalidate
+    # previously published manifests from this registered source generation.
+    floor = ((1, 2, 1) if repaired else (1, 2, 0)) if frozen_source else (1, 2, 3)
+    if repaired and build['boot_service_fix'] != image_receipt():
+        floor = (1, 2, 3)
+    if (type(manifest['format']) is not int or manifest['format'] != 3
+            or manifest.get('source') != OS4_SOURCE
+            or manifest.get('source_device') != 'hongkong'
+            or build.get('archive_sha256') != selected['archive_sha256']
+            or compatibility.get('userdata_family') != 'os4-hongkong-api37-ranchu-4k'
+            or compatibility.get('runtime_in_bundle') is not True
+            or compatibility.get('module_upgrade_preflight') != MODULE_UPGRADE_PREFLIGHT
+            or (not forward and compatibility.get('upgrade_from') != ['v0.2.1-a17-hyperos4-hongkong-r2'])
+            or (not frozen_source and not re.fullmatch(
+                r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r\d+', manifest['version']))
+            or not isinstance(minimum, str) or not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
+            or tuple(map(int, minimum.split('.'))) < floor):
+        raise RuntimeError('Invalid official OS4 ' + ('r4' if repaired else 'r3') + ' upgrade profile.')
+
+
+def load_manifest(value):
     if value.startswith('https://'):
         with secure_urlopen(value, timeout=30) as response:
             data = response.read(2 * 1024**2 + 1)
@@ -56,6 +103,26 @@ def read_manifest(value):
         path = Path(value).expanduser().resolve()
         manifest = json.loads(path.read_text())
         base = path.parent
+    if not isinstance(manifest, dict):
+        raise RuntimeError('Unsupported HyperOS-AVD release manifest.')
+    return manifest, base
+
+
+def read_install_manifest(value):
+    """Read only a known stable envelope before executing verified release code."""
+    from bundle_runtime import has_protocol, validate_envelope
+    manifest, base = load_manifest(value)
+    if has_protocol(manifest):
+        return validate_envelope(manifest), base
+    return validate_manifest(manifest), base
+
+
+def read_manifest(value):
+    manifest, base = load_manifest(value)
+    return validate_manifest(manifest), base
+
+
+def validate_manifest(manifest):
     if manifest.get('project') != 'HyperOS-AVD' or manifest.get('format') not in (1, 2, 3):
         raise RuntimeError('Unsupported HyperOS-AVD release manifest.')
     if not re.fullmatch(r'(?:pad-)?v[0-9A-Za-z_.-]+', manifest.get('version', '')):
@@ -90,39 +157,17 @@ def read_manifest(value):
                     or not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
                     or tuple(map(int, minimum.split('.'))) < (1, 1, 0)):
                 raise RuntimeError('Invalid official OS4 Pad release profile.')
-        elif manifest.get('hyperos') == '4.0.18.0.XFRCNXM':
-            from phone_profile import profile_from_build
-            from manage import MODULE_UPGRADE_PREFLIGHT, FORWARD_UPGRADE_POLICY
-            selected = profile_from_build(build)
-            compatibility = manifest.get('compatibility', {})
-            minimum = compatibility.get('minimum_installer', '')
-            r4 = build.get('boot_service_fix') is not None
-            policy = compatibility.get('upgrade_policy')
-            forward = policy == FORWARD_UPGRADE_POLICY
-            if policy is not None and not forward:
-                raise RuntimeError('Unknown official OS4 forward upgrade policy.')
-            if r4:
-                from apply_boot_service_fix import receipt
-                if build['boot_service_fix'] != receipt() or not forward:
-                    raise RuntimeError('Invalid official OS4 r4 boot service profile.')
-            elif forward:
-                raise RuntimeError('Missing official OS4 r4 boot service profile.')
-            if (type(manifest['format']) is not int or manifest['format'] != 3
-                    or manifest.get('source') != OS4_SOURCE
-                    or manifest.get('source_device') != 'hongkong'
-                    or build.get('archive_sha256') != selected['archive_sha256']
-                    or compatibility.get('userdata_family') != 'os4-hongkong-api37-ranchu-4k'
-                    or compatibility.get('runtime_in_bundle') is not True
-                    or compatibility.get('module_upgrade_preflight') != MODULE_UPGRADE_PREFLIGHT
-                    or (not forward and compatibility.get('upgrade_from') != ['v0.2.1-a17-hyperos4-hongkong-r2'])
-                    or not isinstance(minimum, str) or not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
-                    or tuple(map(int, minimum.split('.'))) < ((1, 2, 1) if r4 else (1, 2, 0))):
-                raise RuntimeError('Invalid official OS4 ' + ('r4' if r4 else 'r3') + ' upgrade profile.')
+        else:
+            validate_phone_manifest(manifest, build)
     elif (manifest.get('android_api', 36) != 36 or manifest.get('variant', 'os3') != 'os3'
           or manifest.get('source') in (OS4_SOURCE, PAD_SOURCE)
           or manifest.get('build', {}).get('source') in (OS4_SOURCE, PAD_SOURCE)):
         raise RuntimeError('OS4 requires a format 2 release; refusing an OS3/OS4 mix.')
-    return manifest, base
+    # Protocol bundles still receive all firmware-specific authentication here.
+    from bundle_runtime import has_protocol, validate_envelope
+    if has_protocol(manifest):
+        validate_envelope(manifest)
+    return manifest
 
 
 def workspace_profile(root):
@@ -250,6 +295,18 @@ def install_bundle(value):
         if not verified:
             raise RuntimeError('Use Installer 1.2.0 Upgrade or Recover for retained OS4 userdata; '
                                'direct Setup requires verified matching firmware and OTA identity.')
+    extract_bundle(manifest, base)
+
+
+def stage_bundle(value):
+    """Extract a transport-verified runtime only into an empty staging root."""
+    manifest, base = read_install_manifest(value)
+    if ROOT.exists() and any(ROOT.iterdir()):
+        raise RuntimeError('Bundle runtime staging requires an empty version directory.')
+    extract_bundle(manifest, base)
+
+
+def extract_bundle(manifest, base):
     validate_memory()
     cache = ROOT / 'downloads' / manifest['version']
     cache.mkdir(parents=True, exist_ok=True)
@@ -373,7 +430,7 @@ def main():
     host_check()
     if args.bundle and args.manifest:
         raise RuntimeError('Choose either --bundle or --manifest.')
-    release = read_manifest(args.bundle or args.manifest)[0] if args.bundle or args.manifest else None
+    release = read_install_manifest(args.bundle or args.manifest)[0] if args.bundle or args.manifest else None
     args.name, args.port = select_release(release, args.name, args.port)
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', args.name):
         raise RuntimeError('Use an ASCII AVD name up to 64 characters.')
@@ -390,6 +447,21 @@ def main():
     sdk = sdk_path(args.sdk)
     from userdata_resize import check_dependencies
     check_dependencies(sdk)
+    from bundle_runtime import has_protocol
+    if release is not None and has_protocol(release):
+        import manage
+        previous = ROOT / 'local/runtime.json'
+        saved = json.loads(previous.read_text()) if previous.is_file() else {}
+        options = saved.get('hardware', {})
+        camera = saved.get('camera_bridge', False)
+        if not isinstance(options, dict) or type(camera) is not bool:
+            raise RuntimeError('Saved hardware or camera choice is invalid; inspect local/runtime.json.')
+        defaults = manage.hardware(4 if release['variant'] == PAD_VARIANT else 6, 32, 4,
+                                   variant=release['variant'])
+        manage.install(ROOT, args.bundle or args.manifest, args.name, args.port, sdk,
+                       {**defaults, **options}, camera=camera)
+        print('Ready. ' + start_instruction(ROOT))
+        return
     if args.bundle or args.manifest:
         firmware_idle(args.port)
         install_bundle(args.bundle or args.manifest)
