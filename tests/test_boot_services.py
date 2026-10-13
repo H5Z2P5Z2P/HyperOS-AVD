@@ -1,4 +1,5 @@
 """Check scoped boot-service guards and supplied firmware artifacts."""
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -82,12 +83,14 @@ class BootServiceTests(unittest.TestCase):
         self.assertNotEqual(fixes.method_code(old, 'run()V'),
                             fixes.method_code(same.replace('v0', 'v1'), 'run()V'))
 
-    def test_only_hongkong18_gets_kernel_boot_policy(self):
+    def test_registered_modern_phone_sources_get_kernel_boot_policy(self):
         empty = b'on boot\n    setprop example 1\n'
         self.assertNotIn(fixes.BOOT_INIT, boot_defaults(empty, profile('4.0.17.0.XFRCNXM')))
-        current = boot_defaults(empty, profile('4.0.18.0.XFRCNXM'))
-        self.assertEqual(current.count(fixes.BOOT_INIT), 1)
-        self.assertEqual(boot_defaults(current, profile('4.0.18.0.XFRCNXM')), current)
+        for version in ('4.0.18.0.XFRCNXM', '4.0.24.0.XFRCNXM'):
+            with self.subTest(version=version):
+                current = boot_defaults(empty, profile(version))
+                self.assertEqual(current.count(fixes.BOOT_INIT), 1)
+                self.assertEqual(boot_defaults(current, profile(version)), current)
 
     def test_capability_policy_distinguishes_supported_missing_and_denied(self):
         script = (REPO / 'config/check_kernel_services.sh').read_text()
@@ -179,7 +182,52 @@ class BootServiceTests(unittest.TestCase):
                                   'boot_service_fix': installer.receipt()}, reader)
         with self.assertRaisesRegex(RuntimeError, 'Baked boot service checksum'):
             verify_boot_services({'hyperos': '4.0.18.0.XFRCNXM',
+                                  'archive_sha256': profile('4.0.18.0.XFRCNXM')['archive_sha256'],
                                   'boot_service_fix': installer.receipt()}, reader)
+
+    def test_new_registered_release_uses_recipe_bytes_and_rejects_foreign_provenance(self):
+        selected = profile('4.0.24.0.XFRCNXM')
+        build = {'source': 'official-hongkong-ota', 'hyperos': selected['hyperos'],
+                 'archive_sha256': selected['archive_sha256'], 'boot_service_fix': installer.receipt()}
+        reader = unittest.mock.Mock(return_value=b'missing fixed bytecode')
+        with self.assertRaisesRegex(RuntimeError, 'Baked boot service checksum'):
+            verify_boot_services(build, reader)
+        self.assertGreater(reader.call_count, 0)
+        reader.reset_mock()
+        for field, value in (('hyperos', '4.0.999.0.XFRCNXM'), ('archive_sha256', 'f' * 64)):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                verify_boot_services(dict(build, **{field: value}), reader)
+            reader.assert_not_called()
+        self.assertEqual(build['boot_service_fix']['firmware'], 'OS4.0.18.0.XFRCNXM')
+
+    def test_release_reads_each_authenticated_recipe_and_rejects_wrong_service_bytes(self):
+        payloads = {path: ('fixed fixture ' + name).encode()
+                    for name, (path, _, _) in fixes.TARGETS.items()}
+        after = {name: hashlib.sha256(payloads[path]).hexdigest()
+                 for name, (path, _, _) in fixes.TARGETS.items()}
+        variants = {before: ('fixed GNSS recipe fixture ' + before).encode()
+                    for before in fixes.SERVICE_RECIPES}
+        recipes = {before: hashlib.sha256(data).hexdigest() for before, data in variants.items()}
+        probe = b'audited kernel probe fixture'
+        payloads.update({'/system/bin/hyperos_kernel_probe': probe,
+                         '/system_ext/etc/init/init.hyperos_avd.rc': fixes.BOOT_INIT,
+                         '/system_ext/etc/selinux/system_ext_sepolicy.cil': fixes.BOOT_SEPOLICY})
+        with patch.object(fixes, 'AFTER', after), patch.object(fixes, 'SERVICE_RECIPES', recipes), \
+                patch.object(fixes, 'PROBE_SHA256', hashlib.sha256(probe).hexdigest()):
+            from image_kernel_services import image_script
+            payloads['/system/etc/hyperos-kernel-services.sh'] = image_script()
+            for version in ('4.0.18.0.XFRCNXM', '4.0.24.0.XFRCNXM'):
+                for marker in fixes.image_receipts():
+                    selected = profile(version)
+                    row = marker['targets']['services']
+                    files = {**payloads, row['path']: variants[row['before']]}
+                    build = {'hyperos': version, 'archive_sha256': selected['archive_sha256'],
+                             'boot_service_fix': marker}
+                    with self.subTest(version=version, recipe=row['before']):
+                        self.assertEqual(verify_boot_services(build, files.__getitem__), 7)
+                        files[row['path']] = b'wrong producer bytes'
+                        with self.assertRaisesRegex(RuntimeError, 'checksum mismatch: ' + row['path']):
+                            verify_boot_services(build, files.__getitem__)
 
     def test_real_artifacts_preserve_all_unrelated_entries_and_signers(self):
         location = os.environ.get('HYPEROS_AVD_BOOT_FIX_ARTIFACTS')

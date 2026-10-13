@@ -185,18 +185,18 @@ def verify_boot_services(build, read):
     marker = build.get('boot_service_fix')
     if marker is None:
         return 0
-    from patch_boot_services import TARGETS, AFTER, PROBE_SHA256, BOOT_INIT, BOOT_SEPOLICY
-    expected = {'schema': 1, 'firmware': 'OS4.0.18.0.XFRCNXM',
-                'targets': {name: {'path': path, 'before': before, 'after': AFTER[name]}
-                            for name, (path, before, _) in TARGETS.items()},
-                'probe_sha256': PROBE_SHA256}
-    if build.get('hyperos') != '4.0.18.0.XFRCNXM' or marker != expected:
+    from patch_boot_services import validate_image_receipt, PROBE_SHA256, BOOT_INIT, BOOT_SEPOLICY
+    from phone_profile import modern_runtime, profile_from_build
+    if not modern_runtime(profile_from_build(build)):
         raise RuntimeError('Unexpected boot service fix metadata.')
-    from apply_boot_service_fix import KERNEL_SCRIPT_SHA256, KERNEL_SCRIPT_HASHES
-    paths = {path: (AFTER[name],) for name, (path, _, _) in TARGETS.items()}
+    try:
+        recipe = validate_image_receipt(marker)
+    except RuntimeError as error:
+        raise RuntimeError('Unexpected boot service fix metadata.') from error
+    from image_kernel_services import PATH, accepted_hashes
+    paths = {target['path']: (target['after'],) for target in recipe['targets'].values()}
     paths['/system/bin/hyperos_kernel_probe'] = (PROBE_SHA256,)
-    paths['/system/etc/hyperos-kernel-services.sh'] = (
-        (KERNEL_SCRIPT_SHA256,) if build.get('boot_policy') is not None else KERNEL_SCRIPT_HASHES)
+    paths[PATH] = accepted_hashes(build)
     for path, checksums in paths.items():
         if hashlib.sha256(read(path)).hexdigest() not in checksums:
             raise RuntimeError('Baked boot service checksum mismatch: ' + path)
@@ -277,11 +277,11 @@ def verify_boot_policy(build, read, init_graph=None):
         from patch_boot_services import BOOT_INIT
         if legacy != [INIT_PATH] or init.count(BOOT_INIT) != 1:
             raise RuntimeError('Unexpected legacy helper in shared boot policy graph.')
-        from apply_boot_service_fix import KERNEL_SCRIPT_SHA256
-        path = '/system/etc/hyperos-kernel-services.sh'
-        if hashlib.sha256(read(path)).hexdigest() != KERNEL_SCRIPT_SHA256:
+        from image_kernel_services import PATH, accepted_hashes
+        checksum = hashlib.sha256(read(PATH)).hexdigest()
+        if checksum not in accepted_hashes(build):
             raise RuntimeError('Legacy Phone helper conflicts with shared boot policy.')
-        paths[path] = KERNEL_SCRIPT_SHA256
+        paths[PATH] = checksum
     return len(paths) + 2
 
 

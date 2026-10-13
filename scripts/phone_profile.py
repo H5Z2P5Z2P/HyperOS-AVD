@@ -7,6 +7,7 @@ CONFIG = Path(__file__).resolve().parent.parent / 'config'
 ARCHIVES = {
     '4.0.17.0.XFRCNXM': 'c45f3fcaccb74d0d8212f68a721814abf229a537f8a8ac6d227be20b348752f2',
     '4.0.18.0.XFRCNXM': 'b022c3fcfeb52ac014e971ea48dd07f8b35a0fb3fbdec74798da22375f7933e4',
+    '4.0.24.0.XFRCNXM': '47449364aabb9d43e6669e210557bccd16256e86075eed3c34e86de0191dc391',
 }
 PROP_PATHS = {
     'system': '/system/build.prop', 'system_ext': '/etc/build.prop',
@@ -39,7 +40,8 @@ LEGACY_PINS = {
 def profile(version='4.0.17.0.XFRCNXM'):
     if version not in ARCHIVES:
         raise RuntimeError('Unsupported official hongkong firmware: ' + str(version))
-    name = 'hongkong-identity.json' if version == '4.0.17.0.XFRCNXM' else 'hongkong-4.0.18-identity.json'
+    name = ('hongkong-identity.json' if version == '4.0.17.0.XFRCNXM'
+            else 'hongkong-' + '.'.join(version.split('.')[:3]) + '-identity.json')
     value = json.loads((CONFIG / name).read_text())
     if value.get('device') != 'hongkong' or value.get('schema') != 1:
         raise RuntimeError('Invalid hongkong source profile.')
@@ -64,6 +66,18 @@ def profile_for_archive(digest):
     raise RuntimeError('Use a pinned original official hongkong OTA ZIP.')
 
 
+def modern_runtime(value):
+    """Select modern runtime policy only from authenticated registered inputs."""
+    try:
+        registered = profile(value.get('hyperos'))
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError('Unsupported modern runtime source profile.') from error
+    if (value.get('archive_sha256') != registered['archive_sha256']
+            or value.get('pins') != registered['pins']):
+        raise RuntimeError('Unsupported modern runtime archive or native/application pins.')
+    return registered['hyperos'] != '4.0.17.0.XFRCNXM'
+
+
 def profile_from_build(build=None):
     if build is None:
         from common import ROOT
@@ -73,7 +87,7 @@ def profile_from_build(build=None):
         raise RuntimeError('Phone profile refused a different firmware source.')
     value = profile(build.get('hyperos', '4.0.17.0.XFRCNXM'))
     digest = build.get('archive_sha256')
-    if (value['hyperos'] == '4.0.18.0.XFRCNXM' or digest is not None) and digest != value['archive_sha256']:
+    if (value['hyperos'] != '4.0.17.0.XFRCNXM' or digest is not None) and digest != value['archive_sha256']:
         raise RuntimeError('Firmware version and OTA archive identity disagree.')
     return value
 
@@ -124,7 +138,8 @@ def verify_source(value, partitions, metadata):
     """Verify source bytes and identity before any firmware edits or registration."""
     from build_image import erofs
     partitions = Path(partitions)
-    expected_parts = set(PROP_PATHS) | {'mi_product'} if value['hyperos'] == '4.0.18.0.XFRCNXM' else {'mi_product'}
+    expected_parts = (set(PROP_PATHS) | {'mi_product'}
+                      if value['hyperos'] != '4.0.17.0.XFRCNXM' else {'mi_product'})
     if set(value.get('source_partition_sha256', {})) != expected_parts:
         raise RuntimeError('Incomplete original OTA partition pins.')
     for part, expected in value['source_partition_sha256'].items():

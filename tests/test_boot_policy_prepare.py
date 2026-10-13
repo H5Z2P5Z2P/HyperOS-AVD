@@ -63,37 +63,52 @@ class SharedBootEditsTests(unittest.TestCase):
                                             ('odm', folder / 'odm.img'),
                                             ('vendor_dlkm', folder / 'vendor_dlkm.img')], {})
 
-    def test_retained_kernel_helper_is_migrated_only_with_known_input_and_source_hashes(self):
+    def test_retained_kernel_helper_is_refreshed_only_from_known_input_to_canonical_output(self):
         import apply_boot_service_fix as legacy
-        old, current = b'known old helper', b'known current helper'
+        import image_kernel_services as current
+        generated = current.image_script()
         init = services.BOOT_INIT
-        helper = 'system/etc/hyperos-kernel-services.sh'
-        with tempfile.TemporaryDirectory() as temporary:
-            script = Path(temporary) / 'current.sh'
-            script.write_bytes(current)
-            for old_input, source_pin, error in ((old, digest(current), None),
-                                                (b'unknown old helper', digest(current), 'existing image kernel helper'),
-                                                (old, digest(b'unknown source'), 'image kernel helper source')):
-                with self.subTest(error=error):
-                    edits = {boot.INIT_PATH: (init, 0o644, 'old-label'),
-                             helper: (old_input, 0o755, 'old-label')}
-                    with patch.object(boot, 'init_files', return_value={boot.INIT_PATH: init}), \
-                            patch.object(boot, 'image_replacements', return_value=({}, {'schema': 1})) as bundle, \
-                            patch.object(prepare, 'erofs', return_value=b'raw bytes'), \
-                            patch.object(legacy, 'KERNEL_SCRIPT_HASHES', (digest(old), digest(current))), \
-                            patch.object(legacy, 'KERNEL_SCRIPT_SHA256', source_pin), \
-                            patch.object(legacy, 'PERF_SCRIPT', script):
-                        if error is None:
+        helper = current.PATH.lstrip('/')
+        for old_input, error in ((legacy.PERF_SCRIPT.read_bytes(), None), (generated, None),
+                                 (b'unknown old helper', 'existing image kernel helper')):
+            with self.subTest(error=error, source=digest(old_input)):
+                edits = {boot.INIT_PATH: (init, 0o644, 'old-label'),
+                         helper: (old_input, 0o755, 'old-label')}
+                with patch.object(boot, 'init_files', return_value={boot.INIT_PATH: init}), \
+                        patch.object(boot, 'image_replacements', return_value=({}, {'schema': 1})) as bundle, \
+                        patch.object(prepare, 'erofs', return_value=b'raw bytes'):
+                    if error is None:
+                        prepare.shared_boot_edits(Path('/raw/system.img'), Path('/raw/vendor.img'),
+                                                  edits, Path('/work'))
+                        self.assertEqual(edits[helper], (generated, 0o755, 'u:object_r:system_file:s0'))
+                        self.assertEqual(digest(edits[helper][0]), current.image_script_sha256())
+                        bundle.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, error):
                             prepare.shared_boot_edits(Path('/raw/system.img'), Path('/raw/vendor.img'),
                                                       edits, Path('/work'))
-                            self.assertEqual(edits[helper], (current, 0o755, 'u:object_r:system_file:s0'))
-                            bundle.assert_called_once()
-                        else:
-                            with self.assertRaisesRegex(RuntimeError, error):
-                                prepare.shared_boot_edits(Path('/raw/system.img'), Path('/raw/vendor.img'),
-                                                          edits, Path('/work'))
-                            self.assertEqual(edits[helper][0], old_input)
-                            bundle.assert_not_called()
+                        self.assertEqual(edits[helper][0], old_input)
+                        bundle.assert_not_called()
+
+    def test_invalid_canonical_recipe_cannot_generate_a_refreshed_helper(self):
+        import apply_boot_service_fix as legacy
+        import image_kernel_services as current
+        prior = legacy.PERF_SCRIPT.read_bytes()
+        init = services.BOOT_INIT
+        helper = current.PATH.lstrip('/')
+        edits = {boot.INIT_PATH: (init, 0o644, 'old-label'),
+                 helper: (prior, 0o755, 'old-label')}
+        receipt = services.image_receipt()
+        receipt['targets']['services']['after'] = 'unreviewed-producer-output'
+        with patch.object(boot, 'init_files', return_value={boot.INIT_PATH: init}), \
+                patch.object(boot, 'image_replacements') as bundle, \
+                patch.object(prepare, 'erofs', return_value=b'raw bytes'), \
+                patch.object(services, 'image_receipts', return_value=(receipt,)):
+            with self.assertRaisesRegex(RuntimeError, 'Invalid image kernel-service prerequisite'):
+                prepare.shared_boot_edits(Path('/raw/system.img'), Path('/raw/vendor.img'),
+                                          edits, Path('/work'))
+            self.assertEqual(edits[helper][0], prior)
+            bundle.assert_not_called()
 
     def test_kernel_helper_tab_duplicate_or_foreign_owner_refuses_before_bundle(self):
         canonical = services.BOOT_INIT

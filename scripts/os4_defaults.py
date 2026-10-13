@@ -237,7 +237,8 @@ def boot_defaults(data, profile=None):
             if b'service ' + name + b' ' in data:
                 raise RuntimeError('Unexpected existing defaults service: ' + name.decode())
             data += block
-    if profile and profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    from phone_profile import modern_runtime
+    if profile and modern_runtime(profile):
         from patch_boot_services import BOOT_INIT
         if BOOT_INIT not in data:
             if b'service hyperos-kernel-services ' in data:

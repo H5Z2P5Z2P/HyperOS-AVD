@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Patch pinned hongkong OS4.0.18 boot services without changing app identity."""
+"""Patch content-audited hongkong boot services without changing app identity."""
 import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -9,7 +10,7 @@ import tempfile
 import zipfile
 
 from common import ROOT, sha256, sdk_path
-from patch_gnss import ARTIFACTS, java
+from patch_gnss import ARTIFACTS, OS4_18_SHA256, java, output_receipt
 
 TARGETS = {
     'qualcomm': ('/system_ext/priv-app/com.qualcomm.location/com.qualcomm.location.apk',
@@ -26,6 +27,13 @@ AFTER = {
     'registration': '2b6c3ddad65ac3c6f65667631c2ac75fd8724a1092250d809bb4d3e7d7d8b1f9',
     'services': '3b1c22fbae3262187af8e040e02962edd7f80ae7369d9bcd724457384a4fd6b1',
     'miui-services': '205bbc10beab0fcd668c79dc2b795c6115fe4b3eca1e3b8eb75f99f5f9702f56',
+}
+# Preserve frozen migration constants above. The modern producer changes only
+# the already-audited GNSS classes2.dex; boot edits still affect classes.dex.
+SERVICE_RECIPES = {
+    TARGETS['services'][1]: AFTER['services'],
+    output_receipt(OS4_18_SHA256)['after']:
+        'a9c0fabb2527c60c27c0498113f2aad337fea617b9ee5aea3470912771172a88',
 }
 PROBE_SHA256 = 'af7486c1f98e01641c10d5089fd46348ce612c6fbf15c1581f50a6bacb6f402a'
 PROBE_SOURCE_SHA256 = 'd5a1290eaeb63b1f3f9e5b2f72b12dd14239ba4441604d4dd1bff85d895d2fa0'
@@ -66,6 +74,52 @@ on property:ro.persistent_properties.ready=true
 on property:sys.boot_completed=1
     start hyperos-kernel-services
 '''
+
+
+def select_recipe(kind, source):
+    """Resolve a fully pinned boot edit by actual input content."""
+    if kind not in TARGETS:
+        raise RuntimeError('Unsupported boot service kind: ' + str(kind))
+    if not isinstance(source, (bytes, str)):
+        raise RuntimeError('Unsupported boot service input: ' + kind)
+    digest = hashlib.sha256(source).hexdigest() if isinstance(source, bytes) else source
+    path, frozen_before, dex = TARGETS[kind]
+    if kind == 'services':
+        after = SERVICE_RECIPES.get(digest)
+    else:
+        after = AFTER[kind] if digest == frozen_before else None
+    if after is None:
+        raise RuntimeError('Unsupported boot service input: ' + kind)
+    return {'path': path, 'before': digest, 'after': after, 'dex': dex}
+
+
+def image_receipt(services_before=None):
+    """Return the frozen receipt by default or one exact registered variant."""
+    targets = {}
+    for name, (_, before, _) in TARGETS.items():
+        recipe = select_recipe(name, services_before
+                               if name == 'services' and services_before is not None else before)
+        targets[name] = {key: recipe[key] for key in ('path', 'before', 'after')}
+    # The firmware field records audited origin, not a runtime version selector.
+    return {'schema': 1, 'firmware': 'OS4.0.18.0.XFRCNXM',
+            'targets': targets, 'probe_sha256': PROBE_SHA256}
+
+
+def image_receipts():
+    """Enumerate exact historical and modern recipes for offline consumers."""
+    return tuple(image_receipt(before) for before in SERVICE_RECIPES)
+
+
+def validate_image_receipt(marker):
+    """Reject extra fields and malformed types, including bool/integer aliases."""
+    try:
+        encoded = json.dumps(marker, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError('Unsupported boot service image receipt.') from error
+    for receipt in image_receipts():
+        if encoded == json.dumps(receipt, sort_keys=True, allow_nan=False):
+            return receipt
+    raise RuntimeError('Unsupported boot service image receipt.')
 
 
 
@@ -120,9 +174,12 @@ def image_replacements(inputs, work):
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
     # Refuse every input before creating any patched output.
+    selected = {}
     for name, data in inputs.items():
-        if hashlib.sha256(data).hexdigest() != TARGETS[name][1]:
-            raise RuntimeError('Unsupported image boot service: ' + name)
+        try:
+            selected[name] = select_recipe(name, data)
+        except RuntimeError as error:
+            raise RuntimeError('Unsupported image boot service: ' + name) from error
     replacements = {}
     for name, data in inputs.items():
         suffix = '.apk' if name in ('qualcomm', 'registration') else '.jar'
@@ -133,13 +190,10 @@ def image_replacements(inputs, work):
             output.read_bytes(), 0o644, 'u:object_r:system_file:s0')
     replacements['system/bin/hyperos_kernel_probe'] = (
         kernel_probe(work / 'kernel-probe').read_bytes(), 0o755, 'u:object_r:system_file:s0')
-    script = Path(__file__).resolve().parent.parent / 'config/check_kernel_services.sh'
-    replacements['system/etc/hyperos-kernel-services.sh'] = (
-        script.read_bytes(), 0o755, 'u:object_r:system_file:s0')
-    return replacements, {'schema': 1, 'firmware': 'OS4.0.18.0.XFRCNXM',
-                          'targets': {name: {'path': path, 'before': before, 'after': AFTER[name]}
-                                      for name, (path, before, _) in TARGETS.items()},
-                          'probe_sha256': PROBE_SHA256}
+    from image_kernel_services import PATH, image_script
+    replacements[PATH.lstrip('/')] = (
+        image_script(), 0o755, 'u:object_r:system_file:s0')
+    return replacements, image_receipt(selected['services']['before'])
 
 
 def kernel_probe(destination):
@@ -356,9 +410,8 @@ EDITS = {
 
 def patch(kind, source, destination):
     source, destination = Path(source), Path(destination)
-    _, expected, dex = TARGETS[kind]
-    if sha256(source) != expected:
-        raise RuntimeError('Unsupported boot service input: ' + kind)
+    recipe = select_recipe(kind, sha256(source))
+    dex = recipe['dex']
     cache = ROOT / 'tools/smali'
     for name, (_, checksum) in ARTIFACTS.items():
         if not (cache / (name + '.jar')).is_file() or sha256(cache / (name + '.jar')) != checksum:
@@ -404,6 +457,6 @@ def patch(kind, source, destination):
             for entry in before.namelist():
                 if entry != dex and before.read(entry) != after.read(entry):
                     raise RuntimeError('Unexpected unrelated service entry change: ' + entry)
-        if sha256(destination) != AFTER[kind]:
+        if sha256(destination) != recipe['after']:
             raise RuntimeError('Boot service output checksum mismatch: ' + kind)
     return destination

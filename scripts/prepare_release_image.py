@@ -44,15 +44,13 @@ def shared_boot_edits(raw, vendor, edits, work):
         from patch_boot_services import BOOT_INIT
         if helpers != [INIT_PATH] or init.count(BOOT_INIT) != 1:
             raise RuntimeError('Unknown existing image kernel helper service.')
-        from apply_boot_service_fix import KERNEL_SCRIPT_HASHES, KERNEL_SCRIPT_SHA256, PERF_SCRIPT
-        path = 'system/etc/hyperos-kernel-services.sh'
+        from apply_boot_service_fix import KERNEL_SCRIPT_HASHES
+        from image_kernel_services import PATH, image_script, image_script_sha256
+        path = PATH.lstrip('/')
         previous = edits[path][0] if path in edits else erofs(raw, '/' + path)
-        if hashlib.sha256(previous).hexdigest() not in KERNEL_SCRIPT_HASHES:
+        if hashlib.sha256(previous).hexdigest() not in (*KERNEL_SCRIPT_HASHES, image_script_sha256()):
             raise RuntimeError('Unknown existing image kernel helper.')
-        current = PERF_SCRIPT.read_bytes()
-        if hashlib.sha256(current).hexdigest() != KERNEL_SCRIPT_SHA256:
-            raise RuntimeError('Unexpected image kernel helper source.')
-        edits[path] = (current, 0o755, 'u:object_r:system_file:s0')
+        edits[path] = (image_script(), 0o755, 'u:object_r:system_file:s0')
     result, receipt = image_replacements(
         graph, graph.get('product/bin/init.qti.display.sh'), init, policy, work)
     edits.update(result)

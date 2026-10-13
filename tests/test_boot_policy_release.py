@@ -152,7 +152,8 @@ class BootPolicyReleaseTests(unittest.TestCase):
         init = files['/' + boot.INIT_PATH] + services.BOOT_INIT
         files['/' + boot.INIT_PATH] = init
         graph[boot.INIT_PATH] = init
-        files['/system/etc/hyperos-kernel-services.sh'] = legacy.PERF_SCRIPT.read_bytes()
+        from image_kernel_services import image_script
+        files['/system/etc/hyperos-kernel-services.sh'] = image_script()
         release.verify_boot_policy({'boot_policy': marker}, files.__getitem__, graph)
         files['/system/etc/hyperos-kernel-services.sh'] = b'old property mutator'
         with self.assertRaisesRegex(RuntimeError, 'conflicts with shared boot policy'):
@@ -173,7 +174,8 @@ class LegacyBootServiceReleaseTests(unittest.TestCase):
         files = {path: ('fixture-' + name).encode() for name, (path, _, _) in services.TARGETS.items()}
         after = {name: digest(files[path]) for name, (path, _, _) in services.TARGETS.items()}
         probe = b'pinned probe fixture'
-        with patch.object(services, 'AFTER', after), patch.object(services, 'PROBE_SHA256', digest(probe)):
+        with patch.object(services, 'AFTER', after), patch.object(services, 'PROBE_SHA256', digest(probe)), \
+                patch.object(services, 'SERVICE_RECIPES', {services.TARGETS['services'][1]: after['services']}):
             marker = {'schema': 1, 'firmware': 'OS4.0.18.0.XFRCNXM',
                       'targets': {name: {'path': path, 'before': before, 'after': after[name]}
                                   for name, (path, before, _) in services.TARGETS.items()},
@@ -190,7 +192,9 @@ fi
 '''
             previous = current.replace(b'PROBE=${1:-', block + b'PROBE=${1:-', 1)
             self.assertEqual(digest(previous), legacy.LEGACY_KERNEL_SCRIPT_SHA256)
-            build = {'hyperos': '4.0.18.0.XFRCNXM', 'boot_service_fix': marker}
+            from phone_profile import profile
+            build = {'hyperos': '4.0.18.0.XFRCNXM', 'boot_service_fix': marker,
+                     'archive_sha256': profile('4.0.18.0.XFRCNXM')['archive_sha256']}
             for helper in (previous, current):
                 files['/system/etc/hyperos-kernel-services.sh'] = helper
                 release.verify_boot_services(build, files.__getitem__)
