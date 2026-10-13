@@ -25,6 +25,13 @@ class CatalogTests(unittest.TestCase):
     install_app = fixture.AppBridgeTests.install_app
     publish = fixture.AppBridgeTests.publish
 
+    def test_released_revision_three_is_frozen_in_reviewed_history(self):
+        frozen = json.loads((REPO / 'tests/fixtures/app-compat-v3-manifest.json').read_text())
+        self.assertEqual(frozen['revision'], 3)
+        self.assertIn(frozen, catalog.previous_manifests())
+        self.assertEqual(digest(catalog.canonical(frozen)),
+                         '291b853daa919f9d06f9a568ad105521e126efa16927c556609d085697ed6c48')
+
     def setUp(self):
         fixture.AppBridgeTests.setUp(self)
         # The namespace double models both file and directory overlays.

@@ -368,7 +368,10 @@ bridge_apply() {
         payload=$(bridge_payload "$target" "$name" "$after" "$placeholder") || { bridge_rollback "$transaction"; return 1; }
         actual=$(bridge_ns_hash 1 "$target")
         BRIDGE_DIRECT_MIGRATED=0
-        if [ "$placeholder" = 1 ] && [ -n "$legacy" ]; then
+        # An immutable image may already carry the exact audited helper. Keep
+        # its inode when every namespace passed preflight; only obsolete bytes
+        # need a writable placeholder and rollback link.
+        if [ "$placeholder" = 1 ] && [ "$actual" != "$after" ] && [ -n "$legacy" ]; then
             case ",$legacy," in *",$actual,"*)
                 bridge_migrate_direct "$target" "$payload" "$actual" "$transaction" || { bridge_rollback "$transaction"; return 1; } ;;
             esac

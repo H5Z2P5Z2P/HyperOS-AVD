@@ -456,6 +456,29 @@ path.write_text(json.dumps(values))
         self.shell('bridge_assets && bridge_cleanup')
         self.assertFalse(installed.exists())
 
+    def test_exact_factory_helper_keeps_readonly_inode_without_migration(self):
+        old, modern = b'obsolete project helper', b'current project helper'
+        helper = self.root / 'libhelper.so'
+        helper.write_bytes(modern)
+        self.options['payloads']['libhelper.so'] = helper
+        self.options['profiles'][0]['libraries'].append(
+            {'name': 'libhelper.so', 'before': bridge.EMPTY, 'after': digest(modern),
+             'placeholder': True, 'legacy_direct': [digest(old), digest(modern)]})
+        self.publish()
+        installed = self.root / (self.native + '/libhelper.so').lstrip('/')
+        installed.write_bytes(modern)
+        installed.chmod(0o444)
+        original_inode = installed.stat().st_ino
+        # EROFS cannot publish a writable placeholder. An exact verified
+        # factory payload must never reach the migration operation.
+        self.shell('bridge_migrate_direct() { return 1; }; bridge_assets && bridge_once')
+        self.assertEqual(installed.stat().st_ino, original_inode)
+        self.assertEqual(installed.read_bytes(), modern)
+        self.assertNotIn(self.native + '/libhelper.so', self.mounts()['1'])
+        self.shell('bridge_assets && bridge_cleanup')
+        self.assertEqual(installed.stat().st_ino, original_inode)
+        self.assertEqual(installed.read_bytes(), modern)
+
     def test_profile_and_payload_guards_reject_aliases_and_unknown_libraries(self):
         for field, value in (('apk_sha256', 'unknown'), ('factory_apk', '/data/app/../escape'),
                              ('id', 'unsafe|id')):
