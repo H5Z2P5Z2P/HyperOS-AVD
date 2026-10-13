@@ -16,8 +16,8 @@ from patch_pad_hwui import (AFTER, BEFORE, PHONE_AFTER, PHONE_BEFORE, PHONE_PROF
 from phone_profile import profile
 
 
-def build_info():
-    value = profile('4.0.18.0.XFRCNXM')
+def build_info(version='4.0.18.0.XFRCNXM'):
+    value = profile(version)
     return {'source': 'official-hongkong-ota', 'hyperos': value['hyperos'],
             'archive_sha256': value['archive_sha256'], 'hwui_renderer': 'skiavk',
             'hwui': {'before': PHONE_BEFORE, 'after': PHONE_AFTER, 'profile': PHONE_PROFILE}}
@@ -77,6 +77,22 @@ class PhoneVulkanNativeTests(unittest.TestCase):
 
 
 class PhoneVulkanRuntimeTests(unittest.TestCase):
+    def test_registered_new_firmware_reuses_the_authenticated_hwui_recipe(self):
+        expected = vulkan_features(build_info())
+        current = build_info('4.0.24.0.XFRCNXM')
+        self.assertEqual(vulkan_features(current), expected)
+        self.assertEqual(vulkan_features({**current, 'name': 'Any_Renamed_AVD',
+                                          'port': 5660, 'avd_path': '/custom/phone.avd'}), expected)
+        with self.assertRaisesRegex(RuntimeError, 'OTA archive identity disagree'):
+            vulkan_features({**current, 'archive_sha256': build_info()['archive_sha256']})
+        for key, value in (('before', '0' * 64), ('after', '0' * 64), ('profile', 'unknown')):
+            with self.subTest(key=key):
+                self.assertEqual(vulkan_features({**current, 'hwui': {**current['hwui'], key: value}}), [])
+        selected = profile(current['hyperos'])
+        selected['pins']['hwui'] = '0' * 64
+        with patch('phone_profile.profile_from_build', return_value=selected):
+            self.assertEqual(vulkan_features(current), [])
+
     def test_submission_workaround_requires_verified_r3_marker_and_keeps_pad(self):
         expected = ['-feature', 'VulkanBatchedDescriptorSetUpdate,-GLAsyncSwap,'
                                '-VulkanQueueSubmitWithCommands']
@@ -129,7 +145,7 @@ class PhoneVulkanRuntimeTests(unittest.TestCase):
 
     def test_gradient_override_accepts_patched_r3_but_rejects_it_for_legacy_r2(self):
         config = {'name': 'Any_Renamed_Phone_AVD', 'port': 5584}
-        for version in ('4.0.17.0.XFRCNXM', '4.0.18.0.XFRCNXM'):
+        for version in ('4.0.17.0.XFRCNXM', '4.0.18.0.XFRCNXM', '4.0.24.0.XFRCNXM'):
             with self.subTest(version=version), patch('apply_flutter_fix.official'), \
                     patch('phone_profile.profile_from_build', return_value=profile(version)), \
                     patch('apply_flutter_fix.root', side_effect=[

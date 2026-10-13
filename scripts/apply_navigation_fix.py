@@ -153,7 +153,8 @@ def patch_watchdog(data):
 
 def image_replacements(apk, firmware):
     """Apply the same audited store deadlines to its identical factory AOT code."""
-    if firmware['hyperos'] != '4.0.18.0.XFRCNXM' or digest(apk) != firmware['pins']['home_apk']:
+    from phone_profile import modern_runtime
+    if not modern_runtime(firmware) or digest(apk) != firmware['pins']['home_apk']:
         raise RuntimeError('Unsupported factory launcher APK for native deadlines.')
     import io
     edits, marker = {}, {'revision': 1, 'apk_sha256': digest(apk), 'libraries': {}}

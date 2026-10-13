@@ -83,8 +83,8 @@ def prepare_boot_policy(source, output):
         raw, vendor = work / 'accepted/system.img', work / 'accepted/vendor.img'
         edits = {}
         if info['source'] == 'official-hongkong-ota' and not info.get('boot_service_fix'):
-            from phone_profile import profile_from_build
-            if profile_from_build(info)['hyperos'] == '4.0.18.0.XFRCNXM':
+            from phone_profile import modern_runtime, profile_from_build
+            if modern_runtime(profile_from_build(info)):
                 from patch_boot_services import TARGETS, BOOT_INIT, BOOT_SEPOLICY
                 from patch_boot_services import image_replacements as service_replacements
                 extra, receipt = service_replacements({
@@ -146,6 +146,8 @@ def authenticated_properties(data):
 def refresh_shared_flutter(data, firmware):
     """Refresh only a known engine from the selected original OTA profile."""
     from patch_flutter import patch, profile
+    from phone_profile import modern_runtime
+    modern_runtime(firmware)
     before, _ = profile(data)
     if before != firmware['pins']['flutter']:
         raise RuntimeError('Shared Flutter engine differs from its original OTA profile.')

@@ -50,8 +50,8 @@ class LockscreenBuilderTests(unittest.TestCase):
     def test_foreign_firmware_and_unpinned_r3_sources_are_refused_before_extraction(self):
         selected = profile(NEW)
         cases = (({'hyperos': '4.0.18.0.XOCCNXM'}, 'profile'),
-                 ({**selected, 'pins': {}}, 'source pin'),
-                 ({**selected, 'pins': {**selected['pins'], 'aod_apk': 'unverified'}}, 'source pin'))
+                 ({**selected, 'pins': {}}, 'modern runtime archive'),
+                 ({**selected, 'pins': {**selected['pins'], 'aod_apk': 'unverified'}}, 'modern runtime archive'))
         for value, message in cases:
             with self.subTest(profile=value['hyperos']), patch.object(video, 'native_from_apk') as extract:
                 with self.assertRaisesRegex(RuntimeError, message):

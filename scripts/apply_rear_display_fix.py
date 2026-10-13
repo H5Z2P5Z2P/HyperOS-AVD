@@ -61,11 +61,9 @@ def same(actual, expected):
 def validate_build(build):
     """Reject unsupported metadata before contacting or changing a guest."""
     from phone_profile import profile_from_build
-    if (not isinstance(build, dict) or build.get('source') != 'official-hongkong-ota'
-            or build.get('hyperos') != rear.VERSION
-            or build.get('archive_sha256') != rear.ARCHIVE_SHA256):
-        raise RuntimeError('Rear wake requires the verified official hongkong 4.0.18.0 source.')
-    rear.validate_profile(profile_from_build(build))
+    if not isinstance(build, dict) or build.get('source') != 'official-hongkong-ota':
+        raise RuntimeError('Rear wake requires a verified official hongkong source.')
+    selected = rear.validate_profile(profile_from_build(build))
     rear.runtime_options(build)
     marker = build.get('rear_display')
     overlay = marker.get('overlay_sha256') if isinstance(marker, dict) else None
@@ -80,7 +78,8 @@ def validate_build(build):
                          'config': f'/product/etc/displayconfig/display_id_{physical}.xml',
                          'config_sha256': rear.SOURCE_SHA256[source],
                          'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
-    expected = {'schema': 1, 'hyperos': rear.VERSION, 'archive_sha256': rear.ARCHIVE_SHA256,
+    expected = {'schema': 1, 'hyperos': selected['hyperos'],
+                'archive_sha256': selected['archive_sha256'],
                 'source_sha256': dict(rear.SOURCE_SHA256), 'mapping_sha256': rear.MAPPING_SHA256,
                 'overlay': rear.OVERLAY, 'overlay_path': '/' + rear.OVERLAY_PATH,
                 'overlay_sha256': overlay, 'overlay_priority': rear.PRIORITY,
@@ -315,10 +314,13 @@ def verify_start(config):
 
 
 def install(config, build=None):
-    """Install without compilation; optionally accept the caller's build data."""
+    """Keep the frozen legacy producer; modern images use the shared Core module."""
     if build is None:
         build = json.loads((ROOT / 'local/build.json').read_text())
     marker = validate_build(build)
+    if build['hyperos'] != rear.VERSION or build['archive_sha256'] != rear.ARCHIVE_SHA256:
+        raise RuntimeError('This legacy rear installer only owns its frozen 4.0.18 source; '
+                           'use the shared Core module for the authenticated current image.')
     if (not isinstance(config.get('name'), str) or not config['name']
             or any(c in config['name'] for c in '\n\r\0')):
         raise RuntimeError('Invalid configured AVD name.')

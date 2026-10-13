@@ -22,6 +22,7 @@ from phone_profile import profile
 
 OLD = '4.0.17.0.XFRCNXM'
 NEW = '4.0.18.0.XFRCNXM'
+CURRENT = '4.0.24.0.XFRCNXM'
 
 
 def density_xml(width, height, density):
@@ -120,6 +121,45 @@ class RearReleaseTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in read_vendor.call_args_list], [composer.NATIVE, sync.NATIVE])
         self.assertEqual(set(call.args[0] for call in read.call_args_list), set(self.system))
         self.compile_wake.assert_not_called()
+
+    def test_current_firmware_requires_its_own_baked_and_release_provenance(self):
+        selected = profile(CURRENT)
+        marker = {**self.marker, 'hyperos': selected['hyperos'],
+                  'archive_sha256': selected['archive_sha256']}
+        build = {**self.build, 'hyperos': selected['hyperos'],
+                 'archive_sha256': selected['archive_sha256'], 'rear_display': marker}
+        system = {**self.system, '/' + rear.MARKER_PATH: json.dumps(marker).encode()}
+        read, read_vendor = self.readers(system)
+        self.assertEqual(package_release.verify_rear_display(
+            selected, build, read, read_vendor, self.template), 12)
+        self.compile_wake.assert_not_called()
+        for changed in (self.marker, {**marker, 'hyperos': NEW},
+                        {**marker, 'archive_sha256': self.selected['archive_sha256']},
+                        {**marker, 'schema': True}):
+            read, read_vendor = self.readers(system)
+            with self.subTest(marker=changed), self.assertRaisesRegex(RuntimeError, 'rear-display resource metadata'):
+                package_release.verify_rear_display(selected, {**build, 'rear_display': changed},
+                                                    read, read_vendor, self.template)
+            read.assert_not_called()
+            read_vendor.assert_not_called()
+        read, read_vendor = self.readers()
+        with self.assertRaisesRegex(RuntimeError, 'resource metadata differs'):
+            package_release.verify_rear_display(selected, build, read, read_vendor, self.template)
+
+    def test_current_firmware_rejects_unknown_or_unpinned_profile_before_image_reads(self):
+        selected = profile(CURRENT)
+        for changed in ({'hyperos': '4.0.999.0.XFRCNXM'},
+                        {'archive_sha256': self.selected['archive_sha256']},
+                        {'pins': {**selected['pins'], 'hwui': '0' * 64}},
+                        {'pins': {**selected['pins'], 'camera_apk': '0' * 64}},
+                        {'source_partition_sha256': {}},
+                        {'display': {**selected['display'], 'density': 480.0}}):
+            read, read_vendor = Mock(), Mock()
+            with self.subTest(profile=changed), self.assertRaises(RuntimeError):
+                package_release.verify_rear_display({**selected, **changed}, self.build,
+                                                    read, read_vendor, self.template)
+            read.assert_not_called()
+            read_vendor.assert_not_called()
 
     def test_wake_receipt_requires_exact_reviewed_revision_source_and_schema(self):
         for marker in (None, {}, {**self.wake, 'revision': 1},
@@ -275,22 +315,27 @@ class RearReleaseTests(unittest.TestCase):
             read.assert_not_called()
             read_vendor.assert_not_called()
 
-    def test_release_metadata_preserves_rear_receipts_only_for_r3(self):
+    def test_release_metadata_preserves_rear_receipts_for_registered_modern_images(self):
         keys = ('rear_display', 'rear_display_composer_fix', 'goldfish_sync_fix',
                 'rear_display_wake_fix')
-        for version in (OLD, NEW):
+        for version in (OLD, NEW, CURRENT):
             selected = profile(version)
             build = {**self.build, 'hyperos': version, 'archive_sha256': selected['archive_sha256'],
                      'android_api': 37, 'adb_authentication': True, 'flutter_render_fix': 6,
                      'native_quickstep_identity': True, 'preinstalled_apps': {'apps': ['fixture']},
                      'avd_defaults': {'fixture': True}}
+            build['rear_display'] = {**build['rear_display'], 'hyperos': version,
+                                     'archive_sha256': selected['archive_sha256']}
+            if version == CURRENT:
+                from patch_boot_services import image_receipts
+                build['boot_service_fix'] = image_receipts()[-1]
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'local').mkdir()
                 (root / 'local/build.json').write_text(json.dumps(build))
                 metadata = package_release.release_metadata(root, 'os4-official')
                 for key in keys:
-                    if version == NEW:
+                    if version != OLD:
                         self.assertEqual(metadata['build'][key], build[key])
                     else:
                         self.assertNotIn(key, metadata['build'])

@@ -25,10 +25,16 @@ def vulkan_features(build):
     """Select audited descriptor, submission and presentation workarounds."""
     if build.get('source') == 'official-yingtian-ota':
         return ['-feature', VULKAN_BASE_FEATURES]
-    if (build.get('source') == 'official-hongkong-ota'
-            and build.get('hyperos') == '4.0.18.0.XFRCNXM'):
-        from phone_profile import profile_from_build
+    if build.get('source') == 'official-hongkong-ota':
+        from phone_profile import modern_runtime, profile as registered_profile, profile_from_build
         from patch_pad_hwui import PHONE_BEFORE, PHONE_AFTER, PHONE_PROFILE
+        # Incomplete/unknown builds have no authenticated content recipe.
+        try:
+            selected = registered_profile(build.get('hyperos'))
+        except RuntimeError:
+            return []
+        if not modern_runtime(selected):
+            return []
         profile = profile_from_build(build)
         expected = {'before': PHONE_BEFORE, 'after': PHONE_AFTER, 'profile': PHONE_PROFILE}
         if (profile['pins']['hwui'] == PHONE_BEFORE and build.get('hwui') == expected

@@ -203,6 +203,41 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(self.source_files(), original)
         self.assertNotIn(b'stale rejected cache', dict(self.packs[0]).values())
 
+    def test_new_registered_source_retains_baked_repairs_and_private_userdata(self):
+        from patch_boot_services import image_receipts
+        self.selected = phone_profile.profile('4.0.24.0.XFRCNXM')
+        self.info.update(hyperos=self.selected['hyperos'],
+                         archive_sha256=self.selected['archive_sha256'],
+                         boot_service_fix=image_receipts()[-1],
+                         rear_display={'hyperos': self.selected['hyperos'],
+                                       'archive_sha256': self.selected['archive_sha256']})
+        self.write_info()
+        original = self.source_files()
+        self.mocked_pipeline()
+        prepare.prepare(self.source, self.output)
+        self.assertEqual(self.source_files(), original)
+        self.assertFalse((self.output / 'avd').exists())
+        saved = json.loads((self.output / 'local/build.json').read_text())
+        for key in ('hyperos', 'archive_sha256', 'boot_service_fix', 'rear_display'):
+            self.assertEqual(saved[key], self.info[key])
+        self.assertEqual(saved['flutter_engine']['before'], self.selected['pins']['flutter'])
+        self.assertEqual(set(dict(self.packs[0])), set(self.partitions))
+
+    def test_unknown_or_tampered_phone_source_refuses_before_output(self):
+        original_info = self.info.copy()
+        self.mocked_pipeline()
+        for key, value in (('hyperos', '4.0.999.0.XFRCNXM'), ('archive_sha256', 'f' * 64)):
+            with self.subTest(key=key):
+                self.info = dict(original_info, **{key: value})
+                self.write_info()
+                original = self.source_files()
+                with self.assertRaises(RuntimeError):
+                    prepare.prepare(self.source, self.output)
+                self.assertEqual(self.source_files(), original)
+                self.assertFalse(self.output.exists())
+        self.assertEqual(self.builds, [])
+        self.assertEqual(self.packs, [])
+
     def test_packed_receipt_mismatch_rejects_before_output_or_build(self):
         self.info['system_sha256'] = digest(b'another accepted image')
         self.write_info()

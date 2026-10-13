@@ -26,6 +26,10 @@ class PhoneBuilderIsolationTests(unittest.TestCase):
         new = candidate_defaults({'hyperos': '4.0.18.0.XFRCNXM'}, REPO)
         self.assertEqual(old, (REPO / 'work/os4-official', 'HyperOS_4_Official_API_37', 5574))
         self.assertEqual(new, (REPO / 'work/os4-r3-build', 'HyperOS_4_R3_API_37', 5584))
+        latest = candidate_defaults({'hyperos': '4.0.24.0.XFRCNXM'}, REPO)
+        self.assertEqual(latest, (REPO / 'work/os4-r6-build', 'HyperOS_4_R6_API_37', 5584))
+        self.assertNotEqual(latest[0], old[0])
+        self.assertNotEqual(latest[0], new[0])
         self.assertTrue(all(previous != candidate for previous, candidate in zip(old, new)))
         with self.assertRaisesRegex(RuntimeError, 'No isolated build defaults'):
             candidate_defaults({'hyperos': 'unverified'}, REPO)
@@ -180,8 +184,8 @@ class PhoneBuilderIsolationTests(unittest.TestCase):
 
 class PhoneBuilderHardwareTests(unittest.TestCase):
     def test_vulkan_is_selected_only_for_r3_and_legacy_r2_stays_reproducible(self):
-        previous = {'hyperos': '4.0.17.0.XFRCNXM'}
-        candidate = {'hyperos': '4.0.18.0.XFRCNXM'}
+        previous = profile('4.0.17.0.XFRCNXM')
+        candidate = profile('4.0.18.0.XFRCNXM')
         self.assertEqual(phone_renderer(previous), 'skiagl')
         self.assertEqual(renderer_properties(previous),
                          b'ro.mediaserver.64b.enable=true\ndebug.hwui.renderer=skiagl\n'
@@ -193,12 +197,15 @@ class PhoneBuilderHardwareTests(unittest.TestCase):
         self.assertEqual(renderer_init(candidate),
                          b'    setprop debug.hwui.renderer skiavk\n'
                          b'    setprop debug.renderengine.backend skiavkthreaded\n')
+        latest = profile('4.0.24.0.XFRCNXM')
+        self.assertEqual(renderer_properties(latest), renderer_properties(candidate))
+        self.assertEqual(renderer_init(latest), renderer_init(candidate))
         with self.assertRaisesRegex(RuntimeError, 'No verified phone renderer'):
             phone_renderer({'hyperos': 'unknown'})
 
     def test_native_replacement_refuses_an_unpinned_source_before_patching(self):
         from phone_profile import profile
-        for version in ('4.0.17.0.XFRCNXM', '4.0.18.0.XFRCNXM'):
+        for version in ARCHIVES:
             with self.subTest(version=version), self.assertRaisesRegex(RuntimeError, 'HWUI source'):
                 native_hwui(profile(version), b'unknown firmware native library')
 
@@ -209,10 +216,10 @@ class PhoneBuilderHardwareTests(unittest.TestCase):
                     'hw.lcd.width': '1120', 'hw.lcd.height': '2436', 'hw.lcd.density': '480',
                     'hw.camera.back': 'virtualscene', 'hw.camera.front': 'emulated',
                     'hw.audioOutput': 'yes', 'kernel.parameters': 'androidboot.selinux=enforcing'}
-        for version in ('4.0.17.0.XFRCNXM', '4.0.18.0.XFRCNXM'):
+        for version in ARCHIVES:
             with self.subTest(version=version):
-                profile = {'hyperos': version, 'display': {'width': 1120, 'height': 2436, 'density': 480}}
-                template = avd_template(original, profile)
+                selected = profile(version)
+                template = avd_template(original, selected)
                 values = dict(line.split('=', 1) for line in template.splitlines() if '=' in line)
                 self.assertEqual({key: values[key] for key in expected}, expected)
                 self.assertTrue(all(key not in values for key in ('path', 'path.rel', 'image.sysdir.1')))

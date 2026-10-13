@@ -66,9 +66,14 @@ RUNTIME_PAYLOADS = {variant: OS4_RUNTIME_PAYLOADS for variant in ('os4-official'
 
 
 def verify_lockscreen_video(profile, build, read):
-    """Require the exact r3 receipt, signed APK and patched native producer."""
-    if profile['hyperos'] != '4.0.18.0.XFRCNXM':
+    """Require the audited producer for authenticated modern phone inputs."""
+    if profile.get('hyperos') in ('4.0.17.0.XFRCNXM', '4.0.6.0.XOCCNXM'):
         return 0
+    from phone_profile import modern_runtime
+    try:
+        modern_runtime(profile)
+    except RuntimeError as error:
+        raise RuntimeError('Missing verified phone lockscreen video metadata or source pin.') from error
     from patch_lockscreen_video import MANIFEST
     if (build.get('lockscreen_video_fix') != MANIFEST
             or profile.get('pins', {}).get('aod_apk') != MANIFEST['apk_sha256']):
@@ -81,9 +86,10 @@ def verify_lockscreen_video(profile, build, read):
 
 
 def verify_rear_display(profile, build, read, read_vendor, template):
-    """Verify the r3 physical rear panel from the packed image's actual bytes."""
-    from rear_display_config import VERSION
-    if profile.get('hyperos') != VERSION:
+    """Verify the physical rear panel from authenticated source and image bytes."""
+    # These frozen non-rear generations have no rear artifacts to verify.
+    # The full image verifier authenticates its selected firmware separately.
+    if profile.get('hyperos') in ('4.0.17.0.XFRCNXM', '4.0.6.0.XOCCNXM', '3.0.2.0.WMCCNXM'):
         return 0
     import xml.etree.ElementTree as ET
     import rear_display_config as rear
@@ -92,7 +98,7 @@ def verify_rear_display(profile, build, read, read_vendor, template):
     from patch_goldfish_sync import MANIFEST as SYNC_FIX
     from apply_rear_display_fix import EXPECTED_WAKE_MANIFEST as WAKE_FIX
     import rear_display_wake as wake
-    rear.validate_profile(profile)
+    profile = rear.validate_profile(profile)
     alpha = {**ALPHA_FIX, 'native_sha256': REAR_FIX['native_sha256']}
     if (build.get('rear_display_composer_fix') != REAR_FIX
             or build.get('composer_alpha_fix') != alpha
@@ -111,7 +117,7 @@ def verify_rear_display(profile, build, read, read_vendor, template):
                          'config': f'/product/etc/displayconfig/display_id_{physical}.xml',
                          'config_sha256': rear.SOURCE_SHA256[source],
                          'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
-    expected = {'schema': 1, 'hyperos': rear.VERSION, 'archive_sha256': rear.ARCHIVE_SHA256,
+    expected = {'schema': 1, 'hyperos': profile['hyperos'], 'archive_sha256': profile['archive_sha256'],
                 'source_sha256': dict(rear.SOURCE_SHA256), 'mapping_sha256': rear.MAPPING_SHA256,
                 'overlay': rear.OVERLAY, 'overlay_path': '/' + rear.OVERLAY_PATH,
                 'overlay_sha256': marker['overlay_sha256'], 'overlay_priority': rear.PRIORITY,
@@ -289,7 +295,7 @@ def verify_os4_image(root, metadata):
     """Verify the release's actual packed image and baked compatibility files."""
     from lp_image import read_lp
     from os4_defaults import COMPONENT_XML, PROVIDER, AOD_INIT, LOG_SCRIPT, LOG_TAGS, phone_scripts
-    from phone_profile import profile_from_build
+    from phone_profile import modern_runtime, profile_from_build
     from patch_flutter import PROFILES
     from patch_weather import ANGLE
     from patch_assistant import profile as assistant_profile
@@ -352,7 +358,7 @@ def verify_os4_image(root, metadata):
         from os4_boot_policy import init_files
         graph = init_files([('', raw), ('vendor', vendor)])
         boot_policy_files = verify_boot_policy(metadata['build'], read, graph)
-    if selected['hyperos'] != '4.0.18.0.XFRCNXM':
+    if not modern_runtime(selected):
         if metadata['build'].get('composer_alpha_fix') != COMPOSER_FIX:
             raise RuntimeError('Missing verified ranchu composer alpha fix metadata.')
         if hashlib.sha256(read_vendor(COMPOSER_FIX['native'])).hexdigest() != COMPOSER_FIX['native_sha256']:
@@ -423,7 +429,7 @@ def verify_os4_image(root, metadata):
         '/system_ext/lib64/libhyper_os_flutter.so': PROFILES[selected['pins']['flutter']]['output'],
         **{'/system/lib64/' + name: checksum for name, checksum in ANGLE.items()},
     }
-    if selected['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(selected):
         from apply_navigation_fix import AOT_BEFORE, AOT_AFTER, WATCHDOG_BEFORE, WATCHDOG_AFTER
         from patch_pad_hwui import NATIVE, PHONE_BEFORE, PHONE_AFTER, PHONE_PROFILE
         hwui = {'before': PHONE_BEFORE, 'after': PHONE_AFTER, 'profile': PHONE_PROFILE}
@@ -466,8 +472,9 @@ def release_metadata(root, variant):
                 'kernelsu': '3.3.0 (32601)', 'gnss_patch': 'status-satellite-first-fix-async'}
     if variant == 'os4-official':
         build = json.loads((root / 'local/build.json').read_text())
-        from phone_profile import profile_from_build
+        from phone_profile import modern_runtime, profile_from_build
         selected = profile_from_build(build)
+        modern = modern_runtime(selected)
         if (build.get('source') != OS4_SOURCE or build.get('android_api') != 37
                 or build.get('hyperos') != selected['hyperos']
                 or build.get('adb_authentication') is not True
@@ -475,6 +482,9 @@ def release_metadata(root, variant):
                 or not build.get('native_quickstep_identity')
                 or not build.get('preinstalled_apps') or not build.get('avd_defaults')):
             raise RuntimeError('OS4 release requires the verified official image, native fixes, defaults and secure ADB.')
+        if (modern and selected['hyperos'] != '4.0.18.0.XFRCNXM'
+                and build.get('boot_service_fix') is None):
+            raise RuntimeError('Modern phone releases require the audited boot-service repairs and forward upgrade policy.')
         metadata.update(format=3, variant=variant, hyperos=build['hyperos'], android_api=37,
                         source=OS4_SOURCE, source_device='hongkong', hardware_base_api=36,
                         build={key: build[key] for key in BUILD_KEYS if key in build})
@@ -497,7 +507,7 @@ def release_metadata(root, variant):
             'userdata_family': 'os4-hongkong-api37-ranchu-4k',
             'upgrade_from': ['v0.2.0-a17-hyperos4-hongkong-r1'],
             'runtime_in_bundle': True}
-        if selected['hyperos'] == '4.0.18.0.XFRCNXM':
+        if modern:
             from manage import MODULE_UPGRADE_PREFLIGHT
             if 'lockscreen_video_fix' in build:
                 metadata['build']['lockscreen_video_fix'] = build['lockscreen_video_fix']
@@ -522,6 +532,10 @@ def release_metadata(root, variant):
 
 def default_release_version(variant, metadata):
     if variant == 'os4-official':
+        from phone_profile import profile
+        selected = profile(metadata['hyperos'])
+        if selected['hyperos'] == '4.0.24.0.XFRCNXM':
+            return 'v0.2.5-a17-hyperos4-hongkong-r6'
         if metadata.get('build', {}).get('boot_service_fix') is not None:
             return 'v0.2.4-a17-hyperos4-hongkong-r5'
         if metadata['hyperos'] == '4.0.18.0.XFRCNXM':

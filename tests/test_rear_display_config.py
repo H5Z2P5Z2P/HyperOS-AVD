@@ -55,6 +55,102 @@ def reference_tables():
 
 
 class RearResourceGuardTests(unittest.TestCase):
+    def test_image_recipe_keeps_resources_and_binds_new_marker_to_its_source(self):
+        sources = {path: ('signed source fixture: ' + path).encode()
+                   for path in rear.SOURCE_SHA256}
+        for identifier, geometry in zip(rear.SOURCE_IDS, ((1120, 2436, 480), (912, 596, 450))):
+            width, height, density = geometry
+            sources[f'product/etc/displayconfig/display_id_{identifier}.xml'] = (
+                '<displayConfiguration><densityMapping><density>'
+                f'<width>{width}</width><height>{height}</height><density>{density}</density>'
+                '</density></densityMapping></displayConfiguration>').encode()
+        hashes = {path: hashlib.sha256(data).hexdigest() for path, data in sources.items()}
+
+        def read(image, path):
+            part = Path(image).stem
+            relative = path.removeprefix('/system/') if part == 'system' else path.removeprefix('/')
+            return sources[part + '/' + relative]
+
+        results = []
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(rear, 'SOURCE_SHA256', hashes), \
+                patch('build_image.erofs', side_effect=read), \
+                patch.object(rear, 'build_overlay', return_value=b'ID-only overlay') as compile:
+            for version in ('4.0.18.0.XFRCNXM', '4.0.24.0.XFRCNXM'):
+                selected = profile(version)
+                edits, marker = rear.image_replacements(selected, temporary, SDK, temporary)
+                results.append(edits)
+                self.assertEqual(marker['hyperos'], selected['hyperos'])
+                self.assertEqual(marker['archive_sha256'], selected['archive_sha256'])
+                self.assertEqual(marker['source_sha256'], hashes)
+                self.assertEqual(json.loads(edits[rear.MARKER_PATH][0]), marker)
+                self.assertFalse(set(edits) & set(sources))
+                self.assertEqual([entry['density'] for entry in marker['displays']], [480, 450])
+            self.assertEqual({key: value for key, value in results[0].items() if key != rear.MARKER_PATH},
+                             {key: value for key, value in results[1].items() if key != rear.MARKER_PATH})
+            self.assertEqual(compile.call_count, 2)
+            for path in sources:
+                original = sources[path]
+                sources[path] += b'tamper'
+                compile.reset_mock()
+                output = Path(temporary) / 'unexpected-output'
+                with self.subTest(source=path), self.assertRaisesRegex(RuntimeError, 'Unexpected original'):
+                    rear.image_replacements(profile('4.0.24.0.XFRCNXM'), temporary, SDK, output)
+                compile.assert_not_called()
+                self.assertFalse(output.exists())
+                sources[path] = original
+
+    def test_registered_new_source_reuses_geometry_with_current_provenance(self):
+        from patch_rear_display import MANIFEST as COMPOSER
+        from patch_goldfish_sync import MANIFEST as SYNC
+        current = profile('4.0.24.0.XFRCNXM')
+        self.assertEqual(rear.validate_profile(current), current)
+        old = profile('4.0.18.0.XFRCNXM')
+        original = b'ro.test.keep=true\npersist.sys.rear_user_preference=false\n'
+        self.assertEqual(rear.properties(original, current), rear.properties(original, old))
+        self.assertEqual(rear.boot_init(current), rear.boot_init(old))
+        marker = {'schema': 1, 'hyperos': current['hyperos'],
+                  'archive_sha256': current['archive_sha256'],
+                  'source_sha256': dict(rear.SOURCE_SHA256),
+                  'mapping_sha256': rear.MAPPING_SHA256, 'overlay': rear.OVERLAY,
+                  'overlay_priority': rear.PRIORITY}
+        build = {'source': 'official-hongkong-ota', 'hyperos': current['hyperos'],
+                 'archive_sha256': current['archive_sha256'], 'rear_display': marker,
+                 'rear_display_composer_fix': dict(COMPOSER), 'goldfish_sync_fix': dict(SYNC)}
+        expected = ['-append-userspace-opt', rear.BOOT_PROPERTY]
+        self.assertEqual(rear.runtime_options(build), expected)
+        mutations = ({'hyperos': old['hyperos'], 'archive_sha256': old['archive_sha256']},
+                     {'hyperos': old['hyperos']}, {'archive_sha256': old['archive_sha256']},
+                     {'schema': True}, {'schema': 1.0}, {'source_sha256': {}},
+                     {'mapping_sha256': '0' * 64}, {'overlay_priority': 1001.0})
+        for fields in mutations:
+            with self.subTest(marker=fields), self.assertRaises(RuntimeError):
+                rear.runtime_options({**build, 'rear_display': {**marker, **fields}})
+        for key in ('rear_display_composer_fix', 'goldfish_sync_fix'):
+            with self.subTest(receipt=key), self.assertRaises(RuntimeError):
+                rear.runtime_options({**build, key: {**build[key], 'revision': True}})
+        with self.assertRaises(RuntimeError):
+            rear.runtime_options({**build, 'archive_sha256': old['archive_sha256']})
+
+    def test_new_source_native_pins_and_partition_identity_fail_closed(self):
+        current = profile('4.0.24.0.XFRCNXM')
+        variants = [None, {**current, 'hyperos': '4.0.999.0.XFRCNXM'},
+                    {**current, 'pins': {**current['pins'], 'hwui': '0' * 64}},
+                    {**current, 'pins': {**current['pins'], 'aod_apk': '0' * 64}},
+                    {**current, 'archive_sha256': profile('4.0.18.0.XFRCNXM')['archive_sha256']},
+                    {**current, 'source_partition_sha256': {
+                        **current['source_partition_sha256'], 'product': '0' * 64}},
+                    {**current, 'model_xml_sha256': '0' * 64},
+                    {**current, 'display': {**current['display'], 'density': 480.0}}]
+        for selected in variants:
+            with self.subTest(profile=selected), tempfile.TemporaryDirectory() as temporary, \
+                    patch('build_image.erofs') as read:
+                output = Path(temporary) / 'output'
+                with self.assertRaisesRegex(RuntimeError, 'Unsupported official hongkong'):
+                    rear.image_replacements(selected, temporary, SDK, output)
+                read.assert_not_called()
+                self.assertFalse(output.exists())
+
     def test_hardware_properties_are_idempotent_and_keep_user_preferences(self):
         selected = profile('4.0.18.0.XFRCNXM')
         original = (b'ro.test.keep=value\npersist.sys.multi_display_type=0\n'

@@ -39,9 +39,10 @@ def source_profile(data):
 
 
 def phone_hashes(profile):
-    """Accept the preload fix only for the independently verified r3 source."""
+    """Accept the preload fix only for authenticated, byte-identical inputs."""
+    from phone_profile import modern_runtime
     original = profile['pins']['hwui']
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM' and original == PHONE_BEFORE:
+    if modern_runtime(profile) and original == PHONE_BEFORE:
         return (original, PHONE_AFTER)
     return (original,)
 

@@ -7,9 +7,9 @@ import re
 import subprocess
 import xml.etree.ElementTree as ET
 
+# Frozen legacy module identity; current image/runtime selection uses profiles.
 VERSION = '4.0.18.0.XFRCNXM'
 ARCHIVE_SHA256 = 'b022c3fcfeb52ac014e971ea48dd07f8b35a0fb3fbdec74798da22375f7933e4'
-PRODUCT_SHA256 = 'd6881694209ec53f9bf728ff27468c3c26627126abac1cea16a9b47c91ca08c7'
 SOURCE_IDS = (4630947121878579347, 4630947121878579348)
 # SurfaceFlinger IDs for the emulator's fixed EMU_display_0/1 EDIDs.
 PHYSICAL_IDS = (4619827259835644672, 4619827551948147201)
@@ -61,14 +61,21 @@ ARRAY_REFERENCES = {
 
 
 def validate_profile(profile):
-    """Refuse every source other than the verified official hongkong 4.0.18."""
-    if (not isinstance(profile, dict) or profile.get('device') != 'hongkong' or
-            profile.get('hyperos') != VERSION or
-            profile.get('incremental') != 'OS' + VERSION or
-            profile.get('archive_sha256') != ARCHIVE_SHA256 or
-            profile.get('source_partition_sha256', {}).get('product') != PRODUCT_SHA256 or
-            profile.get('display') != {'width': 1120, 'height': 2436, 'density': 480}):
+    """Authenticate registered firmware before selecting the shared rear recipe."""
+    from phone_profile import modern_runtime, profile as registered_profile
+    try:
+        selected = registered_profile(profile.get('hyperos'))
+        modern = modern_runtime(profile)
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError('Unsupported official hongkong rear-display profile.') from error
+    keys = ('device', 'incremental', 'source_partition_sha256', 'display',
+            'model_xml_sha256')
+    if (not modern or selected['device'] != 'hongkong'
+            or any(json.dumps(profile.get(key), sort_keys=True) !=
+                   json.dumps(selected.get(key), sort_keys=True) for key in keys)
+            or selected['display'] != {'width': 1120, 'height': 2436, 'density': 480}):
         raise RuntimeError('Unsupported official hongkong rear-display profile.')
+    return selected
 
 
 def properties(data, profile):
@@ -104,14 +111,17 @@ def runtime_options(build):
     from phone_profile import profile_from_build
     from patch_rear_display import MANIFEST
     from patch_goldfish_sync import MANIFEST as SYNC_MANIFEST
-    validate_profile(profile_from_build(build))
-    expected = {'schema': 1, 'hyperos': VERSION, 'archive_sha256': ARCHIVE_SHA256,
+    selected = validate_profile(profile_from_build(build))
+    expected = {'schema': 1, 'hyperos': selected['hyperos'],
+                'archive_sha256': selected['archive_sha256'],
                 'source_sha256': SOURCE_SHA256, 'mapping_sha256': MAPPING_SHA256,
                 'overlay': OVERLAY, 'overlay_priority': PRIORITY}
-    if (not isinstance(marker, dict) or any(marker.get(key) != value
+    if (not isinstance(marker, dict) or any(json.dumps(marker.get(key), sort_keys=True) !=
+                                           json.dumps(value, sort_keys=True)
                                            for key, value in expected.items()) or
-            build.get('rear_display_composer_fix') != MANIFEST or
-            build.get('goldfish_sync_fix') != SYNC_MANIFEST):
+            any(json.dumps(build.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
+                for key, value in (('rear_display_composer_fix', MANIFEST),
+                                   ('goldfish_sync_fix', SYNC_MANIFEST)))):
         raise RuntimeError('Unverified physical rear-display build metadata.')
     return ['-append-userspace-opt', BOOT_PROPERTY]
 
@@ -237,7 +247,7 @@ def build_overlay(sdk, folder, sources):
 
 def image_replacements(profile, partitions, sdk, folder):
     """Add display-ID aliases and one RRO without editing the signed sources."""
-    validate_profile(profile)
+    profile = validate_profile(profile)
     from build_image import erofs
     partitions = Path(partitions)
     sources = {}
@@ -258,7 +268,8 @@ def image_replacements(profile, partitions, sdk, folder):
                          'unique_id': 'local:' + str(physical),
                          'config': '/' + destination, 'config_sha256': SOURCE_SHA256[source],
                          'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
-    marker = {'schema': 1, 'hyperos': VERSION, 'archive_sha256': ARCHIVE_SHA256,
+    marker = {'schema': 1, 'hyperos': profile['hyperos'],
+              'archive_sha256': profile['archive_sha256'],
               'source_sha256': dict(SOURCE_SHA256), 'mapping_sha256': MAPPING_SHA256,
               'overlay': OVERLAY, 'overlay_path': '/' + OVERLAY_PATH,
               'overlay_sha256': hashlib.sha256(overlay).hexdigest(),

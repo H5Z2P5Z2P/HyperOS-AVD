@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import zipfile
 
+from phone_profile import modern_runtime
+
 SOURCE_PARTITIONS = ('system', 'system_ext', 'product', 'mi_ext', 'mi_product',
                      'vendor', 'odm', 'system_dlkm', 'vendor_dlkm')
 
@@ -29,6 +31,8 @@ def candidate_defaults(profile, repo):
         return repo / 'work/os4-official', 'HyperOS_4_Official_API_37', 5574
     if profile['hyperos'] == '4.0.18.0.XFRCNXM':
         return repo / 'work/os4-r3-build', 'HyperOS_4_R3_API_37', 5584
+    if profile['hyperos'] == '4.0.24.0.XFRCNXM':
+        return repo / 'work/os4-r6-build', 'HyperOS_4_R6_API_37', 5584
     raise RuntimeError('No isolated build defaults exist for this phone OTA.')
 
 
@@ -55,12 +59,11 @@ def validate_workspace_firmware(profile, workspace):
 
 
 def phone_renderer(profile):
-    """Keep r2 reproducible while selecting the verified r3 Vulkan path."""
-    if profile['hyperos'] == '4.0.17.0.XFRCNXM':
-        return 'skiagl'
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
-        return 'skiavk'
-    raise RuntimeError('No verified phone renderer exists for this OTA.')
+    """Preserve the legacy renderer and authenticate current native inputs."""
+    try:
+        return 'skiavk' if modern_runtime(profile) else 'skiagl'
+    except RuntimeError as error:
+        raise RuntimeError('No verified phone renderer exists for this OTA.') from error
 
 
 def renderer_properties(profile):
@@ -92,11 +95,9 @@ def native_hwui(profile, data):
 
 
 def lockscreen_video_replacements(profile, apk):
-    """Add the verified phone r3 native producer beside the signed AOD APK."""
-    if profile['hyperos'] == '4.0.17.0.XFRCNXM':
+    """Select the audited producer by the authenticated signed AOD input."""
+    if not modern_runtime(profile):
         return {}, None
-    if profile['hyperos'] != '4.0.18.0.XFRCNXM':
-        raise RuntimeError('No verified phone lockscreen video profile for this OTA.')
     from patch_lockscreen_video import APK_SHA256, MANIFEST, NATIVE, native_from_apk
     if profile.get('pins', {}).get('aod_apk') != APK_SHA256:
         raise RuntimeError('No verified phone lockscreen video APK source pin.')
@@ -128,7 +129,7 @@ def avd_template(original, profile):
                    'target': 'android-37.0', 'hw.ramSize': '6144', 'hw.cpu.ncore': '4',
                    'disk.dataPartition.size': '32G', 'hw.audioOutput': 'yes',
                    'hw.camera.back': 'virtualscene', 'hw.camera.front': 'emulated'})
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         values.update({'hw.hotplug_multi_display': 'no', 'hw.multi_display_window': 'yes'})
     template = ''.join(key + '=' + value + '\n' for key, value in values.items())
     return display_template(template, profile=profile)
@@ -194,7 +195,7 @@ def main():
     validate_workspace_firmware(profile, workspace)
     os.environ['HYPEROS_AVD_WORKSPACE'] = str(workspace)
     from common import (ROOT, OS4_SOURCE, avd_home, fetch_ksu,
-                        firmware_idle, host_check, port_free, sdk_path)
+                        firmware_idle, host_check, port_free, sdk_path, sha256)
     from build_image import erofs
     from erofs_image import build
     from init_userdata import create
@@ -272,7 +273,7 @@ def main():
                                     ROOT / 'work/vendor-alpha-tree')
     (ROOT / 'work/vendor-alpha-fixed.img').replace(vendor)
     rear_composer_manifest = sync_manifest = None
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         from patch_rear_display import build_vendor as build_rear_vendor
         from patch_goldfish_sync import build_vendor as build_sync_vendor
         rear_composer_manifest = build_rear_vendor(vendor, ROOT / 'work/vendor-rear-fixed.img',
@@ -299,7 +300,7 @@ def main():
     prop += b'\n# HyperOS-AVD virtual hardware and native effects.\n'
     prop += renderer_properties(profile)
     prop = production_properties(prop, profile=profile)
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         from rear_display_config import properties as rear_properties
         prop = rear_properties(prop, profile)
     put('system/build.prop', prop, 0o600)
@@ -332,7 +333,7 @@ def main():
     init += renderer_init(profile)
     init += b'    setprop persist.sys.background_blur_supported true\n'
     init += b'\non property:ro.persistent_properties.ready=true\n    setprop persist.sys.background_blur_supported true\n'
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         from rear_display_config import boot_init as rear_init
         init += rear_init(profile)
     from os4_defaults import boot_defaults
@@ -348,7 +349,7 @@ def main():
     fixed_services = patch(services, ROOT / 'work/services-gps-fixed.jar')
     put('system/framework/services.jar', fixed_services)
     boot_service_manifest = None
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         from patch_boot_services import BOOT_SEPOLICY, image_replacements as service_replacements
         service_edits, boot_service_manifest = service_replacements({
             'services': fixed_services,
@@ -371,7 +372,7 @@ def main():
     lockscreen_manifest = None
     rear_manifest = None
     rear_wake_manifest = None
-    if profile['hyperos'] == '4.0.18.0.XFRCNXM':
+    if modern_runtime(profile):
         from apply_navigation_fix import image_replacements as launcher_replacements
         from patch_lockscreen_video import APK as AOD_APK
         launcher_edits, launcher_manifest = launcher_replacements(erofs(
@@ -435,6 +436,8 @@ def main():
         'hwui_renderer': phone_renderer(profile), 'hwui': hwui_manifest,
         'mi_ext_overlays': True, 'mi_ext_software_identity': True, 'flutter_render_fix': 6,
         'preinstalled_apps': app_manifest,
+        'system_sha256': sha256(ROOT / 'images/system.img'),
+        'raw_sha256': sha256(image),
         'native_quickstep_identity': True,
         'factory_launcher_deadlines': launcher_manifest,
         'assistant_render_fix': assistant_manifest,

@@ -19,13 +19,15 @@ import module_lifecycle as lifecycle
 import rear_display_config as rear
 from patch_goldfish_sync import MANIFEST as SYNC
 from patch_rear_display import MANIFEST as COMPOSER
+from phone_profile import profile
 
 DISPLAY = ('DisplayInfo{"Rear", displayId 1, displayGroupId 1, '
            'uniqueId "local:4619827551948147201", state OFF}')
 JAR = b'reviewed DEX fixture for installation guards'
 
 
-def build_fixture(wake):
+def build_fixture(wake, version=rear.VERSION):
+    selected = profile(version)
     displays = []
     for original, physical, geometry in zip(rear.SOURCE_IDS, rear.PHYSICAL_IDS,
                                             ((1120, 2436, 480), (912, 596, 450))):
@@ -35,7 +37,8 @@ def build_fixture(wake):
                          'config': f'/product/etc/displayconfig/display_id_{physical}.xml',
                          'config_sha256': rear.SOURCE_SHA256[source],
                          'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
-    marker = {'schema': 1, 'hyperos': rear.VERSION, 'archive_sha256': rear.ARCHIVE_SHA256,
+    marker = {'schema': 1, 'hyperos': selected['hyperos'],
+              'archive_sha256': selected['archive_sha256'],
               'source_sha256': dict(rear.SOURCE_SHA256), 'mapping_sha256': rear.MAPPING_SHA256,
               'overlay': rear.OVERLAY, 'overlay_path': '/' + rear.OVERLAY_PATH,
               'overlay_sha256': hashlib.sha256(b'ID-only RRO fixture').hexdigest(),
@@ -43,16 +46,16 @@ def build_fixture(wake):
               'requires_runtime_resource_verification': True,
               'overridden_resources': ['config_displayUniqueIdArray'], 'displays': displays,
               'rear_safe_inset_left': 296, 'rear_corner_radius': 106}
-    return {'source': 'official-hongkong-ota', 'hyperos': rear.VERSION,
-            'archive_sha256': rear.ARCHIVE_SHA256, 'rear_display': marker,
+    return {'source': 'official-hongkong-ota', 'hyperos': selected['hyperos'],
+            'archive_sha256': selected['archive_sha256'], 'rear_display': marker,
             'rear_display_composer_fix': dict(COMPOSER), 'goldfish_sync_fix': dict(SYNC),
             'rear_display_wake_fix': copy.deepcopy(wake)}
 
 
 def module_manifest(build):
     return {'schema': 1, 'revision': 2, 'module_id': fix.MODULE_ID,
-            'firmware': {'source': build['source'], 'hyperos': rear.VERSION,
-                         'incremental': 'OS' + rear.VERSION, 'archive_sha256': rear.ARCHIVE_SHA256,
+            'firmware': {'source': build['source'], 'hyperos': build['hyperos'],
+                         'incremental': 'OS' + build['hyperos'], 'archive_sha256': build['archive_sha256'],
                          'hardware': 'ranchu', 'device': 'hongkong'},
             'marker': {'path': '/' + rear.MARKER_PATH,
                        'sha256': fix.digest(fix.encode(build['rear_display']))},
@@ -65,7 +68,7 @@ class Guest:
         wake = build['rear_display_wake_fix']
         self.files = {'/' + rear.MARKER_PATH: fix.encode(build['rear_display']),
                       wake['jar_path']: JAR, wake['script_path']: fix.LAUNCHER}
-        self.properties = ['ranchu', 'hongkong', 'OS' + rear.VERSION, name]
+        self.properties = ['ranchu', 'hongkong', 'OS' + build['hyperos'], name]
         self.display = DISPLAY
         self.module = ''
         self.flags = []
@@ -169,6 +172,30 @@ class RearInstallTests(unittest.TestCase):
         self.assertEqual(self.guest.pushes, [])
         self.assertEqual(self.guest.starts, 0)
         self.assertFalse((self.folder / 'work').exists())
+
+    def test_new_baked_context_validates_without_widening_legacy_installer(self):
+        current = build_fixture(self.wake, '4.0.24.0.XFRCNXM')
+        self.assertEqual(fix.validate_build(current), current['rear_display'])
+        with self.assertRaisesRegex(RuntimeError, 'legacy rear installer'):
+            fix.install(self.config, current)
+        self.official.assert_not_called()
+        self.root.assert_not_called()
+        self.unchanged()
+
+    def test_new_baked_context_rejects_old_or_tampered_provenance(self):
+        current = build_fixture(self.wake, '4.0.24.0.XFRCNXM')
+        variants = [{**current, 'archive_sha256': self.build['archive_sha256']},
+                    {**current, 'rear_display': copy.deepcopy(self.build['rear_display'])},
+                    {**current, 'hyperos': '4.0.999.0.XFRCNXM'}]
+        for field, value in (('source_sha256', {}), ('schema', True),
+                             ('rear_corner_radius', 106.0), ('overlay_sha256', 'unverified')):
+            variants.append({**current, 'rear_display': {**current['rear_display'], field: value}})
+        for build in variants:
+            with self.subTest(build=build), self.assertRaises(RuntimeError):
+                fix.validate_build(build)
+        self.official.assert_not_called()
+        self.root.assert_not_called()
+        self.unchanged()
 
     def test_bad_source_profile_receipts_and_types_fail_before_guest_reads(self):
         variants = [{**self.build, key: value} for key, value in (
