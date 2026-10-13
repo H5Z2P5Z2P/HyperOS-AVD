@@ -122,6 +122,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / 'local').mkdir()
         self.library = self.root / 'tools/emulator_srgb.dylib'
+        self.cached = self.root / 'owned-user-state/emulator_srgb.dylib'
         inherited = {'DYLD_INSERT_LIBRARIES': '/existing/plugin.dylib',
                      'HYPEROS_AVD_SRGB': '1', 'HYPEROS_AVD_SRGB_AVD': 'Old_AVD',
                      'UNRELATED_OPTION': 'kept'}
@@ -138,13 +139,15 @@ class HostColorEnvironmentTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.manifest(source)
                 before = dict(os.environ)
-                with patch.object(host_color, 'build', return_value=(self.library, None)) as build:
+                with patch.object(host_color, 'build', return_value=(self.library, None)) as build, \
+                        patch.object(host_color, 'cached_library', return_value=self.cached) as cache:
                     result = host_color.environment(self.root, name)
                 build.assert_called_once_with(self.root)
                 self.assertEqual(result['HYPEROS_AVD_SRGB'], '1')
                 self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], name)
                 self.assertEqual(result['DYLD_INSERT_LIBRARIES'],
-                                 str(self.library.resolve()) + ':/existing/plugin.dylib')
+                                 str(self.cached.resolve()) + ':/existing/plugin.dylib')
+                cache.assert_called_once_with(self.library, None)
                 self.assertEqual(result['UNRELATED_OPTION'], 'kept')
                 self.assertEqual(dict(os.environ), before)
 
@@ -179,6 +182,89 @@ class HostColorEnvironmentTests(unittest.TestCase):
                 with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'AVD name'):
                     host_color.environment(self.root, name)
         build.assert_not_called()
+
+    def test_only_owned_dyld_entries_are_relocated_without_copying_foreign_plugins(self):
+        self.manifest('official-yingtian-ota')
+        os.environ['DYLD_INSERT_LIBRARIES'] = ':'.join((
+            '/foreign/first.dylib', str(self.library.resolve()),
+            '/foreign/second.dylib', str(self.cached.resolve())))
+        with patch.object(host_color, 'build', return_value=(self.library, None)), \
+                patch.object(host_color, 'cached_library', return_value=self.cached) as cache:
+            result = host_color.environment(self.root, 'Owned_Pad')
+        self.assertEqual(result['DYLD_INSERT_LIBRARIES'], ':'.join((
+            str(self.cached.resolve()), '/foreign/first.dylib', '/foreign/second.dylib')))
+        cache.assert_called_once_with(self.library, None)
+
+
+class InternalHostColorCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.library = self.root / host_color.LIBRARY
+        self.receipt = self.root / host_color.RECEIPT
+        self.data = macho()
+        self.metadata = {'source_sha256': hashlib.sha256((REPO / 'native/emulator_srgb.m').read_bytes()).hexdigest(),
+                         'sha256': hashlib.sha256(self.data).hexdigest(), 'install_name': host_color.INSTALL_NAME}
+        self.library.write_bytes(self.data)
+        self.receipt.write_text(json.dumps(self.metadata))
+        self.state = self.root / 'owned-user-state'
+        self.state.mkdir()
+        directory = patch('host_launch.job_directory', return_value=self.state / 'launchd')
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def cache(self):
+        return host_color.cached_library(self.library, self.receipt)
+
+    def test_verified_hook_is_cached_privately_by_content_and_reused_without_compilation(self):
+        with patch.object(host_color.subprocess, 'run') as compile:
+            cached = self.cache()
+            inode = cached.stat().st_ino
+            modified = cached.stat().st_mtime_ns
+            self.assertEqual(self.cache(), cached)
+        compile.assert_not_called()
+        self.assertEqual(cached, self.state / 'host-color' / self.metadata['sha256'] / host_color.LIBRARY)
+        self.assertEqual(cached.read_bytes(), self.data)
+        self.assertEqual(cached.stat().st_ino, inode)
+        self.assertEqual(cached.stat().st_mtime_ns, modified)
+        self.assertEqual(cached.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(cached.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(json.loads(cached.with_name(host_color.RECEIPT).read_text()), self.metadata)
+
+    def test_source_receipt_mismatch_does_not_create_cache(self):
+        self.receipt.write_text(json.dumps(dict(self.metadata, source_sha256='0' * 64)))
+        with self.assertRaisesRegex(RuntimeError, 'Unverified'):
+            self.cache()
+        self.assertFalse((self.state / 'host-color').exists())
+
+    def test_modified_cached_hook_is_preserved_with_diagnostic(self):
+        cached = self.cache()
+        cached.write_bytes(b'unknown user content')
+        with self.assertRaisesRegex(RuntimeError, 'modified.*preserved'):
+            self.cache()
+        self.assertEqual(cached.read_bytes(), b'unknown user content')
+
+    def test_modified_cached_receipt_is_preserved_with_diagnostic(self):
+        cached = self.cache()
+        receipt = cached.with_name(host_color.RECEIPT)
+        receipt.write_bytes(b'unknown user receipt')
+        with self.assertRaisesRegex(RuntimeError, 'modified.*preserved'):
+            self.cache()
+        self.assertEqual(receipt.read_bytes(), b'unknown user receipt')
+        self.assertEqual(cached.read_bytes(), self.data)
+
+    def test_foreign_cache_alias_is_preserved_without_following_or_rewriting(self):
+        cached = self.cache()
+        cached.unlink()
+        foreign = self.root / 'foreign'
+        foreign.write_bytes(b'foreign library')
+        foreign.chmod(0o600)
+        cached.symlink_to(foreign)
+        with self.assertRaisesRegex(RuntimeError, 'aliased'):
+            self.cache()
+        self.assertEqual(foreign.read_bytes(), b'foreign library')
+        self.assertTrue(cached.is_symlink())
 
 
 @unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64'

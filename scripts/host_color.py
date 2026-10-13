@@ -88,6 +88,41 @@ def build(root):
     return library, receipt
 
 
+def cached_library(library, receipt):
+    """Load only this verified hook from owned storage before app initialization."""
+    from host_launch import job_directory, owned_directory, owned_file, write_private
+    if library.is_symlink() or receipt.is_symlink():
+        raise RuntimeError('Refused an aliased sRGB cache source.')
+    data = library.read_bytes()
+    validate_library(data)
+    metadata = {'source_sha256': hashlib.sha256((REPO_ROOT / 'native/emulator_srgb.m').read_bytes()).hexdigest(),
+                'sha256': hashlib.sha256(data).hexdigest(), 'install_name': INSTALL_NAME}
+    if json.loads(receipt.read_text()) != metadata:
+        raise RuntimeError('Unverified sRGB cache source receipt.')
+    parent = job_directory().parent / 'host-color'
+    owned_directory(parent, private=True)
+    directory = parent / metadata['sha256']
+    owned_directory(directory, private=True)
+    cached, cached_receipt = directory / LIBRARY, directory / RECEIPT
+    for path in (cached, cached_receipt):
+        if path.exists() or path.is_symlink():
+            owned_file(path)
+    if cached.exists() and cached.read_bytes() != data:
+        raise RuntimeError('Owned sRGB cache content was modified; it was preserved.')
+    if cached_receipt.exists():
+        try:
+            recorded = json.loads(cached_receipt.read_text())
+        except ValueError as error:
+            raise RuntimeError('Owned sRGB cache receipt was modified; it was preserved.') from error
+        if recorded != metadata:
+            raise RuntimeError('Owned sRGB cache receipt was modified; it was preserved.')
+    if not cached.exists():
+        write_private(cached, data)
+    if not cached_receipt.exists():
+        write_private(cached_receipt, (json.dumps(metadata, sort_keys=True) + '\n').encode())
+    return cached
+
+
 def environment(root, name, enabled=True):
     """Keep the SDK and other emulator processes unchanged."""
     result = os.environ.copy()
@@ -101,9 +136,14 @@ def environment(root, name, enabled=True):
         return result
     if not isinstance(name, str) or not name:
         raise RuntimeError('The sRGB tag requires the owned launch AVD name.')
-    library, _ = build(root)
+    library, receipt = build(root)
+    cached = cached_library(library, receipt)
     injected = result.get('DYLD_INSERT_LIBRARIES', '')
-    result['DYLD_INSERT_LIBRARIES'] = str(library.resolve()) + (':' + injected if injected else '')
+    # Replace/deduplicate only our authenticated hook. User-provided libraries
+    # remain in their original order and are never copied or modified.
+    owned_paths = {str(library.resolve()), str(cached.resolve())}
+    remaining = [value for value in injected.split(':') if value not in owned_paths and value]
+    result['DYLD_INSERT_LIBRARIES'] = ':'.join([str(cached.resolve()), *remaining])
     result['HYPEROS_AVD_SRGB'] = '1'
     result['HYPEROS_AVD_SRGB_AVD'] = name
     return result

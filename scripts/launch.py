@@ -239,6 +239,8 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--diagnostic', action='store_true',
+                        help='Include verbose Emulator and guest kernel output in the host log')
     parser.add_argument('--no-host-color-fix', action='store_true',
                         help='Disable the OS4 macOS sRGB window tag for this launch')
     parser.add_argument('--skip-oobe', action='store_true',
@@ -258,19 +260,21 @@ def main():
     logs = ROOT / 'logs'
     logs.mkdir(exist_ok=True)
     log = logs / 'emulator-current.log'
-    if log.exists():
-        log.rename(logs / ('emulator-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.log'))
     avd_config = ROOT / 'avd' / (config['name'] + '.avd') / 'config.ini'
     properties = dict(line.split('=', 1) for line in avd_config.read_text().splitlines() if '=' in line)
     memory = str(int(properties.get('hw.ramSize', '2560')))
     build = ROOT / 'local/build.json'
     cores = str(int(properties.get('hw.cpu.ncore', '2')))
-    command = [str(Path(config['sdk']) / 'emulator/emulator'), '-avd', config['name'],
+    command = [str(Path(config['sdk']).resolve() / 'emulator/emulator'), '-avd', config['name'],
                '-sysdir', str(ROOT / 'images'), '-port', str(config['port']),
                '-no-snapshot-load', '-no-snapshot-save', '-accel', 'on', '-gpu', 'host',
-               '-memory', memory, '-cores', cores, '-show-kernel', '-verbose']
+               '-memory', memory, '-cores', cores]
+    if args.diagnostic:
+        command += ['-show-kernel', '-verbose']
     if is_os4():
         command += ['-crash-report-mode', 'never']
+        from host_adb import adapter
+        command += ['-adb-path', str(adapter(Path(config['sdk']), f"emulator-{config['port']}"))]
     if build.is_file():
         # The guest supports batched updates; gfxstream also masks inline uniform
         # blocks in this mode, avoiding the observed MoltenVK descriptor crash.
@@ -283,10 +287,9 @@ def main():
     from host_color import environment
     launch_environment = environment(ROOT, config['name'],
                                      enabled=not (args.headless or args.no_host_color_fix))
-    with log.open('wb') as output:
-        process = subprocess.Popen(command, env=launch_environment, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
-    print(f"Starting {config['name']} (PID {process.pid}). Log: {log}", flush=True)
+    from host_launch import start
+    process = start(ROOT, config, command, launch_environment, log)
+    print(f"Starting {config['name']} (PID {process.pid}, {process.service}). Log: {log}", flush=True)
     # The emulator stays running if setup fails; evidence and userdata are retained.
     initialize(config, bypass_oobe=args.skip_oobe, rotate_window=not args.headless)
 
