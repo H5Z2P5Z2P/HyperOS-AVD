@@ -403,6 +403,46 @@ def configure(sdk, name, port):
             raise RuntimeError('Unexpected per-instance hardware key: ' + key)
         properties[key] = str(value)
     validate_memory(properties)
+    # Retain frozen firmware and user-selected custom ramdisks. Known OS4
+    # KernelSU bytes are adapted offline in a separately verified local cache.
+    build_file = ROOT / 'local/build.json'
+    current_config = path / 'config.ini'
+    authenticated_override = False
+    if current_config.is_file():
+        current_properties = dict(line.split('=', 1) for line in current_config.read_text().splitlines()
+                                  if '=' in line)
+        if 'disk.ramdisk.path' in current_properties:
+            selected_ramdisk = current_properties['disk.ramdisk.path']
+            properties['disk.ramdisk.path'] = selected_ramdisk
+            if target == 'android-37.0' and build_file.is_file() and selected_ramdisk:
+                from ksu_ramdisk import (verify_cache, is_owned_cache_selection,
+                                         refresh_saved_cache, rebase_cache_selection)
+                old_images = current_properties.get('image.sysdir.1', '')
+                if (old_images and Path(old_images).is_absolute()
+                        and Path(old_images).name == 'images'
+                        and Path(old_images).parent != ROOT.resolve()
+                        and is_owned_cache_selection(Path(old_images).parent, Path(selected_ramdisk))):
+                    selected_ramdisk = str(rebase_cache_selection(ROOT, selected_ramdisk, old_images))
+                    properties['disk.ramdisk.path'] = selected_ramdisk
+                try:
+                    verify_cache(ROOT, Path(selected_ramdisk))
+                except (RuntimeError, OSError, ValueError):
+                    if is_owned_cache_selection(ROOT, Path(selected_ramdisk)):
+                        refreshed = refresh_saved_cache(ROOT, Path(selected_ramdisk))
+                        properties.pop('disk.ramdisk.path')
+                        if refreshed is not None:
+                            properties['disk.ramdisk.path'] = str(refreshed)
+                    else:
+                        print('Retained the existing custom or unverified ramdisk selection.', flush=True)
+                else:
+                    # Only our authenticated derivative can be refreshed automatically.
+                    authenticated_override = True
+                    properties.pop('disk.ramdisk.path')
+    if target == 'android-37.0' and build_file.is_file() and 'disk.ramdisk.path' not in properties:
+        from ksu_ramdisk import prepare_runtime
+        override = prepare_runtime(ROOT, strict=authenticated_override)
+        if override is not None:
+            properties['disk.ramdisk.path'] = str(override)
     template = ''.join(key + '=' + value + '\n' for key, value in properties.items())
     template += f'image.sysdir.1={ROOT / "images"}/\n'
     template += 'AvdId=' + name + '\navd.ini.displayname=' + name + '\n'
@@ -470,7 +510,12 @@ def main():
     if missing:
         raise RuntimeError('Install the release assets first: ./Setup.command --bundle /path/to/manifest.json. '
                            'Missing: ' + ', '.join(missing))
-    fetch_ksu(['ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk'])
+    from kernelsu_release import available as current_ksu_available
+    build_record = ROOT / 'local/build.json'
+    os4 = (build_record.is_file() and json.loads(build_record.read_text()).get('source')
+           in (OS4_SOURCE, 'official-yingtian-ota'))
+    if not (os4 and current_ksu_available(ROOT)):
+        fetch_ksu(['ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk'])
     configure(sdk, args.name, args.port)
     print('Ready. ' + start_instruction(ROOT))
 

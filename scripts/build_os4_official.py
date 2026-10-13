@@ -7,13 +7,111 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import zipfile
 
 from phone_profile import modern_runtime
 
 SOURCE_PARTITIONS = ('system', 'system_ext', 'product', 'mi_ext', 'mi_product',
                      'vendor', 'odm', 'system_dlkm', 'vendor_dlkm')
+
+
+def prepare_kernelsu(repo, workspace):
+    """Authenticate the current producer stack without replacing legacy assets."""
+    import kernelsu_release as release
+    from common import KSU_ASSETS
+    from patch_kernelsu import patch, receipt
+    repo, workspace = Path(repo), Path(workspace)
+    release.fetch(repo)
+    sources = {name: release.asset(repo, name) for name in release.ASSETS}
+    directory = workspace / 'tools' / release.DIRECTORY
+    if directory.is_symlink():
+        raise RuntimeError('Refused an aliased OS4 KernelSU producer directory.')
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, source in sources.items():
+        destination = directory / name
+        if destination.exists() or destination.is_symlink():
+            info = destination.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or hashlib.sha256(destination.read_bytes()).hexdigest() != release.ASSETS[name]):
+                raise RuntimeError('Preserving an unknown OS4 KernelSU producer asset: ' + name)
+        else:
+            # Publish exclusively; do not overwrite a newly created custom leaf.
+            with destination.open('xb') as output, source.open('rb') as input_stream:
+                shutil.copyfileobj(input_stream, output)
+            shutil.copystat(source, destination)
+        release.asset(workspace, name)
+    # The portable install file-table contract still requires its original
+    # root-level bootstrap. Current OS4 launch selects the namespaced stack.
+    for name in ('ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk'):
+        source, destination = repo / 'tools' / name, workspace / 'tools' / name
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or archive_digest(source) != KSU_ASSETS[name]):
+            raise RuntimeError('Unknown legacy KernelSU bootstrap attachment: ' + name)
+        if destination.exists() or destination.is_symlink():
+            info = destination.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or archive_digest(destination) != KSU_ASSETS[name]):
+                raise RuntimeError('Preserving an unknown legacy KernelSU bootstrap attachment: ' + name)
+        else:
+            with destination.open('xb') as output, source.open('rb') as input_stream:
+                shutil.copyfileobj(input_stream, output)
+            shutil.copystat(source, destination)
+    official = release.asset(workspace, release.LKM)
+    marker = receipt(official.read_bytes())
+    quiet = patch(official, workspace / 'work' / ('kernelsu-marker-' + marker['after'] + '.ko'))
+    return {'host': release.asset(workspace, 'ksud-aarch64-apple-darwin'),
+            'lkm': quiet, 'receipt': marker}
+
+
+def patch_kernelsu_ramdisk(workspace, stack):
+    """Run the pinned producer in private staging and retain old output leaves."""
+    workspace = Path(workspace)
+    original = workspace / 'images/ramdisk.img'
+    before = archive_digest(original)
+    name = 'ramdisk-kernelsu-' + before + '-' + stack['receipt']['after'] + '.img'
+    canonical = workspace / 'work' / name
+    with tempfile.TemporaryDirectory(prefix='.kernelsu-boot-', dir=workspace / 'work') as temporary:
+        staged = Path(temporary) / name
+        with (workspace / 'logs/kernelsu-patch.log').open('wb') as log:
+            subprocess.run([str(stack['host']), 'boot-patch', '-b', str(original),
+                            '--ramdisk', '--kmi', 'android15-6.6', '--allow-shell',
+                            '-m', str(stack['lkm']), '-o', temporary, '--out-name', name],
+                           check=True, stdout=log, stderr=subprocess.STDOUT)
+        info = staged.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or not 0 < info.st_size < 64 * 1024**2 or archive_digest(original) != before):
+            raise RuntimeError('KernelSU ramdisk producer output/input changed unexpectedly.')
+        from ksu_ramdisk import parse_cpio, unpack
+        from patch_kernelsu import audit
+        _, archive = unpack(staged.read_bytes())
+        entries = [entry for entry in parse_cpio(archive) if entry['name'] == b'kernelsu.ko']
+        if len(entries) != 1:
+            raise RuntimeError('KernelSU producer did not emit one canonical LKM.')
+        entry = entries[0]
+        loaded = audit(archive[entry['body']:entry['body'] + entry['size']])
+        if not loaded['patched'] or loaded['receipt'] != stack['receipt']:
+            raise RuntimeError('KernelSU producer did not embed the authenticated quiet LKM.')
+        expected = archive_digest(staged)
+
+        def verify_existing():
+            owned = canonical.lstat()
+            if (not stat.S_ISREG(owned.st_mode) or owned.st_nlink != 1
+                    or archive_digest(canonical) != expected):
+                raise RuntimeError('Preserving an unknown KernelSU ramdisk producer output.')
+
+        if canonical.exists() or canonical.is_symlink():
+            verify_existing()
+        else:
+            try:
+                os.link(staged, canonical)
+            except FileExistsError:
+                verify_existing()
+    shutil.copy2(canonical, original)
+    return canonical
 
 
 def archive_digest(path):
@@ -194,7 +292,7 @@ def main():
         raise RuntimeError('Use a separate official candidate workspace.')
     validate_workspace_firmware(profile, workspace)
     os.environ['HYPEROS_AVD_WORKSPACE'] = str(workspace)
-    from common import (ROOT, OS4_SOURCE, avd_home, fetch_ksu,
+    from common import (ROOT, OS4_SOURCE, avd_home,
                         firmware_idle, host_check, port_free, sdk_path, sha256)
     from build_image import erofs
     from erofs_image import build
@@ -338,11 +436,7 @@ def main():
         init += rear_init(profile)
     from os4_defaults import boot_defaults
     put('system_ext/etc/init/init.hyperos_avd.rc', boot_defaults(init, profile=profile))
-    cached = ('ksud-aarch64-apple-darwin', 'lkm-aarch64-android15-6.6_kernelsu.ko',
-              'ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk')
-    for name in cached:
-        shutil.copy2(repo / 'tools' / name, ROOT / 'tools' / name)
-    fetch_ksu(cached)
+    ksu = prepare_kernelsu(repo, ROOT)
     shutil.copytree(repo / 'tools/smali', ROOT / 'tools/smali', dirs_exist_ok=True)
     services = ROOT / 'work/services-original.jar'
     services.write_bytes(erofs(system, '/system/framework/services.jar'))
@@ -413,13 +507,7 @@ def main():
             shutil.copy2(path, ROOT / 'images' / path.name)
     for relative in ('data/misc/modem_simulator', 'data/misc/emulator'):
         shutil.copytree(base / relative, ROOT / 'images' / relative, dirs_exist_ok=True)
-    with (ROOT / 'logs/kernelsu-patch.log').open('wb') as log:
-        subprocess.run([str(ROOT / 'tools/ksud-aarch64-apple-darwin'), 'boot-patch',
-                        '-b', str(ROOT / 'images/ramdisk.img'), '--ramdisk', '--kmi', 'android15-6.6',
-                        '--allow-shell', '-m', str(ROOT / 'tools/lkm-aarch64-android15-6.6_kernelsu.ko'),
-                        '-o', str(ROOT / 'work'), '--out-name', 'ramdisk-kernelsu.img'],
-                       check=True, stdout=log, stderr=subprocess.STDOUT)
-    shutil.copy2(ROOT / 'work/ramdisk-kernelsu.img', ROOT / 'images/ramdisk.img')
+    patch_kernelsu_ramdisk(ROOT, ksu)
     # EROFS first-stage mounts retain the ramdisk fstab across switch_root.
     # Disable mounts already embedded in the standalone system image there too.
     patch_ramdisk(ROOT / 'images/ramdisk.img')
@@ -432,6 +520,7 @@ def main():
         'hyperos': profile['hyperos'], 'source': OS4_SOURCE,
         'android_api': 37, 'archive_sha256': archive_sha256, 'kernel_page_size': 4096,
         'hardware_base_api': 36, 'kernel_kmi': 'android15-6.6',
+        'kernelsu_marker_fix': ksu['receipt'],
         'surfaceflinger_backend': 'skiavkthreaded', 'gnss_patch': True,
         'hwui_renderer': phone_renderer(profile), 'hwui': hwui_manifest,
         'mi_ext_overlays': True, 'mi_ext_software_identity': True, 'flutter_render_fix': 6,

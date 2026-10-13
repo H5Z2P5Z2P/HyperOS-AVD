@@ -164,16 +164,16 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
     if is_os4():
         from os4_defaults import apply_sensor_defaults
         apply_sensor_defaults(config)
+    from apply_kernelsu_update import bootstrap as ksu_bootstrap
+    if is_os4():
+        binary, manager_apk = ksu_bootstrap(ROOT)
+    else:
+        binary = ROOT / 'tools/ksud-aarch64-linux-android'
+        manager_apk = ROOT / 'tools/KernelSU_v3.3.0_32601-release.apk'
     root = adb(config, 'shell', "su -W -c 'id'", capture_output=True, text=True, timeout=15)
     if 'uid=0(' not in root.stdout:
-        binary = ROOT / 'tools/ksud-aarch64-linux-android'
-        remote = '/data/local/tmp/hyperos-avd-ksud'
-        adb(config, 'push', str(binary), remote, check=True, capture_output=True, timeout=30)
-        adb(config, 'shell', f'chmod 755 {remote}', check=True, timeout=15)
-        result = adb(config, 'shell', remote + ' debug su', input=remote + ' install\nexit\n',
-                     text=True, capture_output=True, timeout=30)
-        if result.returncode:
-            raise RuntimeError('KernelSU initialization failed: ' + result.stderr)
+        from apply_kernelsu_update import initialize_fresh
+        initialize_fresh(config, binary)
     result = adb(config, 'shell', "su -W -c 'id; getenforce; /data/adb/ksud feature set selinux_hide 0; /data/adb/ksud feature save'",
                  capture_output=True, text=True, timeout=20)
     if 'uid=0(' not in result.stdout or 'Enforcing' not in result.stdout or result.returncode:
@@ -187,6 +187,10 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
         time.sleep(3)
     else:
         raise RuntimeError('Boot did not finish within 5 minutes. Inspect logs/emulator-current.log.')
+    if is_os4():
+        from apply_kernelsu_update import install as update_ksu
+        current_ksu = update_ksu(config, ROOT)
+        print('KernelSU userspace checked: ' + str(current_ksu), flush=True)
     build = ROOT / 'local/build.json'
     metadata = json.loads(build.read_text()) if build.is_file() else {}
     source = metadata.get('source')
@@ -212,7 +216,7 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
         skip_oobe(config)
     manager = adb(config, 'shell', 'pm path me.weishu.kernelsu', capture_output=True, text=True, timeout=15)
     if 'package:' not in manager.stdout:
-        apk = ROOT / 'tools/KernelSU_v3.3.0_32601-release.apk'
+        apk = manager_apk
         if build.is_file() and json.loads(build.read_text()).get('source') == 'official-yingtian-ota':
             # MIUI's fresh tablet setup rejects shell installs; use verified KernelSU root.
             remote = '/data/local/tmp/hyperos-avd-ksu.apk'
@@ -224,7 +228,6 @@ def initialize(config, bypass_oobe=False, rotate_window=True):
                 adb(config, 'shell', 'rm -f ' + remote, timeout=15)
         else:
             adb(config, 'install', '--no-incremental', str(apk), check=True, timeout=60)
-    adb(config, 'shell', 'rm -f /data/local/tmp/hyperos-avd-ksud', timeout=15)
     (ROOT / 'local').mkdir(exist_ok=True)
     (ROOT / 'local/last-boot.json').write_text(json.dumps(
         {'name': config['name'], 'serial': f"emulator-{config['port']}",
@@ -248,7 +251,9 @@ def main():
         raise RuntimeError('Run Setup.command with the release manifest first.')
     # Refresh relocated paths before every cold start; collision checks protect other AVDs.
     configure(Path(config['sdk']), config['name'], config['port'])
-    fetch_ksu(['ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk'])
+    from kernelsu_release import available as current_ksu_available
+    if not (is_os4() and current_ksu_available(ROOT)):
+        fetch_ksu(['ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk'])
     prepare_userdata(config)
     logs = ROOT / 'logs'
     logs.mkdir(exist_ok=True)

@@ -152,9 +152,10 @@ def main():
     from os4_pad import PROFILE
     validate_workspace_firmware(PROFILE, workspace, repo)
     os.environ['HYPEROS_AVD_WORKSPACE'] = str(workspace)
-    from common import ROOT, avd_home, fetch_ksu, firmware_idle, host_check, port_free, sdk_path, sha256
+    from common import ROOT, avd_home, firmware_idle, host_check, port_free, sdk_path, sha256
     from build_image import erofs
-    from build_os4_official import merged_fstab, patch_ramdisk, validate_candidate
+    from build_os4_official import (merged_fstab, patch_kernelsu_ramdisk, patch_ramdisk,
+                                    prepare_kernelsu, validate_candidate)
     from erofs_image import build
     from init_userdata import create
     from lp_image import pack, unpack
@@ -294,11 +295,7 @@ def main():
     put('product/etc/init/lock_fps.sh', refresh_script(REFRESH_SCRIPT), 0o755)
     default_edits, default_manifest = settings_replacements(sdk_path(), ROOT / 'work/defaults-overlay')
     edits.update(default_edits)
-    cached = ('ksud-aarch64-apple-darwin', 'lkm-aarch64-android15-6.6_kernelsu.ko',
-              'ksud-aarch64-linux-android', 'KernelSU_v3.3.0_32601-release.apk')
-    for name in cached:
-        shutil.copy2(repo / 'tools' / name, ROOT / 'tools' / name)
-    fetch_ksu(cached)
+    ksu = prepare_kernelsu(repo, ROOT)
     shutil.copytree(repo / 'tools/smali', ROOT / 'tools/smali', dirs_exist_ok=True)
     services = ROOT / 'work/services-original.jar'
     services.write_bytes(erofs(system, '/system/framework/services.jar'))
@@ -324,19 +321,14 @@ def main():
             shutil.copy2(path, ROOT / 'images' / path.name)
     for relative in ('data/misc/modem_simulator', 'data/misc/emulator'):
         shutil.copytree(base / relative, ROOT / 'images' / relative, dirs_exist_ok=True)
-    with (ROOT / 'logs/kernelsu-patch.log').open('wb') as log:
-        subprocess.run([str(ROOT / 'tools/ksud-aarch64-apple-darwin'), 'boot-patch',
-            '-b', str(ROOT / 'images/ramdisk.img'), '--ramdisk', '--kmi', 'android15-6.6',
-            '--allow-shell', '-m', str(ROOT / 'tools/lkm-aarch64-android15-6.6_kernelsu.ko'),
-            '-o', str(ROOT / 'work'), '--out-name', 'ramdisk-kernelsu.img'],
-            check=True, stdout=log, stderr=subprocess.STDOUT)
-    shutil.copy2(ROOT / 'work/ramdisk-kernelsu.img', ROOT / 'images/ramdisk.img')
+    patch_kernelsu_ramdisk(ROOT, ksu)
     patch_ramdisk(ROOT / 'images/ramdisk.img')
     create()
     pack(base / 'system.img', ROOT / 'images/system.img', [
          ('system', image), ('vendor', vendor), ('system_dlkm', ROOT / 'work/base/system_dlkm.img')])
     (ROOT / 'config/avd.ini').write_text(template((repo / 'config/avd.ini').read_text()))
     manifest = {'source': SOURCE, 'device': 'yingtian', 'android_api': 37,
+        'kernelsu_marker_fix': ksu['receipt'],
         'hyperos': PROFILE['hyperos'], 'archive_sha256': PROFILE['source_archive_sha256'],
         'display': PROFILE['display'], 'model_xml_sha256': PROFILE['model_xml_sha256'],
         'identity_source_sha256': PROFILE['source_sha256'],

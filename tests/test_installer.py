@@ -449,6 +449,118 @@ class InstallerTests(unittest.TestCase):
             state = json.loads((root / 'local/runtime.json').read_text())
             self.assertEqual((state['name'], state['port']), ('My_pad', 5582))
 
+    def test_reconfigure_preserves_instance_custom_ramdisk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\ndisk.ramdisk.path=/template.img\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            config.write_text('disk.ramdisk.path=/user/custom.img\n')
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Custom content')), \
+                    patch('ksu_ramdisk.prepare_runtime') as prepare:
+                setup.configure(root / 'sdk', 'My_pad', 5582)
+            self.assertIn('disk.ramdisk.path=/user/custom.img\n', config.read_text())
+            prepare.assert_not_called()
+
+    def test_reconfigure_refreshes_only_authenticated_ramdisk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            config.write_text('disk.ramdisk.path=/owned/old.img\n')
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.verify_cache', return_value=Path('/owned/old.img')) as verify, \
+                    patch('ksu_ramdisk.prepare_runtime', return_value=Path('/owned/new.img')):
+                setup.configure(root / 'sdk', 'My_pad', 5582)
+            verify.assert_called_once_with(root, Path('/owned/old.img'))
+            self.assertIn('disk.ramdisk.path=/owned/new.img\n', config.read_text())
+
+    def test_reconfigure_refreshes_owned_previous_firmware_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            config.write_text('disk.ramdisk.path=/owned/old.img\n')
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), \
+                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
+                    patch('ksu_ramdisk.refresh_saved_cache', return_value=Path('/owned/new.img')) as refresh:
+                setup.configure(root / 'sdk', 'My_pad', 5582)
+            refresh.assert_called_once_with(root, Path('/owned/old.img'))
+            self.assertIn('disk.ramdisk.path=/owned/new.img\n', config.read_text())
+
+    def test_reconfigure_preserves_unproven_owned_cache_before_refusing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            original = 'disk.ramdisk.path=/owned/old.img\n'
+            config.write_text(original)
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), \
+                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
+                    patch('ksu_ramdisk.refresh_saved_cache', side_effect=RuntimeError('Unknown content')):
+                with self.assertRaisesRegex(RuntimeError, 'Unknown content'):
+                    setup.configure(root / 'sdk', 'My_pad', 5582)
+            self.assertEqual(config.read_text(), original)
+
+    def test_reconfigure_rebases_authenticated_moved_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            old = '/missing/old/local/boot-patches/ramdisk-' + 'a' * 64 + '.img'
+            config.write_text('disk.ramdisk.path=' + old + '\nimage.sysdir.1=/missing/old/images/\n')
+            current = root / 'local/boot-patches' / Path(old).name
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
+                    patch('ksu_ramdisk.rebase_cache_selection', return_value=current) as rebase, \
+                    patch('ksu_ramdisk.verify_cache', return_value=current) as verify, \
+                    patch('ksu_ramdisk.prepare_runtime', return_value=current):
+                setup.configure(root / 'sdk', 'My_pad', 5582)
+            rebase.assert_called_once_with(root, old, '/missing/old/images/')
+            verify.assert_called_once_with(root, current)
+            self.assertIn('disk.ramdisk.path=' + str(current) + '\n', config.read_text())
+
+    def test_reconfigure_refuses_unproven_move_before_writing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
+            (root / 'config').mkdir()
+            (root / 'config/avd.ini').write_text('target=android-37.0\n')
+            config = root / 'avd/My_pad.avd/config.ini'
+            config.parent.mkdir(parents=True)
+            original = ('disk.ramdisk.path=/missing/old/local/boot-patches/ramdisk-' + 'a' * 64
+                        + '.img\nimage.sysdir.1=/missing/old/images/\n')
+            config.write_text(original)
+            with patch.object(setup, 'ROOT', root), \
+                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
+                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
+                    patch('ksu_ramdisk.rebase_cache_selection', side_effect=RuntimeError('Unproven move')):
+                with self.assertRaisesRegex(RuntimeError, 'Unproven move'):
+                    setup.configure(root / 'sdk', 'My_pad', 5582)
+            self.assertEqual(config.read_text(), original)
+
     def test_all_profiles_accept_eight_gib_and_preserve_userdata(self):
         with tempfile.TemporaryDirectory() as temporary:
             for index, (source, ram) in enumerate((('official-yingtian-ota', '8192'),

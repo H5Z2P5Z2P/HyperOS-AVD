@@ -59,10 +59,29 @@ BUILD_KEYS = ('hyperos', 'source', 'android_api', 'archive_sha256', 'kernel_page
               'assistant_render_fix', 'composer_alpha_fix', 'audio_pcm_fix', 'camera_scene_fix',
               'adb_authentication', 'experimental', 'device', 'display', 'model_xml_sha256',
               'identity_source_sha256', 'vendor_fixes', 'hwui',
-              'flutter_engine', 'finddevice_provider_disabled', 'boot_service_fix', 'boot_policy')
+              'flutter_engine', 'finddevice_provider_disabled', 'boot_service_fix', 'boot_policy',
+              'kernelsu_marker_fix')
 OS4_RUNTIME_PAYLOADS = {'os4-core': ('context.json', 'receipt.json'),
                       'os4-app-compat': ('app-compat.zip', 'receipt.json')}
 RUNTIME_PAYLOADS = {variant: OS4_RUNTIME_PAYLOADS for variant in ('os4-official', 'os4-pad')}
+
+
+def current_kernelsu_paths(root, metadata):
+    """Include only a complete pinned current stack in portable OS4 runtimes."""
+    import kernelsu_release as release
+    marker = metadata.get('build', {}).get('kernelsu_marker_fix')
+    if (metadata.get('format') != 3 and isinstance(marker, dict)
+            and marker.get('version') == release.VERSION):
+        raise RuntimeError('A current KernelSU image requires a portable format3 runtime; legacy format was retained.')
+    if metadata.get('format') != 3 or metadata.get('variant') not in RUNTIME_PAYLOADS:
+        return {}
+    if not release.available(root):
+        marker = metadata.get('build', {}).get('kernelsu_marker_fix')
+        if isinstance(marker, dict) and marker.get('version') == release.VERSION:
+            raise RuntimeError('Current KernelSU image requires its complete verified offline runtime stack.')
+        return {}
+    return {'tools/' + release.DIRECTORY + '/' + name: release.asset(root, name)
+            for name in release.RUNTIME_ASSETS}
 
 
 def verify_lockscreen_video(profile, build, read):
@@ -528,6 +547,17 @@ def release_metadata(root, variant):
         # unrelated installer update must not raise an image's minimum.
         metadata['compatibility'].update(minimum_installer=PROTOCOL_MINIMUM,
                                          install_protocol=INSTALL_PROTOCOL)
+    marker = metadata.get('build', {}).get('kernelsu_marker_fix')
+    if marker is not None:
+        from patch_kernelsu import receipt
+        import kernelsu_release as release
+        if (not isinstance(marker, dict) or marker != receipt(marker.get('before'))
+                or json.dumps(marker, sort_keys=True) != json.dumps(receipt(marker.get('before')), sort_keys=True)):
+            raise RuntimeError('Unknown KernelSU producer receipt was preserved.')
+        if marker['version'] == release.VERSION:
+            if metadata['format'] != 3:
+                raise RuntimeError('A current KernelSU image requires a portable format3 runtime; legacy format was retained.')
+            metadata['kernelsu'] = release.VERSION.removeprefix('v') + f' ({release.CODE})'
     return metadata
 
 
@@ -579,6 +609,20 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536):
         raise RuntimeError('Invalid release version.')
     if not 1 <= part_mib < 2048:
         raise RuntimeError('Every GitHub release asset must be smaller than 2 GiB.')
+    import kernelsu_release as current_ksu
+    marker = metadata.get('build', {}).get('kernelsu_marker_fix')
+    if (metadata.get('format') != 3 and isinstance(marker, dict)
+            and marker.get('version') == current_ksu.VERSION):
+        raise RuntimeError('A current KernelSU image requires a portable format3 runtime; legacy format was retained.')
+    current_paths = {'tools/' + current_ksu.DIRECTORY + '/' + name: current_ksu.ASSETS[name]
+                     for name in current_ksu.RUNTIME_ASSETS}
+    included_current = set(paths) & current_paths.keys()
+    if (isinstance(marker, dict) and marker.get('version') == current_ksu.VERSION
+            and (metadata.get('variant') not in RUNTIME_PAYLOADS or included_current != current_paths.keys())):
+        raise RuntimeError('Current KernelSU image requires every verified runtime asset before archiving.')
+    if included_current and (metadata.get('format') != 3 or metadata.get('variant') not in RUNTIME_PAYLOADS
+                             or included_current != current_paths.keys()):
+        raise RuntimeError('A portable current KernelSU stack must contain every verified runtime asset.')
     files = {}
     for relative, path in paths.items():
         if path.is_symlink() or not path.is_file():
@@ -586,6 +630,7 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536):
         allowed = (relative in ('images/' + name for name in (*IMAGE_FILES, 'userdata.img'))
                    or relative.startswith(('images/data/misc/modem_simulator/', 'images/data/misc/emulator/'))
                    or relative in ('tools/' + name for name in KSU_FILES)
+                   or relative in included_current
                    or metadata['format'] in (2, 3) and relative == 'config/avd.ini'
                    or metadata['format'] == 3 and relative.startswith('runtime/')
                    or relative in ('tools/emulator_srgb.dylib', 'tools/emulator_srgb.build.json')
@@ -596,6 +641,9 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536):
         if not allowed or '..' in Path(relative).parts or Path(relative).is_absolute():
             raise RuntimeError('Unexpected release path: ' + relative)
         files[relative] = {'size': path.stat().st_size, 'sha256': sha256(path)}
+        if relative in included_current and (path.stat().st_nlink != 1
+                                             or files[relative]['sha256'] != current_paths[relative]):
+            raise RuntimeError('Current KernelSU release attachment differs from its official pin.')
     directory.mkdir(parents=True, exist_ok=False)
     writer = PartsWriter(directory, 'HyperOS-AVD-' + version + '-macos-arm64', part_mib * 1024**2)
     try:
@@ -651,6 +699,7 @@ def main():
         paths.update({path.relative_to(root).as_posix(): path for path in (root / 'images' / relative).rglob('*')
                       if path.is_file() and path.name != '.DS_Store' and not path.name.startswith('._')})
     paths.update({'tools/' + name: root / 'tools' / name for name in KSU_FILES})
+    paths.update(current_kernelsu_paths(root, metadata))
     if args.variant != 'os3':
         paths['config/avd.ini'] = root / 'config/avd.ini'
         from host_color import build as build_host_color
