@@ -71,6 +71,22 @@ native_enabled() {
 }
 
 native_eligible() {
+    NATIVE_ELIGIBILITY_REASON=device-capability-unavailable
+    if [ "$1" = display-metadata ]; then
+        NATIVE_ELIGIBILITY_REASON=unaudited-ranchu-mapper-capability
+        native_privacy_eligible && native_metadata_eligible; return $?
+    fi
+    if [ "$1" = xqos ] || [ "$1" = perf-hardware ]; then
+        NATIVE_ELIGIBILITY_REASON=physical-qos-prerequisites-unconfirmed
+        native_privacy_eligible && native_xqos_absent; return $?
+    fi
+    if [ "$1" = display-privacy ] || [ "$1" = wifi-capabilities ] || [ "$1" = vendor-ims ]; then
+        NATIVE_ELIGIBILITY_REASON=unaudited-ranchu-vintf-or-composer
+        # The complete pinned generic ranchu declaration inventory also
+        # excludes proprietary WLAN/SAR, OEM IMS, QTI Perf and Uniperf HALs.
+        # A failed Binder lookup alone cannot authorize a capability change.
+        native_privacy_eligible; return $?
+    fi
     # Composer bytes are shared by phones and tablets. A matching ELF cannot
     # prove that this device has Xiaomi's physical rear-panel capability.
     [ "$1" = rear-display ] || return 0
@@ -89,6 +105,184 @@ native_eligible() {
              if ($i <= 0 || $(i+1) <= 0 || $(i+2) <= 0 || $(i+3) <= 0 || seen[$i+0]++) exit 1;
              if ($i == secondary) found=1;
          } exit !found}'
+}
+
+native_xqos_absent() {
+    local recipe="$MODDIR/xqos-capability.tsv" pins kind driver extra expected= count=0 schema=0 seen='|'
+    [ -f "$recipe" ] && [ ! -L "$recipe" ] || return 1
+    pins=$(cat "$recipe") || return 1
+    [ "$(printf '%s\n' "$pins" | "$BB" head -n 1)" = 'schema|1' ] || return 1
+    while IFS='|' read -r kind driver extra; do
+        [ -z "$extra" ] || return 1
+        case "$kind" in
+            schema) [ "$driver" = 1 ] && [ "$schema" = 0 ] || return 1; schema=1 ;;
+            expected-drivers)
+                [ -z "$expected" ] || return 1
+                case "$driver" in ''|*[!0-9]*) return 1 ;; esac
+                [ "${#driver}" -le 2 ] && [ "$driver" -gt 0 ] || return 1
+                expected=$driver ;;
+            driver)
+                case "$driver" in /dev/*) ;; *) return 1 ;; esac
+                case "$driver" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+                [ "$(printf '%s' "$driver" | "$BB" tr -d 'A-Za-z0-9_./-')" = '' ] || return 1
+                case "$seen" in *"|$driver|"*) return 1 ;; esac
+                seen="$seen$driver|"
+                native_ns 1 "$BB" test ! -e "$driver" && native_ns 1 "$BB" test ! -L "$driver" || return 1
+                count=$((count + 1)) ;;
+            *) return 1 ;;
+        esac
+    done <<EOF
+$pins
+EOF
+    [ -n "$expected" ] && [ "$count" = "$expected" ]
+}
+
+native_metadata_eligible() {
+    local recipe="$MODDIR/display-metadata-capability.tsv" pins kind path expected extra schema=0 count=0 checksum
+    [ -f "$recipe" ] && [ ! -L "$recipe" ] || return 1
+    checksum=$("$BB" awk '$2 == "display-metadata-capability.tsv" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1;
+        checksum=$1} END {if (found != 1) exit 1; print checksum}' "$MODDIR/SHA256SUMS") || return 1
+    native_hex "$checksum" && [ "$(native_hash "$recipe")" = "$checksum" ] || return 1
+    pins=$(cat "$recipe") || return 1
+    [ "$(printf '%s\n' "$pins" | "$BB" head -n 1)" = 'schema|1' ] || return 1
+    while IFS='|' read -r kind path expected extra; do
+        [ -z "$extra" ] || return 1
+        case "$kind" in
+            schema) [ "$path" = 1 ] && [ -z "$expected" ] && [ "$schema" = 0 ] || return 1; schema=1 ;;
+            mapper)
+                [ "$schema" = 1 ] && [ "$count" = 0 ] && native_hex "$expected" || return 1
+                [ "$path" = /vendor/lib64/hw/mapper.ranchu.so ] || return 1
+                native_ns 1 "$BB" sh -c '
+                    bb=$1; path=$2; expected=$3; parent=${path%/*}
+                    [ -f "$path" ] && [ ! -L "$path" ] && [ "$("$bb" stat -c %u "$path")" = 0 ] &&
+                        [ "$("$bb" stat -c %h "$path")" = 1 ] || exit 1
+                    while [ "$parent" != / ]; do
+                        [ -d "$parent" ] && [ ! -L "$parent" ] || exit 1
+                        parent=${parent%/*}; [ -n "$parent" ] || parent=/
+                    done
+                    [ "$("$bb" sha256sum "$path" | "$bb" cut -d " " -f 1)" = "$expected" ]
+                ' sh "$BB" "$path" "$expected" || return 1
+                count=$((count + 1)) ;;
+            *) return 1 ;;
+        esac
+    done <<EOF
+$pins
+EOF
+    [ "$schema" = 1 ] && [ "$count" = 1 ]
+}
+
+native_privacy_eligible() {
+    # Missing live Binder services do not establish missing hardware. Prove
+    # the complete reviewed ranchu VINTF inventory in init's mount namespace.
+    [ "$(getprop ro.boot.hardware)" = ranchu ] || return 1
+    local recipe="$MODDIR/display-privacy-capability.tsv" pins
+    [ -f "$recipe" ] && [ ! -L "$recipe" ] || return 1
+    pins=$(cat "$recipe") || return 1
+    native_ns 1 "$BB" sh -c '
+        set -f
+        bb=$1; pins=$2
+        [ "$(printf "%s\n" "$pins" | "$bb" head -n 1)" = "schema|1" ] || exit 1
+        root=$(printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"root\" {print \$2}")
+        [ "$root" = /vendor/etc/vintf ] || exit 1
+        [ -d "$root" ] && [ ! -L "$root" ] && [ ! -L /vendor ] && [ ! -L /vendor/etc ] || exit 1
+        [ ! -L /odm ] || exit 1
+        aliases=$("$bb" find "$root" ! -type d ! -type f -print) || exit 1
+        [ -z "$aliases" ] || exit 1
+        expected=$(printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"file\" {print \$2}" | "$bb" sort)
+        actual=$("$bb" find "$root" -type f -print) || exit 1
+        actual=$(printf "%s\n" "$actual" | "$bb" sort) || exit 1
+        [ -n "$expected" ] && [ "$actual" = "$expected" ] || exit 1
+        expected_trees=$(printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"expected-trees\" {print \$2}")
+        case "$expected_trees" in ""|*[!0-9]*) exit 1 ;; esac
+        [ "${#expected_trees}" -le 2 ] && [ "$expected_trees" -gt 0 ] || exit 1
+        verify_tree() {
+            local tree=$1 role=$2 aliases expected actual
+            [ -d "$tree" ] && [ ! -L "$tree" ] || return 1
+            aliases=$("$bb" find "$tree" ! -type d ! -type f -print) || return 1
+            [ -z "$aliases" ] || return 1
+            expected=$(printf "%s\n" "$pins" | "$bb" awk -F "|" -v role="$role" -v prefix="$tree/" "\$1 == role && index(\$2, prefix) == 1 {print \$2}" | "$bb" sort)
+            actual=$("$bb" find "$tree" -type f -print) || return 1
+            actual=$(printf "%s\n" "$actual" | "$bb" sort) || return 1
+            [ -n "$expected" ] && [ "$expected" = "$actual" ]
+        }
+        composer=0; odm=0; vendor_legacy=0; odm_legacy=0; vendor_odm=0; compat=0
+        odm_apex=0; compat_apex=0; odm_directory=0; active_empty=0; tree_count=0
+        while IFS="|" read -r kind path checksum extra; do
+            [ -z "$extra" ] || exit 1
+            case "$kind" in
+                schema|root|expected-trees) continue ;;
+                absent)
+                    [ -z "$checksum" ] && [ ! -e "$path" ] && [ ! -L "$path" ] || exit 1
+                    case "$path" in
+                        /odm/etc/vintf) odm=1 ;;
+                        /vendor/manifest.xml) vendor_legacy=1 ;;
+                        /odm/manifest.xml) odm_legacy=1 ;;
+                        /vendor/odm/etc/vintf) vendor_odm=1 ;;
+                        /vendor/odm/apex) odm_apex=1 ;;
+                        *) exit 1 ;;
+                    esac ;;
+                compat-link)
+                    [ -L "$path" ] && [ "$("$bb" readlink "$path")" = "$checksum" ] || exit 1
+                    [ ! -L /vendor/odm ] || exit 1
+                    case "$path:$checksum" in
+                        /odm/etc:/vendor/odm/etc)
+                            [ -d "$checksum" ] && [ ! -L "$checksum" ] || exit 1
+                            compat=1 ;;
+                        /odm/apex:/vendor/odm/apex)
+                            [ ! -e "$checksum" ] && [ ! -L "$checksum" ] || exit 1
+                            compat_apex=1 ;;
+                        *) exit 1 ;;
+                    esac ;;
+                directory)
+                    [ "$path" = /vendor/odm/etc ] && [ -d "$path" ] && [ ! -L "$path" ] || exit 1
+                    expected=$(printf "%s\n" "$checksum" | "$bb" tr "," "\n" | "$bb" sort)
+                    actual=$("$bb" ls -A -1 "$path") || exit 1
+                    actual=$(printf "%s\n" "$actual" | "$bb" sort) || exit 1
+                    [ -n "$expected" ] && [ "$expected" = "$actual" ] || exit 1
+                    odm_directory=1 ;;
+                empty)
+                    [ "$path" = /data/apex/active ] && [ -d "$path" ] && [ ! -L "$path" ] && [ ! -L /data/apex ] || exit 1
+                    actual=$("$bb" ls -A -1 "$path") || exit 1
+                    [ -z "$checksum" ] && [ -z "$actual" ] || exit 1
+                    active_empty=1 ;;
+                tree)
+                    case "$path:$checksum" in
+                        /vendor/apex:apex-package) ;;
+                        /apex/*/etc/vintf:apex-fragment)
+                            base=${path%/etc/vintf}
+                            [ ! -L /apex ] && [ ! -L "$base" ] && [ ! -L "$base/etc" ] || exit 1 ;;
+                        *) exit 1 ;;
+                    esac
+                    verify_tree "$path" "$checksum" || exit 1
+                    tree_count=$((tree_count + 1)) ;;
+                file|composer|apex-package|apex-fragment)
+                    [ "${#checksum}" = 64 ] || exit 1
+                    case "$checksum" in *[!0-9a-f]*) exit 1 ;; esac
+                    [ -f "$path" ] && [ ! -L "$path" ] || exit 1
+                    current=$("$bb" sha256sum "$path") || exit 1
+                    current=${current%% *}
+                    if [ "$kind" = composer ]; then
+                        [ "$path" = /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu ] || exit 1
+                        [ "$current" != "$checksum" ] || composer=1
+                    elif [ "$kind" = file ]; then
+                        case "$path" in "$root"/*.xml|"$root"/manifest/*.xml) ;; *) exit 1 ;; esac
+                        [ "$current" = "$checksum" ] || exit 1
+                    else
+                        case "$kind:$path" in
+                            apex-package:/vendor/apex/*.apex|apex-fragment:/apex/*/etc/vintf/*.xml) ;;
+                            *) exit 1 ;;
+                        esac
+                        [ "$current" = "$checksum" ] || exit 1
+                    fi ;;
+                *) exit 1 ;;
+            esac
+        done <<EOF
+$pins
+EOF
+        [ "$composer:$odm:$vendor_legacy:$odm_legacy:$vendor_odm:$compat" = 1:1:1:1:1:1 ] &&
+        [ "$odm_apex:$compat_apex:$odm_directory:$active_empty" = 1:1:1:1 ] && [ "$tree_count" = "$expected_trees" ]
+    ' sh "$BB" "$pins"
 }
 
 native_assets() {
@@ -506,7 +700,7 @@ native_apply_target() {
         return
     fi
     if ! native_eligible "$feature"; then
-        native_status "$feature" "${target:-$package/$library}" skipped device-capability-unavailable
+        native_status "$feature" "${target:-$package/$library}" skipped "${NATIVE_ELIGIBILITY_REASON:-device-capability-unavailable}"
         return
     fi
     if [ "$kind" = app ]; then
@@ -624,7 +818,7 @@ native_reconcile() {
                     continue
                 fi
                 if ! native_eligible "$feature"; then
-                    native_status "$feature" "$resolved" skipped device-capability-unavailable
+                    native_status "$feature" "$resolved" skipped "${NATIVE_ELIGIBILITY_REASON:-device-capability-unavailable}"
                     continue
                 fi
                 initial=$(native_ns_hash 1 "$resolved")
@@ -718,19 +912,47 @@ native_service_release() {
     NATIVE_LOCK_HELD=false
 }
 
+native_lock_guard_identity() {
+    local path=$1 mode identity extra device inode owner links size
+    [ "${2:-leaf}" = fd ] || [ ! -L "$path" ] || return 1
+    identity=$("$BB" stat -Lc '%f|%d:%i:%u:%h:%s' "$path") || return 1
+    IFS='|' read -r mode identity extra <<EOF
+$identity
+EOF
+    [ -z "$extra" ] || return 1
+    case "$mode" in 8[0-9a-f][0-9a-f][0-9a-f]) ;; *) return 1 ;; esac
+    IFS=':' read -r device inode owner links size extra <<EOF
+$identity
+EOF
+    [ -n "$device" ] && [ -n "$inode" ] && [ -z "$extra" ] || return 1
+    case "$device:$inode" in *[!0-9:]*) return 1 ;; esac
+    [ "$owner" = 0 ] && [ "$links" = 1 ] && [ "$size" = 0 ] || return 1
+    printf '%s|%s\n' "$mode" "$identity"
+}
+
 native_service_lock() {
-    local lock=$1 guard="$1.guard" boot oldpid oldboot
+    local lock=$1 guard="$1.guard" fd="/proc/$$/fd/9" boot oldpid oldboot identity opened
     [ "$lock" = "$MODDIR/service.lock" ] || return 1
+    [ "${NATIVE_LOCK_HELD:-false}" != true ] || return 1
     boot=$(cat "$PROC/sys/kernel/random/boot_id") || return 1
     [ -n "$boot" ] || return 1
-    [ ! -L "$guard" ] && { [ ! -e "$guard" ] || [ -f "$guard" ]; } || return 1
+    if [ ! -e "$guard" ] && [ ! -L "$guard" ]; then
+        (set -C; : > "$guard") || return 1
+    fi
+    identity=$(native_lock_guard_identity "$guard") || return 1
     # This lease serializes recovery with acquisition and is dropped by the
     # kernel on a crash. The directory remains a human-readable owner receipt.
-    exec 9>"$guard" || return 1
+    exec 9>>"$guard" || return 1
+    opened=$(native_lock_guard_identity "$fd" fd) || { exec 9>&-; return 1; }
+    [ "$opened" = "$identity" ] && [ "$(native_lock_guard_identity "$guard")" = "$identity" ] || { exec 9>&-; return 1; }
     if ! "$BB" flock -n 9; then exec 9>&-; return 1; fi
+    [ "$(native_lock_guard_identity "$fd" fd)" = "$identity" ] &&
+        [ "$(native_lock_guard_identity "$guard")" = "$identity" ] || { exec 9>&-; return 1; }
+    # Operate on the authenticated open object, so a leaf swap cannot redirect
+    # a pathname chmod onto a foreign inode after the final identity check.
+    "$BB" chmod 600 "$fd" || { exec 9>&-; return 1; }
     NATIVE_LOCK_HELD=true
     NATIVE_LOCK_PATH="$lock"; NATIVE_LOCK_PID=$$; NATIVE_LOCK_BOOT="$boot"
-    chmod 600 "$guard" || { native_service_release; return 1; }
     if ! mkdir "$lock" 2>/dev/null; then
         native_lock_directory_safe "$lock" || { native_service_release; return 1; }
         # Give a legacy hook time to publish owner fields, then reject any live
@@ -764,21 +986,26 @@ native_service() {
     native_blocked && return 0
     native_assets || { native_log 'Module assets changed while waiting for boot; preserving targets.'; return 1; }
     . "$MODDIR/platform.sh"
+    # A verified image context may arrive during this first pass. Capture its
+    # token before applying effects so the observer cannot adopt an unhandled
+    # update as its initial baseline.
+    previous=$(native_package_token)
+    core_early || native_log 'A platform capability was preserved or unavailable.'
     core_late || native_log 'A late platform capability was preserved or unavailable.'
     native_blocked && return 0
     "$BB" sh "$MODDIR/dex2oat-cpu-policy.sh" apply || native_log 'ART CPU policy could not be applied.'
     native_reconcile late
-    previous=$(native_package_token)
     while :; do
         sleep "$NATIVE_INTERVAL"
-        if native_blocked; then native_cleanup; core_rear_cleanup; return 0; fi
+        if native_blocked; then native_cleanup; core_rear_cleanup; core_policy_cleanup; return 0; fi
         token=$(native_package_token)
         [ "$token" != "$previous" ] || continue
         sleep 2
         stable=$(native_package_token)
         [ "$stable" = "$token" ] || continue
-        native_reconcile late
+        core_early || native_log 'A changed platform capability was preserved or unavailable.'
         core_late || native_log 'A changed platform capability was preserved or unavailable.'
+        native_reconcile late
         previous=$stable
     done
 }

@@ -2,8 +2,9 @@
 """Export audited equal-size native edits for standard KernelSU delivery.
 
 This catalog records content identities, not OTA names or device models.
-Unknown binaries remain unsupported. Image, kernel, Java bytecode and host
-patches intentionally retain their separate build routes.
+Unknown binaries remain unsupported. Signed APK, image, kernel and host
+patches retain their separate build routes. Audited unsigned framework JARs
+use finite equal-length ZIP/DEX sites.
 """
 import argparse
 import json
@@ -12,7 +13,7 @@ import re
 
 
 FEATURES = frozenset(('flutter', 'hwui', 'assistant', 'lockscreen-video',
-                      'navigation', 'composer', 'rear-display'))
+                      'navigation', 'composer', 'rear-display', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'))
 APP_PACKAGES = frozenset(('com.miui.home', 'com.miui.weather2',
                           'com.miui.voiceassist', 'com.miui.aod'))
 SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
@@ -105,6 +106,33 @@ def validate_catalog(value):
                 or row['library'] in ('.', '..')):
             raise RuntimeError('Invalid native patch target.')
         path, package = row['path'], row['package']
+        if row['feature'] == 'wifi-capabilities':
+            from patch_wifi_capabilities import PATH
+            if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(PATH).name or package != ''):
+                raise RuntimeError('Unsafe unsigned framework patch target.')
+        if row['feature'] == 'xqos':
+            from patch_xqos import NATIVE
+            if (row['kind'] != 'system' or path != NATIVE or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(NATIVE).name or package != ''):
+                raise RuntimeError('Unsafe physical QoS patch target.')
+        if row['feature'] == 'vendor-ims':
+            from patch_xiaomi_ims import PATH
+            if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(PATH).name or package != ''):
+                raise RuntimeError('Unsafe vendor IMS framework patch target.')
+        if row['feature'] == 'display-metadata':
+            from patch_display_metadata import RECIPES
+            if (row['kind'] != 'system' or path not in {value['path'] for value in RECIPES.values()}
+                    or row['phase'] != 'early' or row['library'] != PurePosixPath(path).name or package != ''):
+                raise RuntimeError('Unsafe display metadata consumer target.')
+        if row['feature'] == 'perf-hardware':
+            from patch_bufferqueue_perf import NATIVE as BUFFERQUEUE
+            from patch_qti_perf import NATIVE as QTI
+            from patch_uniperf import MIUI_SERVICES, PATH
+            if (row['kind'] != 'system' or path not in (QTI, PATH, MIUI_SERVICES, BUFFERQUEUE) or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(path).name or package != ''):
+                raise RuntimeError('Unsafe proprietary performance patch target.')
         if row['kind'] == 'system':
             if (not isinstance(path, str) or not path.startswith(('/system/', '/system_ext/',
                                                                    '/product/', '/vendor/'))
@@ -136,10 +164,18 @@ def catalog():
     import apply_navigation_fix as navigation
     import patch_assistant as assistant
     import patch_composer as composer
+    import patch_display_privacy as privacy
     import patch_flutter as flutter
     import patch_lockscreen_video as lockscreen
     import patch_pad_hwui as hwui
     import patch_rear_display as rear
+    import patch_wifi_capabilities as wifi
+    import patch_xqos as xqos
+    import patch_xiaomi_ims as ims
+    import patch_qti_perf as qti
+    import patch_uniperf as uniperf
+    import patch_bufferqueue_perf as bufferqueue
+    import patch_display_metadata as metadata
 
     profiles = []
     for before, row in flutter.PROFILES.items():
@@ -158,12 +194,44 @@ def catalog():
                  navigation.WATCHDOG_AFTER, navigation.WATCHDOG_SITES),
         _profile('composer-plane-alpha', 'composer', composer.BEFORE, composer.AFTER, composer.SITES),
         _profile('rear-display-secondary-timing', 'rear-display', rear.BEFORE, rear.AFTER, rear.SITES),
+        _profile('display-privacy-disabled-state', 'display-privacy', privacy.BEFORE,
+                 privacy.AFTER, privacy.SITES),
     ))
+    for recipe in wifi.catalog_recipes():
+        profiles.append(_profile('wifi-capabilities-' + recipe['before'][:12], 'wifi-capabilities',
+                                 recipe['before'], recipe['after'],
+                                 [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for recipe in xqos.catalog_recipes():
+        profiles.append(_profile('xqos-' + recipe['before'][:12], 'xqos',
+                                 recipe['before'], recipe['after'],
+                                 [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for recipe in ims.catalog_recipes():
+        profiles.append(_profile('vendor-ims-' + recipe['before'][:12], 'vendor-ims',
+                                 recipe['before'], recipe['after'],
+                                 [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for producer, label in ((qti, 'qti-perf'), (uniperf, 'uniperf'), (bufferqueue, 'bufferqueue-perf')):
+        for recipe in producer.catalog_recipes():
+            profiles.append(_profile(label + '-' + recipe['before'][:12], 'perf-hardware',
+                                     recipe['before'], recipe['after'],
+                                     [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for recipe in metadata.catalog_recipes():
+        profiles.append(_profile('display-metadata-' + recipe['before'][:12], 'display-metadata',
+                                 recipe['before'], recipe['after'],
+                                 [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
     targets = [
         _target('flutter', 'early', flutter_targets.SYSTEM_LIB),
         _target('hwui', 'early', hwui.NATIVE),
         _target('composer', 'early', composer.NATIVE),
         _target('rear-display', 'early', rear.NATIVE),
+        _target('display-privacy', 'early', privacy.NATIVE),
+        *[_target('display-metadata', 'early', path) for path in sorted({value['path'] for value in metadata.RECIPES.values()})],
+        _target('wifi-capabilities', 'early', wifi.PATH),
+        _target('xqos', 'early', xqos.NATIVE),
+        _target('vendor-ims', 'early', ims.PATH),
+        _target('perf-hardware', 'early', qti.NATIVE),
+        _target('perf-hardware', 'early', uniperf.PATH),
+        _target('perf-hardware', 'early', uniperf.MIUI_SERVICES),
+        _target('perf-hardware', 'early', bufferqueue.NATIVE),
         *[_target('flutter', 'late', package=package,
                   library=PurePosixPath(flutter_targets.SYSTEM_LIB).name)
           for package in flutter_targets.PACKAGES],

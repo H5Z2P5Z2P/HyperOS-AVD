@@ -16,6 +16,33 @@ import dex2oat_cpu_policy as cpu_policy
 
 
 class NativeModulePackageTests(unittest.TestCase):
+    def test_privacy_capability_recipe_is_canonical_and_integrity_bound(self):
+        import patch_display_privacy as privacy
+        files = package.module_files()
+        name = 'display-privacy-capability.tsv'
+        self.assertEqual(files[name], privacy.capability_recipe())
+        rows = [row.split('|') for row in files[name].decode().splitlines()]
+        self.assertEqual(rows[:3], [['schema', '1'], ['root', privacy.VINTF_ROOT],
+                                  ['absent', privacy.ABSENT_VINTF]])
+        self.assertEqual([row[1] for row in rows if row[0] == 'absent'],
+                         list(privacy.ABSENT_DECLARATIONS))
+        self.assertEqual([row[1:] for row in rows if row[0] == 'compat-link'],
+                         [list(privacy.ODM_COMPAT_LINK), list(privacy.ODM_APEX_COMPAT_LINK)])
+        self.assertEqual({row[1]: row[2] for row in rows if row[0] == 'apex-package'},
+                         privacy.APEX_PACKAGES)
+        self.assertEqual({row[1]: row[2] for row in rows if row[0] == 'apex-fragment'},
+                         privacy.APEX_FRAGMENTS)
+        expected_trees = {'/vendor/apex', *[str(Path(path).parent) for path in privacy.APEX_FRAGMENTS]}
+        self.assertEqual({row[1] for row in rows if row[0] == 'tree'}, expected_trees)
+        self.assertEqual([row[1] for row in rows if row[0] == 'expected-trees'], [str(len(expected_trees))])
+        pins = {row[1]: row[2] for row in rows if row[0] == 'file'}
+        self.assertEqual(pins, {privacy.VINTF_ROOT + '/' + path: checksum
+                                for path, checksum in privacy.VINTF_FILES.items()})
+        self.assertEqual(len(pins), 26)
+        manifest = json.loads(files['manifest.json'])
+        self.assertEqual(manifest['files_sha256'][name], hashlib.sha256(files[name]).hexdigest())
+        self.assertIn('display-privacy', manifest['features'])
+
     def test_boot_catalog_uses_complete_canonical_image_receipts(self):
         from patch_boot_services import image_receipts
         files = package.module_files()

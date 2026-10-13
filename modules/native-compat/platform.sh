@@ -69,8 +69,41 @@ core_boot_recipe() {
         }' "$catalog" "$CORE_STATE/image.tsv"
 }
 
+core_reviewed_native_derivative() {
+    # An owned early bind may add one audited capability edit to an immutable
+    # image prerequisite. Authenticate the whole current control set and the
+    # exact source edge; never reinterpret unknown hashes or legacy chains.
+    local path=$1 expected=$2 actual=$3 feature
+    native_hex "$expected" && native_hex "$actual" && [ "$expected" != "$actual" ] || return 1
+    native_guard && native_assets || return 1
+    core_safe_file "$MODDIR/targets.tsv" && core_safe_file "$MODDIR/profiles.tsv" || return 1
+    native_owns_mount 1 "$path" || return 1
+    feature=$("$BB" awk -F '|' -v path="$path" -v expected="$expected" -v actual="$actual" '
+        function hex(value) {return length(value) == 64 && value !~ /[^0-9a-f]/}
+        FNR == NR {
+            if ($4 == path) {
+                targets++; parts_count=split(path, parts, "/");
+                if (NF != 6 || $1 != "early" || $2 != "system" ||
+                    $3 != "perf-hardware" || $5 != "" || $6 != parts[parts_count]) bad=1;
+                feature=$3;
+            }
+            next
+        }
+        $1 == expected || $2 == actual || index("," $3 ",", "," expected ",") {
+            profiles++;
+            if (NF != 5 || !hex($1) || !hex($2) || $1 != expected || $2 != actual ||
+                $3 != "" || $4 != feature || $5 !~ /^[a-z0-9]+(-[a-z0-9]+)*$/) bad=1;
+        }
+        END {if (bad || targets != 1 || profiles != 1) exit 1; print feature}
+        ' "$MODDIR/targets.tsv" "$MODDIR/profiles.tsv") || return 1
+    # Content remains the same when the user disables a feature while its
+    # inode is loaded. Reboot controls applicability; it cannot revoke the
+    # image's independent boot provenance or authorize a new mutation.
+    native_eligible "$feature" && [ "$(native_ns_hash 1 "$path")" = "$actual" ]
+}
+
 core_context_rows_ready() {
-    local kind=$1 row path expected extra found=0 seen='|'
+    local kind=$1 row path expected extra actual found=0 seen='|'
     while IFS='|' read -r row path expected extra; do
         [ "$row" = "$kind" ] || continue
         [ -z "$extra" ] && native_hex "$expected" || return 1
@@ -83,7 +116,10 @@ core_context_rows_ready() {
             *) return 1 ;;
         esac
         native_path "$path" && core_safe_file "$path" || return 1
-        [ "$(native_ns_hash 1 "$path")" = "$expected" ] || return 1
+        actual=$(native_ns_hash 1 "$path")
+        if [ "$actual" != "$expected" ]; then
+            [ "$kind" = boot ] && core_reviewed_native_derivative "$path" "$expected" "$actual" || return 1
+        fi
         found=$((found + 1))
     done
     [ "$found" -gt 0 ]
@@ -392,5 +428,54 @@ core_early() {
 }
 
 core_late() {
-    core_refresh; core_kernel; core_rear
+    core_refresh; core_kernel; core_rear; core_policies
+}
+
+core_policy_restore_required() {
+    local feature=$1 file
+    for file in "$MODDIR/disable" "$MODDIR/remove"; do
+        [ ! -e "$file" ] && [ ! -L "$file" ] || return 0
+    done
+    for file in "$MODDIR/features.disabled" "$CORE_STATE/legacy-blocked.features"; do
+        [ ! -L "$file" ] || return 1
+        [ ! -e "$file" ] || core_safe_file "$file" || return 1
+        if [ -f "$file" ] && "$BB" grep -Fxq "$feature" "$file"; then return 0; fi
+    done
+    return 1
+}
+
+core_package_policy() {
+    local feature=$1 package=$2 mode=apply observed state reason extra
+    native_assets || return 1
+    if core_policy_restore_required "$feature"; then mode=restore
+    elif ! core_permitted "$feature"; then
+        if native_blocked; then native_status "$feature" "$package" pending module-update-staged
+        else native_status "$feature" "$package" skipped unsafe-platform-state; fi
+        return 0
+    # This complete pinned ranchu inventory proves the OEM display and XRING
+    # IMS HALs are absent; a transient missing live Binder is insufficient.
+    elif ! native_privacy_eligible; then
+        native_status "$feature" "$package" skipped unaudited-ranchu-vendor
+        return 0
+    fi
+    observed=$("$BB" sh "$MODDIR/$feature-policy.sh" "$mode")
+    IFS='|' read -r state reason extra <<EOF
+$observed
+EOF
+    [ -z "$extra" ] && native_word "$state" && native_word "$reason" || return 1
+    native_status "$feature" "$package" "$state" "$reason"
+}
+
+core_policies() {
+    core_package_policy finddevice com.xiaomi.finddevice
+    core_package_policy vendor-ims com.xring.ims
+}
+
+core_policy_cleanup() {
+    local feature
+    native_assets || return 1
+    for feature in finddevice vendor-ims; do
+        core_policy_restore_required "$feature" || continue
+        "$BB" sh "$MODDIR/$feature-policy.sh" restore >/dev/null
+    done
 }

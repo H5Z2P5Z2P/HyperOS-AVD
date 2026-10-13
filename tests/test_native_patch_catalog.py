@@ -35,6 +35,23 @@ def generic_patch(data, profile):
     return bytes(result)
 
 
+def audited_wifi_inputs():
+    """Optional private fixtures; identities are selected only by full content."""
+    import patch_wifi_capabilities as wifi
+    defaults = ('work/feedback-investigation-20261013/phone-wifi-service.jar',
+                'work/feedback-investigation-20261013/pad-producer-audit/miui-wifi-service.jar')
+    paths = [Path(value) for value in os.environ.get('HYPEROS_AVD_WIFI_FRAMEWORK_ARTIFACTS', '').split(os.pathsep)
+             if value] or [REPO / value for value in defaults]
+    found = {}
+    for path in paths:
+        if path.is_file():
+            data = path.read_bytes()
+            identity = hashlib.sha256(data).hexdigest()
+            if identity in wifi.RECIPES:
+                found[identity] = data
+    return found
+
+
 class NativePatchCatalogTests(unittest.TestCase):
     def setUp(self):
         self.value = native.catalog()
@@ -50,8 +67,8 @@ class NativePatchCatalogTests(unittest.TestCase):
         self.assertEqual(data, native.dump_catalog())
         self.assertEqual(json.loads(data), self.value)
         self.assertEqual(native.validate_catalog(self.value), self.value)
-        self.assertEqual(len(self.value['profiles']), 13)
-        self.assertEqual(len(self.value['targets']), 10)
+        self.assertEqual(len(self.value['profiles']), 27)
+        self.assertEqual(len(self.value['targets']), 20)
         self.assertEqual(set(row['feature'] for row in self.value['profiles']), native.FEATURES)
         self.assertEqual([row['id'] for row in self.value['profiles']],
                          sorted(row['id'] for row in self.value['profiles']))
@@ -71,6 +88,7 @@ class NativePatchCatalogTests(unittest.TestCase):
         import apply_navigation_fix as navigation
         import patch_assistant as assistant
         import patch_composer as composer
+        import patch_display_privacy as privacy
         import patch_lockscreen_video as lockscreen
         import patch_pad_hwui as hwui
         import patch_rear_display as rear
@@ -81,6 +99,7 @@ class NativePatchCatalogTests(unittest.TestCase):
                                                     hwui.REPLACEMENT.hex()]])
         for before, after, sites in ((assistant.BEFORE, assistant.AFTER, assistant.SITES),
                                      (composer.BEFORE, composer.AFTER, composer.SITES),
+                                     (privacy.BEFORE, privacy.AFTER, privacy.SITES),
                                      (rear.BEFORE, rear.AFTER, rear.SITES),
                                      (lockscreen.BEFORE, lockscreen.AFTER, lockscreen.SITES),
                                      (navigation.AOT_BEFORE, navigation.AOT_AFTER, navigation.AOT_SITES),
@@ -105,7 +124,7 @@ class NativePatchCatalogTests(unittest.TestCase):
 
     def test_system_and_app_targets_are_explicit_and_scoped(self):
         system = {row['feature']: row for row in self.value['targets'] if row['kind'] == 'system'}
-        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display'})
+        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'})
         self.assertTrue(all(row['phase'] == 'early' and not row['package'] for row in system.values()))
         self.assertEqual(system['flutter']['path'], '/system_ext/lib64/libhyper_os_flutter.so')
         self.assertEqual(system['hwui']['path'], '/system/lib64/libhwui.so')
@@ -183,6 +202,182 @@ class NativePatchCatalogTests(unittest.TestCase):
         changed[-1] ^= 1
         with self.assertRaisesRegex(RuntimeError, 'Unsupported input content'):
             generic_patch(changed, row)
+
+    def test_wifi_profiles_reuse_all_six_canonical_offline_sites(self):
+        import patch_wifi_capabilities as wifi
+        rows = {row['before']: row for row in self.value['profiles']
+                if row['feature'] == 'wifi-capabilities'}
+        self.assertEqual(set(rows), set(wifi.RECIPES))
+        for source in wifi.catalog_recipes():
+            row = rows[source['before']]
+            self.assertEqual(row['after'], source['after'])
+            self.assertEqual(row['legacy'], [])
+            self.assertEqual(row['sites'], [[site['offset'], site['before'], site['after']]
+                                            for site in source['sites']])
+            self.assertEqual(len(row['sites']), 6)
+        targets = [row for row in self.value['targets'] if row['feature'] == 'wifi-capabilities']
+        self.assertEqual(targets, [{'feature': 'wifi-capabilities', 'phase': 'early',
+                                  'kind': 'system', 'path': wifi.PATH,
+                                  'package': '', 'library': Path(wifi.PATH).name}])
+
+    def test_wifi_recipe_cannot_be_redirected_to_apk_app_or_late_boot(self):
+        def target(value):
+            return next(row for row in value['targets'] if row['feature'] == 'wifi-capabilities')
+        changes = ({'path': '/system_ext/framework/miui-wifi-service.apk',
+                    'library': 'miui-wifi-service.apk'},
+                   {'path': '/system_ext/framework/custom.jar', 'library': 'custom.jar'},
+                   {'phase': 'late'},
+                   {'kind': 'app', 'path': '', 'package': 'com.miui.home',
+                    'library': 'libapp.so', 'phase': 'late'},
+                   {'kind': 'app', 'path': '', 'package': 'com.miui.weather2',
+                    'library': 'miui-wifi-service.jar', 'phase': 'early'})
+        for change in changes:
+            with self.subTest(change=change):
+                self.reject(lambda value: target(value).update(change))
+
+    def test_actual_unsigned_wifi_jars_match_producer_without_elf_or_repacking(self):
+        import io
+        import zipfile
+        import patch_wifi_capabilities as wifi
+        sources = audited_wifi_inputs()
+        if not sources:
+            self.skipTest('Private audited WiFi JAR inputs unavailable; no download attempted.')
+        rows = {row['before']: row for row in self.value['profiles']
+                if row['feature'] == 'wifi-capabilities'}
+        for before, original in sources.items():
+            with self.subTest(before=before):
+                self.assertTrue(original.startswith(b'PK\x03\x04'))
+                self.assertFalse(original.startswith(b'\x7fELF'))
+                patched = generic_patch(original, rows[before])
+                self.assertEqual(patched, wifi.patch_bytes(original))
+                self.assertEqual(generic_patch(patched, rows[before]), patched)
+                with zipfile.ZipFile(io.BytesIO(patched)) as jar:
+                    self.assertEqual(jar.namelist(), ['classes.dex', 'META-INF/MANIFEST.MF'])
+                    self.assertIsNone(jar.testzip())
+                altered = bytearray(original); altered[-1] ^= 1
+                with self.assertRaisesRegex(RuntimeError, 'Unsupported input content'):
+                    generic_patch(bytes(altered), rows[before])
+
+    def test_xqos_profiles_and_system_scope_match_only_canonical_recipes(self):
+        import patch_xqos as xqos
+        rows={row['before']:row for row in self.value['profiles'] if row['feature']=='xqos'}
+        self.assertEqual(set(rows),set(xqos.RECIPES))
+        for source in xqos.catalog_recipes():
+            row=rows[source['before']]
+            self.assertEqual(row['after'],source['after'])
+            self.assertEqual(row['sites'],[[site['offset'],site['before'],site['after']] for site in source['sites']])
+            self.assertEqual(len(row['sites']),7)
+        def target(value):return next(row for row in value['targets'] if row['feature']=='xqos')
+        self.assertEqual(target(self.value),{'feature':'xqos','phase':'early','kind':'system',
+                                            'path':xqos.NATIVE,'package':'','library':'libxqos.so'})
+        for change in ({'phase':'late'}, {'kind':'app','path':'','package':'com.miui.home'},
+                       {'path':'/system_ext/lib64/libxqos.so'}, {'library':'libunrelated.so'}):
+            with self.subTest(change=change):self.reject(lambda value:target(value).update(change))
+
+    def test_vendor_ims_uses_one_existing_feature_and_four_canonical_early_jar_sites(self):
+        import patch_xiaomi_ims as ims
+        profile=next(row for row in self.value['profiles'] if row['feature']=='vendor-ims')
+        receipt=ims.recipe_receipt()
+        self.assertEqual(profile['before'],ims.BEFORE);self.assertEqual(profile['after'],ims.AFTER)
+        self.assertEqual(profile['sites'],[[site['offset'],site['before'],site['after']] for site in receipt['sites']])
+        self.assertEqual(profile['legacy'],[])
+        def target(value):return next(row for row in value['targets'] if row['feature']=='vendor-ims')
+        self.assertEqual(target(self.value),{'feature':'vendor-ims','phase':'early','kind':'system',
+                                             'path':ims.PATH,'package':'','library':'xiaomi-opt-ims.jar'})
+        for change in ({'phase':'late'}, {'kind':'app','path':'','package':'com.miui.home'},
+                       {'path':'/system_ext/framework/xiaomi-opt-ims.apk','library':'xiaomi-opt-ims.apk'},
+                       {'path':'/system/framework/ims-common.jar','library':'ims-common.jar'},
+                       {'library':'custom.jar'}):
+            with self.subTest(change=change):self.reject(lambda value:target(value).update(change))
+
+    def test_actual_vendor_ims_jar_sites_match_producer_and_preserve_all_other_bytes(self):
+        import patch_xiaomi_ims as ims
+        from test_xiaomi_ims_patch import actual_input
+        original=actual_input()
+        if original is None:self.skipTest('Private audited IMS JAR unavailable; no download attempted.')
+        row=next(row for row in self.value['profiles'] if row['feature']=='vendor-ims')
+        output=generic_patch(original,row)
+        self.assertEqual(output,ims.patch_bytes(original));self.assertEqual(generic_patch(output,row),output)
+        altered=bytearray(original);altered[ims.ENTRY[0]]^=1
+        with self.assertRaisesRegex(RuntimeError,'Unsupported input content'):generic_patch(bytes(altered),row)
+
+    def test_performance_backends_share_one_feature_and_keep_exact_early_scopes(self):
+        import patch_qti_perf as qti
+        import patch_uniperf as uniperf
+        import patch_bufferqueue_perf as bufferqueue
+        rows={row['before']:row for row in self.value['profiles'] if row['feature']=='perf-hardware'}
+        sources=(*qti.catalog_recipes(),*uniperf.catalog_recipes(),*bufferqueue.catalog_recipes())
+        self.assertEqual(set(rows),{source['before'] for source in sources})
+        for source in sources:
+            row=rows[source['before']]
+            self.assertEqual(row['after'],source['after'])
+            self.assertEqual(row['sites'],[[site['offset'],site['before'],site['after']] for site in sorted(source['sites'],key=lambda item:item['offset'])])
+            self.assertEqual(row['legacy'],[])
+        targets=[row for row in self.value['targets'] if row['feature']=='perf-hardware']
+        self.assertEqual({row['path'] for row in targets},{qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE})
+        for source in (qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE):
+            def target(value):return next(row for row in value['targets'] if row['path']==source)
+            for change in ({'phase':'late'},{'kind':'app','path':'','package':'com.miui.home'},
+                           {'path':'/system_ext/lib64/custom.so','library':'custom.so'},
+                           {'path':'/system_ext/framework/UniperfClient.apk','library':'UniperfClient.apk'}):
+                with self.subTest(source=source,change=change):self.reject(lambda value:target(value).update(change))
+
+    def test_actual_performance_inputs_match_the_offline_producers(self):
+        import patch_qti_perf as qti
+        import patch_uniperf as uniperf
+        import patch_bufferqueue_perf as bufferqueue
+        roots=REPO/'work/feedback-investigation-20261013/phone-perf-callers'
+        audit=roots.parent
+        candidates=((qti,roots/'libqti-perfd-client_system.so'),(uniperf,roots/'UniperfClient.jar'),
+                    (uniperf,audit/'phone-uniperf-loaded-caller/miui-services.jar'),
+                    (uniperf,audit/'pad-uniperf-loaded-caller/miui-services.jar'),
+                    (bufferqueue,audit/'bufferqueue-perf/pad-libgui.so'))
+        found=0
+        for producer,path in candidates:
+            if not path.is_file():continue
+            original=path.read_bytes();checksum=hashlib.sha256(original).hexdigest()
+            row=next(row for row in self.value['profiles'] if row['before']==checksum)
+            output=generic_patch(original,row);self.assertEqual(output,producer.patch_bytes(original))
+            self.assertEqual(generic_patch(output,row),output);found+=1
+        if not found:self.skipTest('Private audited performance inputs unavailable; no download attempted.')
+
+    def test_display_metadata_profiles_keep_exact_early_consumer_and_mapper_provenance(self):
+        import patch_display_metadata as metadata
+        import package_native_module as package
+        rows={row['before']:row for row in self.value['profiles'] if row['feature']=='display-metadata'}
+        self.assertEqual(set(rows),set(metadata.RECIPES))
+        for recipe in metadata.catalog_recipes():
+            row=rows[recipe['before']]
+            self.assertEqual(row['after'],recipe['after']);self.assertEqual(row['legacy'],[])
+            self.assertEqual(row['sites'],[[site['offset'],site['before'],site['after']] for site in recipe['sites']])
+        targets=[row for row in self.value['targets'] if row['feature']=='display-metadata']
+        self.assertEqual({row['path'] for row in targets},{rule['path'] for rule in metadata.RECIPES.values()})
+        for target_path in {row['path'] for row in targets}:
+            for change in ({'phase':'late'},{'kind':'app','path':'','package':'com.miui.weather2'},
+                           {'path':'/vendor/lib64/hw/mapper.ranchu.so','library':'mapper.ranchu.so'},
+                           {'path':'/system_ext/lib64/libmisurfaceflinger.so','library':'libmisurfaceflinger.so'},
+                           {'library':'foreign.so'}):
+                with self.subTest(target=target_path,change=change):
+                    self.reject(lambda value:next(row for row in value['targets'] if row['path']==target_path).update(change))
+        generated=package.module_files()['display-metadata-capability.tsv']
+        self.assertEqual(generated,metadata.capability_recipe())
+        self.assertIn(metadata.MAPPER_SHA256.encode(),generated)
+
+    def test_actual_display_metadata_inputs_match_offline_sites_without_mapper_or_property_changes(self):
+        import patch_display_metadata as metadata
+        root=REPO/'work/feedback-investigation-20261013/pad-metadata-caller-audit'
+        found=0
+        for name in ('libui.so','phone-libui.so','libsurfaceflinger.so'):
+            path=root/name
+            if not path.is_file():continue
+            original=path.read_bytes();before=hashlib.sha256(original).hexdigest()
+            row=next(row for row in self.value['profiles'] if row['before']==before)
+            changed=generic_patch(original,row)
+            self.assertEqual(changed,metadata.patch_bytes(original));self.assertEqual(generic_patch(changed,row),changed)
+            if name=='libsurfaceflinger.so':
+                self.assertIn(b'ro.vendor.display.bt2020.supported',changed)
+            found+=1
+        if not found:self.skipTest('Private audited display consumers unavailable; no download attempted.')
 
     def test_cli_emits_the_same_catalog_without_workspace_dependencies(self):
         result = subprocess.run([sys.executable, str(REPO / 'scripts/native_patch_catalog.py')],

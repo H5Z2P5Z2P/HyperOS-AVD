@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 5
+REVISION = 11
 
 
 def boot_prerequisites():
@@ -43,8 +43,10 @@ def module_files(value=None, template=None):
     validate_catalog(value)
     template = REPO / 'modules/native-compat' if template is None else Path(template)
     files = {}
-    for name in ('module.prop', 'customize.sh', 'runtime.sh', 'platform.sh', 'post-fs-data.sh', 'service.sh'):
+    for name in ('module.prop', 'customize.sh', 'runtime.sh', 'platform.sh', 'post-fs-data.sh', 'service.sh', 'uninstall.sh'):
         files[name] = (template / name).read_bytes()
+    from finddevice_policy import files as finddevice_files
+    files.update(finddevice_files(template))
     from dex2oat_cpu_policy import policy_script
     files['dex2oat-cpu-policy.sh'] = policy_script()
     from module_webui import files as webui_files
@@ -56,6 +58,13 @@ def module_files(value=None, template=None):
         raise RuntimeError('Native module revision and template disagree.')
     files['skip_mount'] = b''
     files['boot-prerequisites.tsv'] = boot_prerequisites()
+    from patch_display_privacy import capability_recipe
+    files['display-privacy-capability.tsv'] = capability_recipe()
+    from patch_display_metadata import capability_recipe as metadata_capability_recipe
+    files['display-metadata-capability.tsv'] = metadata_capability_recipe()
+    from patch_xqos import ABSENT_NODES
+    files['xqos-capability.tsv'] = ('schema|1\nexpected-drivers|' + str(len(ABSENT_NODES)) + '\n' +
+                                    ''.join('driver|' + node + '\n' for node in ABSENT_NODES)).encode()
     files['catalog.json'] = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     profiles = []
     for profile in sorted(value['profiles'], key=lambda item: item['id']):
@@ -76,7 +85,7 @@ def module_files(value=None, template=None):
                       item['package'], item['library'])) for item in value['targets']]
     files['targets.tsv'] = ('\n'.join(rows) + '\n').encode()
     features = sorted({profile['feature'] for profile in value['profiles']} |
-                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake'})
+                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake', 'finddevice', 'vendor-ims'})
     files['features.tsv'] = ('\n'.join(features) + '\n').encode()
     manifest = {'schema': 1, 'id': MODULE_ID, 'revision': REVISION,
                 'catalog_sha256': hashlib.sha256(files['catalog.json']).hexdigest(),

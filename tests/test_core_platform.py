@@ -182,8 +182,7 @@ class CorePlatformShellTests(unittest.TestCase):
         self.environment.update(HYPEROS_CORE_STATE=str(state), HYPEROS_CORE_PENDING=str(self.root / 'pending'),
                                 HYPEROS_CORE_RESETPROP=str(self.bin / 'resetprop'))
         # Android BusyBox metadata uses the guest's root owner, not the host UID.
-        busybox = fixture.BUSYBOX.replace(".replace('%u:%g', attrs.get('owner', os.environ.get('HYPEROS_NATIVE_TEST_OWNER', f'{value.st_uid}:{value.st_gid}'))))",
-            ".replace('%u:%g', attrs.get('owner', '0:0')).replace('%u', attrs.get('owner', '0:0').split(':')[0]).replace('%h', str(value.st_nlink)))")
+        busybox = fixture.BUSYBOX.replace("os.environ.get('HYPEROS_NATIVE_TEST_OWNER', f'{value.st_uid}:{value.st_gid}')", "'0:0'")
         self.bb.write_text(busybox)
         trace = self.root / 'effects'
         (self.bin / 'resetprop').write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(trace)) + '\n')
@@ -193,6 +192,44 @@ class CorePlatformShellTests(unittest.TestCase):
         result = subprocess.run(['sh', '-c', script], env=self.environment, text=True,
                                 capture_output=True, check=check)
         return result, trace.read_text() if trace.exists() else ''
+
+    def test_package_policies_require_complete_vendor_proof_and_restore_feature_choices(self):
+        for feature in ('finddevice', 'vendor-ims'):
+            helper = self.module / (feature + '-policy.sh')
+            helper.write_text('#!/bin/sh\nprintf "%s:%s\\n" ' + shlex.quote(feature) +
+                              ' "$1" >> ' + shlex.quote(str(self.root / 'effects')) +
+                              '\nprintf "ready|owned-package-disabled\\n"\n')
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        _, effects = self.run_platform('core_policies', 'native_privacy_eligible() { return 1; }')
+        self.assertEqual(effects, '')
+        _, effects = self.run_platform('core_policies', 'native_privacy_eligible() { return 0; }')
+        self.assertEqual(effects, 'finddevice:apply\nvendor-ims:apply\n')
+        (self.module / 'features.disabled').write_text('finddevice\n')
+        _, effects = self.run_platform('core_policies', 'native_privacy_eligible() { return 0; }')
+        self.assertTrue(effects.endswith('finddevice:restore\nvendor-ims:apply\n'))
+        (self.module / 'disable').touch()
+        _, effects = self.run_platform('core_policies', 'native_privacy_eligible() { return 0; }')
+        self.assertTrue(effects.endswith('finddevice:restore\nvendor-ims:restore\n'))
+        _, effects = self.run_platform('core_policy_cleanup')
+        self.assertTrue(effects.endswith('finddevice:restore\nvendor-ims:restore\n'))
+
+    def test_pending_update_preserves_package_policy_until_explicit_user_disable(self):
+        for feature in ('finddevice','vendor-ims'):
+            (self.module/(feature+'-policy.sh')).write_text('#!/bin/sh\nprintf "%s:%s\\n" '+shlex.quote(feature)+' "$1" >> '+shlex.quote(str(self.root/'effects'))+'\nprintf "disabled|original-state-restored\\n"\n')
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        (self.root/'pending').mkdir()
+        _,effects=self.run_platform('core_policies;core_policy_cleanup','native_privacy_eligible() { return 0; }')
+        self.assertEqual(effects,'')
+        self.assertIn('|pending|module-update-staged\n',(self.module/'state/status.tsv').read_text())
+        (self.module/'features.disabled').write_text('finddevice\n')
+        _,effects=self.run_platform('core_policies;core_policy_cleanup','native_privacy_eligible() { return 0; }')
+        self.assertEqual(effects,'finddevice:restore\nfinddevice:restore\n')
+        (self.module/'disable').touch()
+        _,effects=self.run_platform('core_policy_cleanup')
+        self.assertTrue(effects.endswith('finddevice:restore\nvendor-ims:restore\n'))
+        (self.module/'disable').unlink();(self.module/'remove').symlink_to(self.root/'missing')
+        _,effects=self.run_platform('core_policy_cleanup')
+        self.assertTrue(effects.endswith('finddevice:restore\nvendor-ims:restore\n'))
 
     def test_serial_persists_across_ota_and_never_replays_a_device_table(self):
         state = self.root / 'persistent'; state.mkdir()
@@ -322,6 +359,111 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
             result, _ = self.run_platform('core_context_ready boot',
                 'core_safe_file() { return 0; }\nnative_ns_hash() { echo ' + 'f' * 64 + '; }', check=False)
             self.assertNotEqual(result.returncode, 0, 'Actual namespace content must also match.')
+
+    def boot_native_derivative_fixture(self):
+        import patch_uniperf as uniperf
+        from patch_boot_services import image_receipt
+        source=REPO/'work/feedback-investigation-20261013/phone-uniperf-loaded-caller/miui-services.jar'
+        self.boot_path=uniperf.MIUI_SERVICES
+        receipt=image_receipt()
+        pins={row['path']:row['after'] for row in receipt['targets'].values()}
+        pins['/system/bin/hyperos_kernel_probe']=receipt['probe_sha256']
+        self.boot_expected=pins[self.boot_path]
+        derivative=uniperf.RECIPES[self.boot_expected]['after']
+        if source.is_file():
+            original=source.read_bytes();self.boot_after=uniperf.patch_bytes(original)
+            self.assertEqual(hashlib.sha256(original).hexdigest(),self.boot_expected)
+            self.assertEqual(hashlib.sha256(self.boot_after).hexdigest(),derivative)
+        else:
+            # Keep guard/provenance coverage in public CI. The namespace hash
+            # oracle models the reviewed byte identity; producer tests audit
+            # the proprietary JAR independently when that input is available.
+            self.boot_after=b'Public namespace fixture for an audited immutable derivative.'
+        # Authenticate real generated controls; path mapping substitutes only
+        # the namespace's immutable image files, never catalog/hash semantics.
+        for name,body in package_native_module.module_files().items():
+            target=self.module/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(body)
+        self.boot_actual=self.root/'miui-services.jar';self.boot_actual.write_bytes(self.boot_after)
+        state=self.root/'persistent';state.mkdir(exist_ok=True)
+        self.boot_rows=''.join('boot|'+path+'|'+checksum+'\n' for path,checksum in pins.items())
+        (state/'image.tsv').write_text(self.boot_rows)
+        self.boot_mount='40 1 253:1 '+str(self.module/'cache/trusted.so')+' '+self.boot_path+' rw - ext4 /dev/block/test rw\n'
+        (self.proc/'1/mountinfo').write_text(self.boot_mount)
+        actual=shlex.quote(str(self.boot_actual));path=shlex.quote(self.boot_path)
+        overrides='core_safe_file() { case "$1" in\n'+path+') [ -f '+actual+' ] && [ ! -L '+actual+' ] && [ "$("$BB" stat -c %h '+actual+')" = 1 ];;\n'
+        overrides+=''.join(shlex.quote(item)+') return 0;;\n' for item in pins if item!=self.boot_path)
+        overrides+='*) [ -f "$1" ] && [ ! -L "$1" ] && [ "$("$BB" stat -c %u "$1")" = 0 ] && [ "$("$BB" stat -c %h "$1")" = 1 ];;\nesac; }\n'
+        fixture_hash=hashlib.sha256(self.boot_after).hexdigest()
+        overrides+='native_ns_hash() { case "$2" in\n'+path+') observed=$(native_hash '+actual+'); if [ "$observed" = '+fixture_hash+' ]; then echo '+derivative+'; else echo "$observed"; fi;;\n'
+        overrides+=''.join(shlex.quote(item)+') echo '+checksum+';;\n' for item,checksum in pins.items() if item!=self.boot_path)
+        overrides+='*) return 1;;\nesac; }\n'
+        overrides+='native_eligible() { [ "$1" = perf-hardware ]; }\n'
+        return overrides
+
+    def test_exact_owned_native_derivative_keeps_independent_boot_provenance_when_feature_off(self):
+        overrides=self.boot_native_derivative_fixture()
+        self.run_platform('core_context_ready boot',overrides)
+        (self.module/'features.disabled').write_text('perf-hardware\n')
+        _,effects=self.run_platform('core_context_ready boot',overrides)
+        self.assertEqual(effects,'')
+        self.assertEqual((self.root/'persistent/image.tsv').read_text(),self.boot_rows)
+        self.assertEqual(self.boot_actual.read_bytes(),self.boot_after)
+
+    def test_boot_derivative_rejects_foreign_mount_unconfirmed_capability_and_unknown_bytes(self):
+        overrides=self.boot_native_derivative_fixture()
+        mount=self.proc/'1/mountinfo'
+        for body in ('',self.boot_mount.replace(str(self.module/'cache'),'/foreign/module/cache')):
+            mount.write_text(body)
+            self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        mount.write_text(self.boot_mount)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides+'native_eligible() { return 1; }\n',check=False)[0].returncode,0)
+        self.boot_actual.write_bytes(b'unknown framework content')
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        self.boot_actual.write_bytes(self.boot_after)
+        context=self.root/'persistent/image.tsv'
+        context.write_text(self.boot_rows.replace(self.boot_path+'|'+self.boot_expected,self.boot_path+'|'+'a'*64))
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+
+    def test_boot_derivative_rejects_changed_current_controls_and_aliases(self):
+        overrides=self.boot_native_derivative_fixture()
+        profiles=self.module/'profiles.tsv';original=profiles.read_bytes()
+        profiles.write_bytes(original+b'\n')
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        profiles.write_bytes(original)
+        alias=self.module/'profiles-alias';alias.write_bytes(original)
+        profiles.unlink();profiles.symlink_to(alias)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        profiles.unlink();profiles.write_bytes(original)
+        hardlink=self.module/'profiles-hardlink';os.link(profiles,hardlink)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        hardlink.unlink()
+        target_alias=self.root/'actual-alias';self.boot_actual.rename(target_alias);self.boot_actual.symlink_to(target_alias)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+
+    def test_boot_derivative_rejects_duplicate_scopes_and_legacy_or_mixed_edges(self):
+        overrides=self.boot_native_derivative_fixture()
+        profiles=self.module/'profiles.tsv';targets=self.module/'targets.tsv'
+        original_profiles,original_targets=profiles.read_text(),targets.read_text()
+        expected=self.boot_expected
+        selected=next(line for line in original_profiles.splitlines(True) if line.startswith(expected+'|'))
+        scope=next(line for line in original_targets.splitlines(True) if '|'+self.boot_path+'|' in line)
+        middle='a'*64;parts=selected.rstrip().split('|')
+        cases=((original_profiles+selected,original_targets),
+               (original_profiles,original_targets+scope),
+               (original_profiles,original_targets.replace(scope,scope.replace('early|system','late|system'))),
+               (original_profiles,original_targets.replace(scope,scope.replace('perf-hardware','hwui'))),
+               (original_profiles,original_targets.replace(scope,scope.replace('|miui-services.jar','|foreign.jar'))),
+               (original_profiles.replace(selected,'|'.join((expected,middle,'',*parts[3:]))+'\n'),original_targets),
+               (original_profiles.replace(selected,'|'.join((parts[0],parts[1],middle,*parts[3:]))+'\n'),original_targets),
+               (original_profiles.replace(selected,'|'.join((middle,parts[1],expected,*parts[3:]))+'\n'),original_targets),
+               (original_profiles.replace(selected,'|'.join((expected,middle,'',*parts[3:]))+'\n'+'|'.join((middle,parts[1],'',parts[3],'foreign-profile'))+'\n'),original_targets))
+        for changed_profiles,changed_targets in cases:
+            profiles.write_text(changed_profiles);targets.write_text(changed_targets)
+            fixture.NativeModuleRuntimeTests.checksums(self)
+            self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        profiles.write_text(original_profiles);targets.write_text(original_targets)
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        self.run_platform('core_context_ready boot',overrides)
 
     def test_boot_catalog_is_checked_and_full_recipes_cannot_be_mixed(self):
         from patch_boot_services import image_receipt
