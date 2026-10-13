@@ -70,14 +70,15 @@ def context_files(context):
         files['rear.record'] = '1|1|1|local:4619827551948147201\n'
     boot = context.get('boot_services')
     if boot is not None:
-        from patch_boot_services import TARGETS, AFTER, PROBE_SHA256
-        expected = {item[0]: AFTER[name] for name, item in TARGETS.items()}
+        from patch_boot_services import image_receipts, PROBE_SHA256
+        expected = [{item['path']: item['after'] for item in recipe['targets'].values()}
+                    for recipe in image_receipts()]
         if (not isinstance(boot, dict) or set(boot) != {'files', 'probe'}
                 or not isinstance(boot['files'], list)
                 or boot['probe'] != {'path': '/system/bin/hyperos_kernel_probe', 'sha256': PROBE_SHA256}
-                or len(boot['files']) != len(expected)
                 or any(not isinstance(item, dict) or set(item) != {'path', 'sha256'} for item in boot['files'])
-                or {item['path']: item['sha256'] for item in boot['files']} != expected):
+                or len({item['path'] for item in boot['files']}) != len(boot['files'])
+                or {item['path']: item['sha256'] for item in boot['files']} not in expected):
             raise RuntimeError('Unreviewed Core boot-service image prerequisites.')
         for item in [*boot['files'], boot['probe']]:
             rows.append(('boot', item['path'], item['sha256']))

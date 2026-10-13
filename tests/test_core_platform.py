@@ -169,7 +169,10 @@ class LegacyFlutterReceiptTests(unittest.TestCase):
 
 
 class CorePlatformShellTests(unittest.TestCase):
-    setUp = fixture.NativeModuleRuntimeTests.setUp
+    def setUp(self):
+        fixture.NativeModuleRuntimeTests.setUp(self)
+        (self.module / 'boot-prerequisites.tsv').write_bytes(package_native_module.boot_prerequisites())
+        fixture.NativeModuleRuntimeTests.checksums(self)
     profile = fixture.NativeModuleRuntimeTests.profile
     file_metadata = fixture.NativeModuleRuntimeTests.file_metadata
 
@@ -293,23 +296,100 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
         self.assertEqual(effects, '')
 
     def test_boot_gate_requires_every_reviewed_image_prerequisite(self):
-        from patch_boot_services import TARGETS, AFTER, PROBE_SHA256
+        from patch_boot_services import image_receipts
         state = self.root / 'persistent'; state.mkdir()
-        pins = {item[0]: AFTER[name] for name, item in TARGETS.items()}
-        pins['/system/bin/hyperos_kernel_probe'] = PROBE_SHA256
+        for receipt in image_receipts():
+            pins = {item['path']: item['after'] for item in receipt['targets'].values()}
+            pins['/system/bin/hyperos_kernel_probe'] = receipt['probe_sha256']
+            rows = ''.join('boot|' + path + '|' + checksum + '\n' for path, checksum in pins.items())
+            (state / 'image.tsv').write_text(rows)
+            overrides = 'core_safe_file() { return 0; }\nnative_ns_hash() { case "$2" in\n'
+            overrides += ''.join(shlex.quote(path) + ') echo ' + checksum + ';;\n' for path, checksum in pins.items())
+            overrides += 'esac; }'
+            self.run_platform('core_context_ready boot', overrides)
+            for changed in (rows.replace(receipt['probe_sha256'], '0' * 64),
+                            ''.join(rows.splitlines(True)[:-1]), rows + rows.splitlines(True)[0],
+                            rows + 'boot|/system/framework/foreign.jar|' + 'a' * 64 + '\n',
+                            rows.replace('|/system/framework/services.jar|', '|/system/framework/services.jar|extra|')):
+                with self.subTest(recipe=receipt['targets']['services']['after'], changed=changed):
+                    (state / 'image.tsv').write_text(changed)
+                    result, _ = self.run_platform('core_context_ready boot', overrides, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    # The invalid group precedes any probe or service control.
+                    self.run_platform('core_kernel', overrides)
+                    self.assertIn('unverified-image-prerequisites', (self.module / 'state/status.tsv').read_text())
+            (state / 'image.tsv').write_text(rows)
+            result, _ = self.run_platform('core_context_ready boot',
+                'core_safe_file() { return 0; }\nnative_ns_hash() { echo ' + 'f' * 64 + '; }', check=False)
+            self.assertNotEqual(result.returncode, 0, 'Actual namespace content must also match.')
+
+    def test_boot_catalog_is_checked_and_full_recipes_cannot_be_mixed(self):
+        from patch_boot_services import image_receipt
+        state = self.root / 'persistent'; state.mkdir()
+        receipt = image_receipt()
+        pins = {item['path']: item['after'] for item in receipt['targets'].values()}
+        pins['/system/bin/hyperos_kernel_probe'] = receipt['probe_sha256']
         rows = ''.join('boot|' + path + '|' + checksum + '\n' for path, checksum in pins.items())
         (state / 'image.tsv').write_text(rows)
-        overrides = 'core_safe_file() { return 0; }\nnative_ns_hash() { case "$2" in\n'
+        catalog = self.module / 'boot-prerequisites.tsv'
+        original = catalog.read_bytes()
+        # A tampered file is refused even when the requested group still exists.
+        catalog.write_bytes(original + b'\n')
+        result, _ = self.run_platform('core_boot_recipe', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        catalog.write_bytes(original)
+        alias = self.module / 'catalog-alias'; alias.write_bytes(original)
+        catalog.unlink(); catalog.symlink_to(alias)
+        result, _ = self.run_platform('core_boot_recipe', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        catalog.unlink(); catalog.write_bytes(original)
+        # Future recipes may change several files. Every hash can be registered
+        # individually while their mixture is still an unaudited combination.
+        second = dict(pins)
+        second['/system/framework/services.jar'] = 'a' * 64
+        second['/system_ext/framework/miui-services.jar'] = 'b' * 64
+        generated = ['schema|1']
+        for identity, group in (('1' * 64, pins), ('2' * 64, second)):
+            generated.append(f'recipe|{identity}|{len(group)}')
+            generated.extend('|'.join(('file', identity, path, checksum)) for path, checksum in group.items())
+        body = '\n'.join(generated) + '\n'
+        catalog.write_text(body); fixture.NativeModuleRuntimeTests.checksums(self)
+        self.run_platform('core_boot_recipe')
+        mixed = dict(pins); mixed['/system/framework/services.jar'] = second['/system/framework/services.jar']
+        (state / 'image.tsv').write_text(''.join('boot|' + path + '|' + checksum + '\n' for path, checksum in mixed.items()))
+        result, _ = self.run_platform('core_boot_recipe', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        (state / 'image.tsv').write_text(rows)
+        for malformed in (body.replace('schema|1', 'schema|2'),
+                          body + generated[2] + '\n',
+                          '\n'.join(generated[:2] + generated[3:]) + '\n',
+                          body + generated[1] + '\n',
+                          body.replace(generated[2], generated[2] + '|extra')):
+            catalog.write_text(malformed); fixture.NativeModuleRuntimeTests.checksums(self)
+            result, _ = self.run_platform('core_boot_recipe', check=False)
+            self.assertNotEqual(result.returncode, 0, malformed)
+
+    def test_boot_group_snapshot_cannot_be_replaced_between_matching_and_hashing(self):
+        from patch_boot_services import image_receipt
+        state = self.root / 'persistent'; state.mkdir()
+        receipt = image_receipt()
+        pins = {item['path']: item['after'] for item in receipt['targets'].values()}
+        pins['/system/bin/hyperos_kernel_probe'] = receipt['probe_sha256']
+        (state / 'image.tsv').write_text(''.join('boot|' + path + '|' + checksum + '\n'
+                                              for path, checksum in pins.items()))
+        overrides = '''core_safe_file() { return 0; }
+native_ns_hash() {
+    printf 'boot|/system/framework/foreign.jar|%s\\n' ''' + 'a' * 64 + ''' > "$CORE_STATE/image.tsv"
+    echo "$2" >> "$CORE_STATE/hashed-paths"
+    case "$2" in
+'''
         overrides += ''.join(shlex.quote(path) + ') echo ' + checksum + ';;\n' for path, checksum in pins.items())
-        overrides += 'esac; }'
+        overrides += '*) echo ' + 'a' * 64 + ';;\nesac; }'
         self.run_platform('core_context_ready boot', overrides)
-        for changed in (rows.replace(PROBE_SHA256, '0' * 64), ''.join(rows.splitlines(True)[:-1]), rows + rows.splitlines(True)[0]):
-            (state / 'image.tsv').write_text(changed)
-            result, _ = self.run_platform('core_context_ready boot', overrides, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            # The invalid gate precedes any probe execution or service control.
-            self.run_platform('core_kernel', overrides)
-            self.assertIn('unverified-image-prerequisites', (self.module / 'state/status.tsv').read_text())
+        self.assertCountEqual((state / 'hashed-paths').read_text().splitlines(), list(pins))
+        self.assertNotIn('/system/framework/foreign.jar', (state / 'hashed-paths').read_text())
+        result, _ = self.run_platform('core_context_ready boot', overrides, check=False)
+        self.assertNotEqual(result.returncode, 0, 'The next check must reject the changed userdata context.')
 
     def rear_process(self, pid, start=42, owned=True):
         directory = self.proc / str(pid); directory.mkdir(exist_ok=True)
@@ -406,6 +486,8 @@ class CoreMigrationShellTests(CorePlatformShellTests):
     test_persistent_conflict_gate_blocks_the_native_and_platform_owner = None
     test_identity_and_status_do_not_rehash_or_rewrite_unchanged_values = None
     test_boot_gate_requires_every_reviewed_image_prerequisite = None
+    test_boot_catalog_is_checked_and_full_recipes_cannot_be_mixed = None
+    test_boot_group_snapshot_cannot_be_replaced_between_matching_and_hashing = None
     test_rear_disable_stops_only_the_exact_adopted_process_lifetime = None
     test_rear_missing_empty_alias_dead_boot_pid_reuse_and_foreign_are_preserved = None
     test_rear_lease_serializes_start_adoption_and_cleanup = None

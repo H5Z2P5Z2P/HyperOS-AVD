@@ -161,7 +161,7 @@ class NativeModuleInstallTests(unittest.TestCase):
         checksum = history.checksum_for(saved)
         self.assertEqual(checksum, 'fa204e270753618e9ff114c1131d118265eb359da682801679c546105833f355')
         current = json.loads(self.current_manifest())
-        self.assertEqual(current['revision'], 4)
+        self.assertEqual(current['revision'], install.REVISION)
         self.assertNotEqual(saved['files_sha256']['webroot/app.js'], current['files_sha256']['webroot/app.js'])
         prop = PROPERTY.rsplit('=', 1)[0] + '=3'
         result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
@@ -169,6 +169,31 @@ class NativeModuleInstallTests(unittest.TestCase):
         stage = next(command for command in commands if 'module install' in command)
         self.assertIn(checksum, stage)
         self.assertEqual(adb.call_count, 1)
+
+    def test_core4_standard_update_authenticates_the_frozen_package_before_core5(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v4-manifest.json').read_text()
+        saved = json.loads(previous)
+        self.assertEqual(saved['revision'], 4)
+        checksum = history.checksum_for(saved)
+        self.assertEqual(checksum, 'd50c1ea813e3933dd6e0fb23e1a0a6fd10ea5235151e4cd59d790ae67ed5b036')
+        current = json.loads(self.current_manifest())
+        self.assertEqual(current['revision'], install.REVISION)
+        self.assertNotIn('boot-prerequisites.tsv', saved['files_sha256'])
+        self.assertIn('boot-prerequisites.tsv', current['files_sha256'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=4'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(checksum, verification); self.assertIn(checksum, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['platform.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands))
+        adb.assert_not_called()
 
     def test_reviewed_previous_receipt_with_changed_controls_is_preserved(self):
         def changed(command):

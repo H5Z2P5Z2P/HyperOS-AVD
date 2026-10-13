@@ -26,9 +26,51 @@ core_permitted() {
     core_state_safe
 }
 
-core_context_ready() {
+core_boot_recipe() {
+    # Match one complete immutable recipe before inspecting any guest file.
+    # SHA256SUMS is anchored by the installed module's reviewed manifest and
+    # verified by native_assets before its hooks run. Recheck this small asset
+    # here so a changed catalog cannot authorize later platform effects.
+    local catalog="$MODDIR/boot-prerequisites.tsv" expected
+    core_safe_file "$catalog" && core_safe_file "$MODDIR/SHA256SUMS" || return 1
+    expected=$("$BB" awk '$2 == "boot-prerequisites.tsv" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1;
+        checksum=$1} END {if (found != 1) exit 1; print checksum}' "$MODDIR/SHA256SUMS") || return 1
+    native_hex "$expected" && [ "$(native_hash "$catalog")" = "$expected" ] || return 1
+    "$BB" awk -F '|' '
+        function hex(value) {return length(value) == 64 && value !~ /[^0-9a-f]/}
+        FNR == NR {
+            if (FNR == 1) {if ($0 != "schema|1") bad=1; next}
+            if ($1 == "recipe" && NF == 3 && hex($2) && $3 ~ /^[1-9][0-9]*$/ && length($3) <= 3) {
+                if (declared[$2]++) bad=1; required[$2]=$3+0; next
+            }
+            if ($1 == "file" && NF == 4 && hex($2) && $3 ~ /^\/(system|system_ext|product)\// && hex($4)) {
+                key=$2 SUBSEP $3;
+                if ((key in pins) || !declared[$2]) bad=1;
+                pins[key]=$4; count[$2]++; next
+            }
+            bad=1; next
+        }
+        $1 == "boot" {
+            if (NF != 3 || !hex($3) || ($2 in image)) bad=1;
+            image[$2]=$3; found++
+        }
+        END {
+            if (bad || !found) exit 1;
+            for (recipe in declared) {
+                if (count[recipe] != required[recipe]) exit 1;
+                if (found != required[recipe]) continue;
+                matches=1;
+                for (path in image) if (pins[recipe SUBSEP path] != image[path]) matches=0;
+                if (matches) {selected=recipe; accepted++}
+            }
+            if (accepted != 1) exit 1;
+            for (path in image) print "boot|" path "|" pins[selected SUBSEP path]
+        }' "$catalog" "$CORE_STATE/image.tsv"
+}
+
+core_context_rows_ready() {
     local kind=$1 row path expected extra found=0 seen='|'
-    core_state_safe && core_safe_file "$CORE_STATE/image.tsv" || return 1
     while IFS='|' read -r row path expected extra; do
         [ "$row" = "$kind" ] || continue
         [ -z "$extra" ] && native_hex "$expected" || return 1
@@ -37,18 +79,27 @@ core_context_ready() {
         case "$kind:$path" in
             identity:/system/build.prop|identity:/product/etc/build.prop) ;;
             rear:/system_ext/framework/rear-display-wake.jar|rear:/system_ext/bin/rear-display-wake|rear:/product/etc/hyperos-avd-rear-display.json|rear:/product/overlay/HyperOSAVDRearDisplay/RearDisplay.apk|rear:/product/etc/displayconfig/display_id_*.xml) ;;
-            boot:/system_ext/priv-app/com.qualcomm.location/com.qualcomm.location.apk) [ "$expected" = 66dce6b9f484ee6d3651d3577f536d57f12aef0adb4a1940ee6fa0118eeb5134 ] || return 1 ;;
-            boot:/product/priv-app/AutoRegistration/AutoRegistration.apk) [ "$expected" = 2b6c3ddad65ac3c6f65667631c2ac75fd8724a1092250d809bb4d3e7d7d8b1f9 ] || return 1 ;;
-            boot:/system/framework/services.jar) [ "$expected" = 3b1c22fbae3262187af8e040e02962edd7f80ae7369d9bcd724457384a4fd6b1 ] || return 1 ;;
-            boot:/system_ext/framework/miui-services.jar) [ "$expected" = 205bbc10beab0fcd668c79dc2b795c6115fe4b3eca1e3b8eb75f99f5f9702f56 ] || return 1 ;;
-            boot:/system/bin/hyperos_kernel_probe) [ "$expected" = af7486c1f98e01641c10d5089fd46348ce612c6fbf15c1581f50a6bacb6f402a ] || return 1 ;;
+            boot:*) ;;
             *) return 1 ;;
         esac
         native_path "$path" && core_safe_file "$path" || return 1
         [ "$(native_ns_hash 1 "$path")" = "$expected" ] || return 1
         found=$((found + 1))
-    done < "$CORE_STATE/image.tsv"
-    if [ "$kind" = boot ]; then [ "$found" -eq 5 ]; else [ "$found" -gt 0 ]; fi
+    done
+    [ "$found" -gt 0 ]
+}
+
+core_context_ready() {
+    local kind=$1 rows
+    core_state_safe && core_safe_file "$CORE_STATE/image.tsv" || return 1
+    if [ "$kind" = boot ]; then
+        # Verify the canonical matched snapshot, not a second read of mutable
+        # userdata that could change between recipe matching and hashing.
+        rows=$(core_boot_recipe) || return 1
+        printf '%s\n' "$rows" | core_context_rows_ready "$kind"
+    else
+        core_context_rows_ready "$kind" < "$CORE_STATE/image.tsv"
+    fi
 }
 
 core_identity_rows() {
@@ -198,8 +249,7 @@ core_kernel() {
         native_status boot-services kernel skipped unverified-image-prerequisites; return 0
     fi
     local probe=/system/bin/hyperos_kernel_probe code protocol service
-    if ! core_safe_file "$probe" || [ ! -x "$probe" ] ||
-            [ "$(native_ns_hash 1 "$probe")" != af7486c1f98e01641c10d5089fd46348ce612c6fbf15c1581f50a6bacb6f402a ]; then
+    if ! core_safe_file "$probe" || [ ! -x "$probe" ]; then
         native_status boot-services kernel skipped verified-image-probe-unavailable; return 0
     fi
     protocol=$(getprop ro.millet.netlink)

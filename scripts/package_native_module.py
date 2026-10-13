@@ -9,7 +9,31 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 4
+REVISION = 5
+
+
+def boot_prerequisites():
+    """Serialize complete registered image recipes from the canonical producer."""
+    from patch_boot_services import image_receipts, validate_image_receipt
+    rows = ['schema|1']
+    seen = set()
+    for value in image_receipts():
+        receipt = validate_image_receipt(value)
+        identity = hashlib.sha256(json.dumps(receipt, sort_keys=True,
+                                            separators=(',', ':')).encode()).hexdigest()
+        if identity in seen:
+            raise RuntimeError('Duplicate boot prerequisite recipe.')
+        seen.add(identity)
+        pins = {item['path']: item['after'] for item in receipt['targets'].values()}
+        pins['/system/bin/hyperos_kernel_probe'] = receipt['probe_sha256']
+        if len(pins) != len(receipt['targets']) + 1:
+            raise RuntimeError('Duplicate boot prerequisite path.')
+        rows.append(f'recipe|{identity}|{len(pins)}')
+        rows.extend('|'.join(('file', identity, path, checksum))
+                    for path, checksum in sorted(pins.items()))
+    if not seen:
+        raise RuntimeError('Missing boot prerequisite recipes.')
+    return ('\n'.join(rows) + '\n').encode()
 
 
 def module_files(value=None, template=None):
@@ -31,6 +55,7 @@ def module_files(value=None, template=None):
     if properties.get('versionCode') != str(REVISION):
         raise RuntimeError('Native module revision and template disagree.')
     files['skip_mount'] = b''
+    files['boot-prerequisites.tsv'] = boot_prerequisites()
     files['catalog.json'] = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     profiles = []
     for profile in sorted(value['profiles'], key=lambda item: item['id']):

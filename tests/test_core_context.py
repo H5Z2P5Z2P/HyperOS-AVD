@@ -5,10 +5,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import copy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import core_context
 import package_release
+import core_platform
 
 
 class CoreContextTests(unittest.TestCase):
@@ -70,6 +72,28 @@ class CoreContextTests(unittest.TestCase):
                      'modules/native-compat/platform.sh', 'modules/app-bridge/catalog.sh'):
             self.assertIn(name, files)
         self.assertFalse(any('/state/' in name or 'runtime.log' in name for name in files))
+
+    def test_boot_platform_admits_complete_registered_recipes_only(self):
+        from patch_boot_services import image_receipts, PROBE_SHA256
+        for recipe in image_receipts():
+            context = copy.deepcopy(self.context)
+            context['boot_services'] = {
+                'files': [{'path': target['path'], 'sha256': target['after']}
+                          for target in recipe['targets'].values()],
+                'probe': {'path': '/system/bin/hyperos_kernel_probe', 'sha256': PROBE_SHA256}}
+            self.assertIn('image.tsv', core_platform.context_files(context))
+            for mutation in ('changed', 'duplicate', 'missing'):
+                bad = copy.deepcopy(context)
+                files = bad['boot_services']['files']
+                if mutation == 'changed':
+                    files[0]['sha256'] = '0' * 64
+                elif mutation == 'duplicate':
+                    files.append(dict(files[0]))
+                else:
+                    files.pop()
+                with self.subTest(recipe=recipe, mutation=mutation), self.assertRaisesRegex(
+                        RuntimeError, 'boot-service image prerequisites'):
+                    core_platform.context_files(bad)
 
 
 if __name__ == '__main__':

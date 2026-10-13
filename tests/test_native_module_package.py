@@ -16,6 +16,41 @@ import dex2oat_cpu_policy as cpu_policy
 
 
 class NativeModulePackageTests(unittest.TestCase):
+    def test_boot_catalog_uses_complete_canonical_image_receipts(self):
+        from patch_boot_services import image_receipts
+        files = package.module_files()
+        rows = [row.split('|') for row in files['boot-prerequisites.tsv'].decode().splitlines()]
+        self.assertEqual(rows.pop(0), ['schema', '1'])
+        declared = {row[1]: int(row[2]) for row in rows if row[0] == 'recipe'}
+        groups = {identity: {} for identity in declared}
+        for row in rows:
+            if row[0] == 'file':
+                self.assertNotIn(row[2], groups[row[1]])
+                groups[row[1]][row[2]] = row[3]
+        expected = []
+        for receipt in image_receipts():
+            pins = {item['path']: item['after'] for item in receipt['targets'].values()}
+            pins['/system/bin/hyperos_kernel_probe'] = receipt['probe_sha256']
+            expected.append(pins)
+        self.assertCountEqual(list(groups.values()), expected)
+        self.assertTrue(all(len(group) == declared[identity] == 5 for identity, group in groups.items()))
+        self.assertEqual(hashlib.sha256(files['boot-prerequisites.tsv']).hexdigest(),
+                         json.loads(files['manifest.json'])['files_sha256']['boot-prerequisites.tsv'])
+
+    def test_boot_catalog_cannot_broaden_unknown_or_duplicate_receipts(self):
+        import patch_boot_services
+        receipt = patch_boot_services.image_receipt()
+        with patch.object(patch_boot_services, 'image_receipts', return_value=(receipt, receipt)):
+            with self.assertRaisesRegex(RuntimeError, 'Duplicate'):
+                package.boot_prerequisites()
+        receipt['probe_sha256'] = 'a' * 64
+        with patch.object(patch_boot_services, 'image_receipts', return_value=(receipt,)), \
+                patch.object(patch_boot_services, 'validate_image_receipt',
+                             side_effect=RuntimeError('Unsupported boot service image receipt.')) as validate:
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported'):
+                package.boot_prerequisites()
+            validate.assert_called_once_with(receipt)
+
     def test_deterministic_zip_is_self_contained_and_checked(self):
         with tempfile.TemporaryDirectory() as temporary:
             first, second = Path(temporary) / 'a.zip', Path(temporary) / 'b.zip'

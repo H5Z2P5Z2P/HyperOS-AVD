@@ -44,12 +44,11 @@ def context_from_image(build, read):
                           'launcher_path': wake['script_path']}
     services = build.get('boot_service_fix')
     if services is not None:
-        from patch_boot_services import AFTER, TARGETS, PROBE_SHA256
+        from patch_boot_services import validate_image_receipt, PROBE_SHA256
+        recipe = validate_image_receipt(services)
         files = []
-        for name, (path, _, _) in TARGETS.items():
-            if services.get('targets', {}).get(name, {}).get('after') != AFTER[name]:
-                raise RuntimeError('Unknown boot-service image prerequisite: ' + name)
-            files.append(pin(path, AFTER[name]))
+        for target in recipe['targets'].values():
+            files.append(pin(target['path'], target['after']))
         if services.get('probe_sha256') != PROBE_SHA256:
             raise RuntimeError('Unknown kernel capability probe prerequisite.')
         result['boot_services'] = {'files': files,
