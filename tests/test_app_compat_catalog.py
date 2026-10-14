@@ -40,6 +40,55 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(digest(catalog.canonical(frozen)),
                          '06780882c2472b78fc2f65b0710f815f4c8e094ed0b8b6db7750e9fd4f978e53')
 
+    def test_deployed_revision_five_is_frozen_with_complete_controls(self):
+        frozen = json.loads((REPO / 'tests/fixtures/app-compat-v5-manifest.json').read_text())
+        self.assertEqual(frozen['revision'], 5)
+        self.assertIn(frozen, catalog.previous_manifests())
+        self.assertEqual(digest(catalog.canonical(frozen)),
+                         '26130954cc1740faec490beb0412f3507c49324b404ee757c342c4501d4fd4c8')
+        checker = consumer._authentication_command('/data/adb/modules/' + catalog.MODULE_ID, frozen)
+        for name, checksum in frozen['files_sha256'].items():
+            if name == 'customize.sh':
+                continue  # KernelSU consumes this install-only archive member.
+            self.assertIn(checksum, checker)
+            self.assertIn(name, checker)
+        self.assertIn('manifest.json', checker)
+        self.assertIn('SHA256SUMS', checker)
+        changed = copy.deepcopy(frozen)
+        changed['files_sha256']['catalog.sh'] = digest(b'unknown replacement')
+        with patch.object(catalog, 'PREVIOUS_MANIFESTS', {digest(catalog.canonical(frozen)): changed}):
+            with self.assertRaisesRegex(RuntimeError, 'Invalid reviewed'):
+                catalog.previous_manifests()
+
+    def test_deployed_revision_six_is_frozen_before_namespace_optimization(self):
+        frozen = json.loads((REPO / 'tests/fixtures/app-compat-v6-manifest.json').read_text())
+        self.assertEqual(frozen['revision'], 6)
+        self.assertIn(frozen, catalog.previous_manifests())
+        self.assertEqual(digest(catalog.canonical(frozen)),
+                         '3a46a482a1a1ac8581d4959980972b5f01f9a62d49333671c0737ec21606d1f9')
+
+    def test_mirror_regular_uses_one_namespace_and_keeps_cache_boundaries(self):
+        context = self.module / 'contexts/first'
+        cache = context / 'cache'; cache.mkdir(exist_ok=True)
+        mirror = cache / 'mirror-fixture'; mirror.mkdir()
+        target = mirror / 'Fixture.apk'; target.write_bytes(self.apk_data)
+        trace = self.root / 'ns-trace'
+        command = 'MODDIR=' + shlex.quote(str(context)) + '\ncatalog_mirror_regular 1 '
+        trace.write_text('')
+        self.shell(command + shlex.quote(str(target)))
+        self.assertEqual(trace.read_text().splitlines(), ['1'])
+        alias = mirror / 'other.apk'; os.link(target, alias)
+        self.assertNotEqual(self.shell(command + shlex.quote(str(target)), check=False).returncode, 0)
+        alias.unlink()
+        target.unlink(); target.symlink_to(alias); alias.write_bytes(self.apk_data)
+        self.assertNotEqual(self.shell(command + shlex.quote(str(target)), check=False).returncode, 0)
+        target.unlink(); alias.unlink(); target.write_bytes(self.apk_data)
+        moved = cache / 'other'; mirror.rename(moved); mirror.symlink_to(moved)
+        self.assertNotEqual(self.shell(command + shlex.quote(str(target)), check=False).returncode, 0)
+        trace.write_text('')
+        self.assertNotEqual(self.shell(command + shlex.quote(str(mirror) + '/../Fixture.apk'), check=False).returncode, 0)
+        self.assertEqual(trace.read_text(), '')
+
     def setUp(self):
         fixture.AppBridgeTests.setUp(self)
         # The namespace double models both file and directory overlays.
@@ -250,6 +299,56 @@ else:
         self.pm_map['com.fixture.app']=factory;self.write_pm();self.publish_catalog()
         return factory,apk,passthrough
 
+    def factory_provider(self):
+        provider = '/vendor/bin/hw/android.hardware.camera.provider@2.7-service-google'
+        original, patched = b'original exact provider', b'patched exact provider'
+        target = self.root / provider.lstrip('/')
+        target.parent.mkdir(parents=True)
+        target.write_bytes(original); target.chmod(0o755)
+        self.metadata(target, context='u:object_r:hal_camera_default_exec:s0', owner='1000:1000')
+        payload = self.root / 'provider.so'; payload.write_bytes(patched)
+        self.outputs[digest(patched)] = payload
+        self.recipes[0]['system_targets'] = [{'target': provider, 'before': digest(original),
+                                            'after': digest(patched), 'mount_flags': 'ro,suid,exec'}]
+        self.publish_catalog()
+        return provider, target, original
+
+    def test_factory_preflight_runs_once_before_provider_and_cache_effects(self):
+        factory, apk, _ = self.factory_preopt()
+        provider, _, _ = self.factory_provider()
+        source = (REPO / 'modules/app-bridge/catalog.sh').read_text()
+        original = source.split('catalog_mirror_validate() {', 1)[1].split('\n}', 1)[0]
+        self.shell('original_mirror_validate() {' + original + '\n}\n'
+                   'catalog_mirror_validate() {\n'
+                   '  [ ! -s "$MODDIR/state/owned.tsv" ] || return 1\n'
+                   '  [ -z "$(ls -A "$MODDIR/cache")" ] || return 1\n'
+                   '  printf "validated\\n" >> "$BRIDGE_TEST_ROOT/preflight-trace"\n'
+                   '  original_mirror_validate "$@"\n}\ncatalog_pass early')
+        self.assertEqual((self.root / 'preflight-trace').read_text(), 'validated\n')
+        self.assertEqual(self.statuses()['weather'], 'verified')
+        self.assertEqual(set(self.mounts()['1']), {provider, str(Path(factory).parent)})
+        # Both the cache APK and the mounted APK still receive full hashes.
+        trace = (self.root / 'hash-trace').read_text().splitlines()
+        mirror = Path(self.mounts()['1'][str(Path(factory).parent)])
+        self.assertIn(str(mirror / apk.name), trace)
+        self.assertIn(str(apk), trace)
+
+    def test_factory_system_failure_and_mirror_rollback_keep_distinct_ownership(self):
+        factory, _, _ = self.factory_preopt()
+        provider, target, original = self.factory_provider()
+        (self.root / 'fail-mount').write_text(provider)
+        self.shell('catalog_pass early')
+        self.assertEqual(self.statuses()['weather'], 'pending')
+        self.assertIn('System namespace overlay deferred', (self.module / 'state/status.tsv').read_text())
+        self.assertFalse(any(self.mounts().values()))
+        self.assertEqual(target.read_bytes(), original)
+        (self.root / 'fail-mount').write_text(str(Path(factory).parent))
+        self.shell('catalog_pass early')
+        self.assertEqual(self.statuses()['weather'], 'pending')
+        self.assertIn('Factory overlay safely deferred', (self.module / 'state/status.tsv').read_text())
+        self.assertEqual(set(self.mounts()['1']), {provider})
+        self.assertFalse(list((self.module / 'contexts/first/state').glob('transaction.*')))
+
     def test_factory_preopt_mirror_preserves_exact_bytes_and_metadata(self):
         factory,apk,passthrough=self.factory_preopt()
         original=apk.read_bytes()
@@ -281,6 +380,7 @@ else:
 
     def test_factory_preopt_unknown_content_and_aliases_fail_before_any_bind(self):
         _,apk,passthrough=self.factory_preopt()
+        _,provider,provider_original=self.factory_provider()
         target=apk.parent/'oat/arm64/Fixture.vdex'
         original=target.read_bytes()
         target.write_bytes(b'unaudited preopt update')
@@ -304,6 +404,8 @@ else:
         self.assertEqual(self.statuses()['weather'],'unsupported')
         self.assertEqual(self.mounts(),{})
         self.assertEqual(unknown.read_bytes(),b'foreign')
+        self.assertEqual(provider.read_bytes(), provider_original)
+        self.assertFalse(list((self.module / 'contexts/first/cache').iterdir()))
 
     def test_factory_passthrough_schema_requires_explicit_preopt_and_overlay(self):
         for asset in ('../Fixture.odex','oat/arm64/../Fixture.odex','oat/arm64/unknown.art',

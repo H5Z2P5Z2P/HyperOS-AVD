@@ -69,17 +69,20 @@ bridge_pids() {
         "$BB" tr ' ' '\n' | "$BB" awk '/^[0-9]+$/ && !seen[$0]++ {print}'
 }
 bridge_regular() {
-    local pid=$1 target=$2 allow_missing=$3 parent=$2
+    local pid=$1 target=$2 allow_missing=$3
     bridge_path "$target" || return 1
-    while [ "$parent" != / ]; do
-        bridge_ns "$pid" test ! -L "$parent" || return 1
-        parent=${parent%/*}; [ -n "$parent" ] || parent=/
-        bridge_ns "$pid" test -d "$parent" || return 1
-    done
-    if bridge_ns "$pid" test -e "$target"; then
-        bridge_ns "$pid" test -f "$target" &&
-            [ "$(bridge_ns "$pid" "$BB" stat -c %h "$target")" = 1 ]
-    else [ "$allow_missing" = 1 ]; fi
+    # Keep every ancestor and inode predicate in one entered namespace.
+    bridge_ns "$pid" sh -c '
+        target=$1; parent=$1; allow_missing=$2; BB=$3
+        while [ "$parent" != / ]; do
+            test ! -L "$parent" || exit 1
+            parent=${parent%/*}; [ -n "$parent" ] || parent=/
+            test -d "$parent" || exit 1
+        done
+        if test -e "$target"; then
+            test -f "$target" && [ "$("$BB" stat -c %h "$target")" = 1 ]
+        else [ "$allow_missing" = 1 ]; fi
+    ' sh "$target" "$allow_missing" "$BB"
 }
 bridge_owned_mount() {
     local pid=$1 target=$2

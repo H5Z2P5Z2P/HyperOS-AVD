@@ -158,16 +158,18 @@ catalog_system_apply() {
     rm -f "$transaction"
 }
 catalog_mirror_regular() {
-    local pid=$1 target=$2 parent=$2
+    local pid=$1 target=$2
     case "$target" in "$MODDIR/cache/"*)
         case "$target" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
-        while [ "$parent" != "$MODDIR" ]; do
-            bridge_ns "$pid" test ! -L "$parent" || return 1
-            parent=${parent%/*}
-            bridge_ns "$pid" test -d "$parent" || return 1
-        done
-        bridge_ns "$pid" test -f "$target" &&
-            [ "$(bridge_ns "$pid" "$BB" stat -c %h "$target")" = 1 ] ;;
+        bridge_ns "$pid" sh -c '
+            target=$1; parent=$1; root=$2; BB=$3
+            while [ "$parent" != "$root" ]; do
+                test ! -L "$parent" || exit 1
+                parent=${parent%/*}
+                test -d "$parent" || exit 1
+            done
+            test -f "$target" && [ "$("$BB" stat -c %h "$target")" = 1 ]
+        ' sh "$target" "$MODDIR" "$BB" ;;
         *) bridge_regular "$pid" "$target" 0 ;;
     esac
 }
@@ -276,9 +278,14 @@ catalog_mirror_build() {
     done < "$MODDIR/passthrough.tsv"
 }
 catalog_mirror_apply() {
-    local apk=$1 native=$2 mirror stage selected name before after placeholder legacy pid
+    local apk=$1 native=$2 mirror stage selected name before after placeholder legacy pid result
     local transaction="$MODDIR/state/transaction.$$" parent=${1%/*} changed=0
-    catalog_mirror_validate "$apk" "$native" || return 1
+    # One complete factory preflight precedes every provider/cache effect.
+    # Codes 2/3/4 retain the scheduler's loaded/layout/system diagnostics.
+    catalog_mirror_validate "$apk" "$native" || return 3
+    catalog_system_apply; result=$?
+    [ "$result" != 2 ] || return 2
+    [ "$result" = 0 ] || return 4
     mirror="$MODDIR/cache/mirror-$APK_HASH"
     if [ ! -e "$mirror" ] && [ ! -L "$mirror" ]; then
         stage=$("$BB" mktemp -d "$MODDIR/cache/mirror.XXXXXX") || return 1
@@ -737,18 +744,22 @@ catalog_pass() {
                 catalog_status "$feature" "$PACKAGE" unsupported 'Pinned native or system ABI differs'; continue
             }
             if [ "$(cat "$MODDIR/mirror.txt")" = 1 ] && [ "$apk" = "$factory" ]; then
-                catalog_mirror_validate "$apk" "$native" || {
-                    catalog_status "$feature" "$PACKAGE" unsupported 'Factory layout contains unaudited assets'; continue
-                }
-            fi
-            catalog_system_apply; result=$?
-            if [ "$result" = 2 ]; then catalog_status "$feature" "$PACKAGE" reboot-required 'A loaded provider needs normal cold boot'; continue; fi
-            [ "$result" = 0 ] || { catalog_status "$feature" "$PACKAGE" pending 'System namespace overlay deferred'; continue; }
-            if [ "$(cat "$MODDIR/mirror.txt")" = 1 ] && [ "$apk" = "$factory" ]; then
-                catalog_mirror_apply "$apk" "$native" || { catalog_status "$feature" "$PACKAGE" pending 'Factory overlay safely deferred'; continue; }
-            elif [ "$phase" = late ]; then
-                BRIDGE_LAST_TOKEN=
-                bridge_once || { catalog_status "$feature" "$PACKAGE" pending 'Private application preflight deferred'; continue; }
+                catalog_mirror_apply "$apk" "$native"; result=$?
+                case "$result" in
+                    2) catalog_status "$feature" "$PACKAGE" reboot-required 'A loaded provider needs normal cold boot'; continue ;;
+                    3) catalog_status "$feature" "$PACKAGE" unsupported 'Factory layout contains unaudited assets'; continue ;;
+                    4) catalog_status "$feature" "$PACKAGE" pending 'System namespace overlay deferred'; continue ;;
+                    0) ;;
+                    *) catalog_status "$feature" "$PACKAGE" pending 'Factory overlay safely deferred'; continue ;;
+                esac
+            else
+                catalog_system_apply; result=$?
+                if [ "$result" = 2 ]; then catalog_status "$feature" "$PACKAGE" reboot-required 'A loaded provider needs normal cold boot'; continue; fi
+                [ "$result" = 0 ] || { catalog_status "$feature" "$PACKAGE" pending 'System namespace overlay deferred'; continue; }
+                if [ "$phase" = late ]; then
+                    BRIDGE_LAST_TOKEN=
+                    bridge_once || { catalog_status "$feature" "$PACKAGE" pending 'Private application preflight deferred'; continue; }
+                fi
             fi
             stage=$("$BB" mktemp "$MODDIR/state/reconciled.XXXXXX") || continue
             catalog_token "$apk" "$native" > "$stage" && mv "$stage" "$MODDIR/state/reconciled-token" || continue

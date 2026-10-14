@@ -37,6 +37,7 @@ def translate(value):
     return value
 if command == 'nsenter':
     pid = args[args.index('-t')+1]; os.environ['BRIDGE_TEST_PID'] = pid
+    with (root / 'ns-trace').open('a') as output: output.write(pid + '\n')
     args = args[args.index('--')+1:]
     if len(args) > 1 and args[0].endswith('/busybox') and args[1] in ('mount','umount'):
         os.environ['BRIDGE_TEST_RAW_TARGET'] = args[-1]
@@ -160,6 +161,28 @@ path.write_text(json.dumps(values))
         (directory / 'stat').write_text(' '.join(['0'] * 21 + [str(pid * 7)]))
         (directory / 'mountinfo').write_text('')
         (directory / 'maps').write_text('')
+
+    def test_regular_checks_all_predicates_with_one_namespace_entry(self):
+        target = self.native + '/libtest.so'
+        trace = self.root / 'ns-trace'
+        for path, missing, accepted in ((target, 0, True), (target + '.missing', 0, False),
+                                         (target + '.missing', 1, True), (self.native, 0, False)):
+            trace.write_text('')
+            result = self.shell('bridge_regular 1 ' + shlex.quote(path) + ' ' + str(missing), check=False)
+            self.assertEqual(result.returncode == 0, accepted)
+            self.assertEqual(trace.read_text().splitlines(), ['1'])
+        actual = self.root / target.lstrip('/')
+        hardlink = actual.with_suffix('.alias'); os.link(actual, hardlink)
+        self.assertNotEqual(self.shell('bridge_regular 1 ' + shlex.quote(target) + ' 0', check=False).returncode, 0)
+        hardlink.unlink()
+        original = actual.read_bytes(); actual.unlink(); actual.symlink_to(hardlink); hardlink.write_bytes(original)
+        self.assertNotEqual(self.shell('bridge_regular 1 ' + shlex.quote(target) + ' 0', check=False).returncode, 0)
+        actual.unlink(); hardlink.unlink(); actual.write_bytes(original)
+        parent = actual.parent; moved = parent.with_name('other-native'); parent.rename(moved); parent.symlink_to(moved)
+        self.assertNotEqual(self.shell('bridge_regular 1 ' + shlex.quote(target) + ' 0', check=False).returncode, 0)
+        trace.write_text('')
+        self.assertNotEqual(self.shell('bridge_regular 1 /unreviewed/file 1', check=False).returncode, 0)
+        self.assertEqual(trace.read_text(), '')
 
     def install_app(self, apk):
         path = self.root / apk.lstrip('/')
