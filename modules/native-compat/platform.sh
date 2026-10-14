@@ -83,8 +83,10 @@ core_reviewed_native_derivative() {
         FNR == NR {
             if ($4 == path) {
                 targets++; parts_count=split(path, parts, "/");
+                reviewed=(($3 == "perf-hardware" && path == "/system_ext/framework/miui-services.jar") ||
+                          ($3 == "rear-input" && path == "/system/framework/services.jar"));
                 if (NF != 6 || $1 != "early" || $2 != "system" ||
-                    $3 != "perf-hardware" || $5 != "" || $6 != parts[parts_count]) bad=1;
+                    !reviewed || $5 != "" || $6 != parts[parts_count]) bad=1;
                 feature=$3;
             }
             next
@@ -448,6 +450,9 @@ EOF
     [ -z "$extra" ] && [ "$(native_hash "$MODDIR/rear-wake.jar")" = "$jar" ] &&
         [ "$(native_ns_hash 1 /system_ext/framework/rear-display-wake.jar)" = "$legacy" ] &&
         [ "$(native_ns_hash 1 /system_ext/bin/rear-display-wake)" = "$launcher" ] || return 1
+    # Early framework mounts precede live DisplayManager publication. This
+    # mode still requires every pinned image asset and the exact rear record.
+    [ "${1:-}" != image ] || return 0
     dumpsys display | "$BB" awk -v unique="$unique" '
         /DisplayInfo/ && /displayId[ =:]*1([, }]|$)/ && /displayGroupId[ =:]*1([, }]|$)/ && index($0,unique) {found=1}
         END {exit !found}'

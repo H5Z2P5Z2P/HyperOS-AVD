@@ -15,6 +15,8 @@ def files(family):
         if not path.is_file() or path.is_symlink():
             raise RuntimeError('Missing offline module status asset: ' + name)
         body = path.read_bytes().replace(b'@MODULE_ID@', FAMILIES[family].encode())
+        body = body.replace(b'/*@CORE_TITLES@*/',
+                            "'rear-input':'背屏触控', ".encode() if family == 'core' else b'')
         target = 'webui-status.sh' if name == 'status.sh' else 'webroot/' + name
         result[target] = body
     return result

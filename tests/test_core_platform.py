@@ -363,18 +363,28 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
                 'core_safe_file() { return 0; }\nnative_ns_hash() { echo ' + 'f' * 64 + '; }', check=False)
             self.assertNotEqual(result.returncode, 0, 'Actual namespace content must also match.')
 
-    def boot_native_derivative_fixture(self):
+    def boot_native_derivative_fixture(self, rear=False):
         import patch_uniperf as uniperf
         from patch_boot_services import image_receipt
         source=REPO/'work/feedback-investigation-20261013/phone-uniperf-loaded-caller/miui-services.jar'
         self.boot_path=uniperf.MIUI_SERVICES
         receipt=image_receipt()
+        feature='perf-hardware'
+        producer=uniperf
+        if rear:
+            import patch_rear_input_policy as producer
+            from patch_boot_services import image_receipts
+            self.boot_path=producer.PATH
+            receipt=next(row for row in image_receipts()
+                         if row['targets']['services']['after']==producer.BEFORE)
+            source=REPO/('work/feedback-investigation-20261013/rear-state-sync/phone-services-'+producer.BEFORE+'.jar')
+            feature='rear-input'
         pins={row['path']:row['after'] for row in receipt['targets'].values()}
         pins['/system/bin/hyperos_kernel_probe']=receipt['probe_sha256']
         self.boot_expected=pins[self.boot_path]
-        derivative=uniperf.RECIPES[self.boot_expected]['after']
+        derivative=(producer.AFTER if rear else uniperf.RECIPES[self.boot_expected]['after'])
         if source.is_file():
-            original=source.read_bytes();self.boot_after=uniperf.patch_bytes(original)
+            original=source.read_bytes();self.boot_after=producer.patch_bytes(original)
             self.assertEqual(hashlib.sha256(original).hexdigest(),self.boot_expected)
             self.assertEqual(hashlib.sha256(self.boot_after).hexdigest(),derivative)
         else:
@@ -386,7 +396,7 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
         # the namespace's immutable image files, never catalog/hash semantics.
         for name,body in package_native_module.module_files().items():
             target=self.module/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(body)
-        self.boot_actual=self.root/'miui-services.jar';self.boot_actual.write_bytes(self.boot_after)
+        self.boot_actual=self.root/Path(self.boot_path).name;self.boot_actual.write_bytes(self.boot_after)
         state=self.root/'persistent';state.mkdir(exist_ok=True)
         self.boot_rows=''.join('boot|'+path+'|'+checksum+'\n' for path,checksum in pins.items())
         (state/'image.tsv').write_text(self.boot_rows)
@@ -400,7 +410,7 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
         overrides+='native_ns_hash() { case "$2" in\n'+path+') observed=$(native_hash '+actual+'); if [ "$observed" = '+fixture_hash+' ]; then echo '+derivative+'; else echo "$observed"; fi;;\n'
         overrides+=''.join(shlex.quote(item)+') echo '+checksum+';;\n' for item,checksum in pins.items() if item!=self.boot_path)
         overrides+='*) return 1;;\nesac; }\n'
-        overrides+='native_eligible() { [ "$1" = perf-hardware ]; }\n'
+        overrides+='native_eligible() { [ "$1" = '+feature+' ]; }\n'
         return overrides
 
     def test_exact_owned_native_derivative_keeps_independent_boot_provenance_when_feature_off(self):
@@ -467,6 +477,53 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
         profiles.write_text(original_profiles);targets.write_text(original_targets)
         fixture.NativeModuleRuntimeTests.checksums(self)
         self.run_platform('core_context_ready boot',overrides)
+
+    def test_rear_input_owned_derivative_retains_complete_boot_pin_and_feature_choices(self):
+        overrides=self.boot_native_derivative_fixture(rear=True)
+        self.run_platform('core_context_ready boot',overrides)
+        (self.module/'features.disabled').write_text('rear-input\n')
+        self.run_platform('core_context_ready boot',overrides)
+        self.assertEqual((self.root/'persistent/image.tsv').read_text(),self.boot_rows)
+        self.assertEqual(self.boot_actual.read_bytes(),self.boot_after)
+
+    def test_rear_input_derivative_rejects_foreign_mount_capability_unknown_bytes_and_wrong_scope(self):
+        overrides=self.boot_native_derivative_fixture(rear=True)
+        mount=self.proc/'1/mountinfo'
+        mount.write_text(self.boot_mount.replace(str(self.module/'cache'),'/foreign/module/cache'))
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        mount.write_text(self.boot_mount)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides+'native_eligible() { return 1; }\n',check=False)[0].returncode,0)
+        self.boot_actual.write_bytes(b'unknown framework content')
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+        self.boot_actual.write_bytes(self.boot_after)
+        targets=self.module/'targets.tsv';original=targets.read_text()
+        selected=next(line for line in original.splitlines(True) if '|'+self.boot_path+'|' in line)
+        targets.write_text(original.replace(selected,selected.replace('|rear-input|','|perf-hardware|')))
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        self.assertNotEqual(self.run_platform('core_context_ready boot',overrides,check=False)[0].returncode,0)
+
+    def test_rear_input_requires_exact_retained_rear_context_and_logical_id_before_boot(self):
+        state=self.root/'persistent';state.mkdir()
+        record=state/'rear.record';record.write_text('1|1|1|local:4619827551948147201\n')
+        properties=fixture.NativeModuleRuntimeTests.rear_properties(self,**{
+            'persist.sys.secondary_builtin_display_id':'1','ro.boot.qemu.external.displays':'1,912,596,160,0'})
+        overrides=self.rear_hash_override()+properties+'\ncore_context_ready() { [ "$1" = rear ]; }\n'
+        # No live display service is needed to mount the method before zygote.
+        self.run_platform('native_eligible rear-input',overrides)
+        self.assertNotEqual(self.run_platform('native_eligible rear-input',overrides+'core_context_ready() { return 1; }\n',check=False)[0].returncode,0)
+        for row in ('1|2|1|local:4619827551948147201\n','1|1|2|local:4619827551948147201\n',
+                    '1|1|1|local:unknown\n'):
+            record.write_text(row)
+            self.assertNotEqual(self.run_platform('native_eligible rear-input',overrides,check=False)[0].returncode,0)
+        record.unlink()
+        self.assertNotEqual(self.run_platform('native_eligible rear-input',overrides,check=False)[0].returncode,0)
+        record.write_text('1|1|1|local:4619827551948147201\n')
+        other=fixture.NativeModuleRuntimeTests.rear_properties(self,**{
+            'persist.sys.secondary_builtin_display_id':'3','ro.boot.qemu.external.displays':'3,912,596,160,0'})
+        self.assertNotEqual(self.run_platform('native_eligible rear-input',self.rear_hash_override()+other+'\ncore_context_ready() { return 0; }\n',check=False)[0].returncode,0)
+        self.assertNotEqual(self.run_platform('native_eligible rear-input',self.rear_hash_override(),check=False)[0].returncode,0)
+        (self.module/'rear-wake.jar').write_bytes(b'customized unreviewed helper')
+        self.assertNotEqual(self.run_platform('native_eligible rear-input',overrides,check=False)[0].returncode,0)
 
     def test_boot_catalog_is_checked_and_full_recipes_cannot_be_mixed(self):
         from patch_boot_services import image_receipt
@@ -761,6 +818,9 @@ class CoreMigrationShellTests(CorePlatformShellTests):
     test_rear_runtime_recipe_rejects_unknown_code_and_extra_rows = None
     test_rear_current_helper_disable_uses_the_same_verified_lifetime_lease = None
     test_rear_cold_start_executes_only_the_verified_module_jar_and_reuses_lease = None
+    test_rear_input_owned_derivative_retains_complete_boot_pin_and_feature_choices = None
+    test_rear_input_derivative_rejects_foreign_mount_capability_unknown_bytes_and_wrong_scope = None
+    test_rear_input_requires_exact_retained_rear_context_and_logical_id_before_boot = None
 
     def setUp(self):
         super().setUp()

@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 12
+REVISION = 13
 
 
 def boot_prerequisites():

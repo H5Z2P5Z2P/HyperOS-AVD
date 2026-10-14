@@ -5,7 +5,7 @@
     'lockscreen-video':'锁屏视频', navigation:'桌面与返回', composer:'窗口透明度',
     'rear-display':'背屏合成', identity:'设备身份', serial:'模拟序列号', thermal:'温控兼容',
     refresh:'显示帧率', 'boot-services':'启动服务', 'rear-wake':'背屏唤醒',
-    weather:'天气桥接', 'oem-camera':'系统相机', camera:'系统相机',
+    /*@CORE_TITLES@*/weather:'天气桥接', 'oem-camera':'系统相机', camera:'系统相机',
     'parrot-camera':'Google 相机', parrot:'Google 相机'};
   const labels = {enabled:'已启用', ready:'已就绪', verified:'已核验', failed:'检查失败', disabled:'已停用',
     skipped:'已跳过', unsupported:'未匹配', pending:'待激活', 'reboot-required':'待重启',

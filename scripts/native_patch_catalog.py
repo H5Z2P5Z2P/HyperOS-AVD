@@ -13,7 +13,7 @@ import re
 
 
 FEATURES = frozenset(('flutter', 'hwui', 'assistant', 'lockscreen-video',
-                      'navigation', 'composer', 'rear-display', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'))
+                      'navigation', 'composer', 'rear-display', 'rear-input', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'))
 APP_PACKAGES = frozenset(('com.miui.home', 'com.miui.weather2',
                           'com.miui.voiceassist', 'com.miui.aod'))
 SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
@@ -121,6 +121,11 @@ def validate_catalog(value):
             if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
                     or row['library'] != PurePosixPath(PATH).name or package != ''):
                 raise RuntimeError('Unsafe vendor IMS framework patch target.')
+        if row['feature'] == 'rear-input':
+            from patch_rear_input_policy import PATH
+            if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(PATH).name or package != ''):
+                raise RuntimeError('Unsafe rear input policy target.')
         if row['feature'] == 'display-metadata':
             from patch_display_metadata import RECIPES
             if (row['kind'] != 'system' or path not in {value['path'] for value in RECIPES.values()}
@@ -169,6 +174,7 @@ def catalog():
     import patch_lockscreen_video as lockscreen
     import patch_pad_hwui as hwui
     import patch_rear_display as rear
+    import patch_rear_input_policy as rear_input
     import patch_wifi_capabilities as wifi
     import patch_xqos as xqos
     import patch_xiaomi_ims as ims
@@ -209,6 +215,10 @@ def catalog():
         profiles.append(_profile('vendor-ims-' + recipe['before'][:12], 'vendor-ims',
                                  recipe['before'], recipe['after'],
                                  [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for recipe in rear_input.catalog_recipes():
+        profiles.append(_profile('rear-input-' + recipe['before'][:12], 'rear-input',
+                                 recipe['before'], recipe['after'],
+                                 [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
     for producer, label in ((qti, 'qti-perf'), (uniperf, 'uniperf'), (bufferqueue, 'bufferqueue-perf')):
         for recipe in producer.catalog_recipes():
             profiles.append(_profile(label + '-' + recipe['before'][:12], 'perf-hardware',
@@ -223,6 +233,7 @@ def catalog():
         _target('hwui', 'early', hwui.NATIVE),
         _target('composer', 'early', composer.NATIVE),
         _target('rear-display', 'early', rear.NATIVE),
+        _target('rear-input', 'early', rear_input.PATH),
         _target('display-privacy', 'early', privacy.NATIVE),
         *[_target('display-metadata', 'early', path) for path in sorted({value['path'] for value in metadata.RECIPES.values()})],
         _target('wifi-capabilities', 'early', wifi.PATH),

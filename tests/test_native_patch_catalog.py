@@ -67,8 +67,8 @@ class NativePatchCatalogTests(unittest.TestCase):
         self.assertEqual(data, native.dump_catalog())
         self.assertEqual(json.loads(data), self.value)
         self.assertEqual(native.validate_catalog(self.value), self.value)
-        self.assertEqual(len(self.value['profiles']), 27)
-        self.assertEqual(len(self.value['targets']), 20)
+        self.assertEqual(len(self.value['profiles']), 28)
+        self.assertEqual(len(self.value['targets']), 21)
         self.assertEqual(set(row['feature'] for row in self.value['profiles']), native.FEATURES)
         self.assertEqual([row['id'] for row in self.value['profiles']],
                          sorted(row['id'] for row in self.value['profiles']))
@@ -124,7 +124,7 @@ class NativePatchCatalogTests(unittest.TestCase):
 
     def test_system_and_app_targets_are_explicit_and_scoped(self):
         system = {row['feature']: row for row in self.value['targets'] if row['kind'] == 'system'}
-        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'})
+        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'rear-input', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'})
         self.assertTrue(all(row['phase'] == 'early' and not row['package'] for row in system.values()))
         self.assertEqual(system['flutter']['path'], '/system_ext/lib64/libhyper_os_flutter.so')
         self.assertEqual(system['hwui']['path'], '/system/lib64/libhwui.so')

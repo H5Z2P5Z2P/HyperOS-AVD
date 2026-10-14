@@ -86,6 +86,9 @@ class ModuleWebUITests(unittest.TestCase):
             self.assertIn(identity.encode(), files['webroot/index.html'])
             self.assertIn(('ID=' + identity).encode(), files['webui-status.sh'])
             self.assertNotIn(b'@MODULE_ID@', b''.join(files.values()))
+            self.assertNotIn(b'@CORE_TITLES@', files['webroot/app.js'])
+            self.assertEqual("'rear-input':'背屏触控'".encode() in files['webroot/app.js'],
+                             family == 'core')
             self.assertIn(b"connect-src 'none'", files['webroot/index.html'])
             self.assertNotIn(b'http', files['webroot/app.js'])
             self.assertNotIn(b'innerHTML', files['webroot/app.js'])
@@ -136,17 +139,22 @@ assert.equal(data.logs[0],'<script>unsafe</script>');
 
     @unittest.skipUnless(shutil.which('node'), 'JavaScript runtime is optional')
     def test_render_treats_status_and_logs_as_text(self):
-        source = module_webui.ROOT / 'modules/compat-webui/app.js'
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        source = Path(temporary.name) / 'app.js'
+        source.write_bytes(module_webui.files('core')['webroot/app.js'])
         javascript = r'''
 const assert=require('node:assert/strict');const view=require(process.argv[1]);
 const nodes={};function node(){return {children:[],textContent:'',append(...items){this.children.push(...items);},replaceChildren(){this.children=[];}};}
 const document={getElementById:id=>nodes[id]??=(node()),createElement:()=>node()};
 view.render({module:{state:'disabled'},health:{renderer:'skiavk',selinux:'Enforcing'},
- patches:[{feature:'weather',state:'unsupported',reason:'<script>x</script>',target:'$(touch /data/pwn)'}],
+ patches:[{feature:'weather',state:'unsupported',reason:'<script>x</script>',target:'$(touch /data/pwn)'},
+          {feature:'rear-input',state:'ready',reason:'verified-bind',target:'/system/framework/services.jar'}],
  logs:['<img src=x onerror=alert(1)>']},document);
 assert.equal(nodes['module-state'].textContent,'已停用');
 assert.equal(nodes.patches.children[0].children[1].textContent,'<script>x</script>');
 assert.equal(nodes.patches.children[0].children[2].textContent,'$(touch /data/pwn)');
+assert.equal(nodes.patches.children[1].children[0].children[0].textContent,'背屏触控');
 assert.equal(nodes.logs.textContent,'<img src=x onerror=alert(1)>');
 view.render({module:{state:'enabled'},health:{},patches:[],logs:[]},document);
 assert.equal(nodes['module-state'].textContent,'已启用');

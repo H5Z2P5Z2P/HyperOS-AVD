@@ -92,6 +92,7 @@ def tap(time, duration=80, x=16000, y=12000, slot=0, coordinates=True):
 
 class RearDisplayWakeJavaTest(unittest.TestCase):
     JAVA_SOURCE = bridge.JAVA_SOURCE
+    HARNESS = HARNESS
 
     @classmethod
     def setUpClass(cls):
@@ -109,7 +110,7 @@ class RearDisplayWakeJavaTest(unittest.TestCase):
         package.mkdir(parents=True)
         source, harness = package / 'RearDisplayWake.java', package / 'WakeHarness.java'
         source.write_text(cls.JAVA_SOURCE)
-        harness.write_text(HARNESS)
+        harness.write_text(cls.HARNESS)
         subprocess.run([str(javac), '-source', '8', '-target', '8', '-d', str(cls.folder),
                         str(source), str(harness)], check=True, capture_output=True)
 
@@ -236,6 +237,86 @@ class RearDisplayWakeJavaTest(unittest.TestCase):
 
 class CoreRearDisplayWakeJavaTest(RearDisplayWakeJavaTest):
     from rear_display_wake_runtime import JAVA_SOURCE
+    HARNESS = HARNESS.replace('int state = 1;', 'int state = 1; Boolean interactive;').replace(
+        'new RearDisplayWake.Snapshot(RearDisplayWake.UNIQUE_ID, 1, 1, state), uptime);',
+        'new RearDisplayWake.Snapshot(RearDisplayWake.UNIQUE_ID, 1, 1, state, '
+        'interactive != null ? interactive.booleanValue() : !(state == 1 || state == 3 || state == 4), '
+        'Long.MIN_VALUE), uptime);').replace(
+        'if (args[0].equals("history") && (line.startsWith("STATE ")',
+        'if (args[0].equals("history") && line.startsWith("INTERACTIVE ")) {\n'
+        '                String[] value = line.split(" ");\n'
+        '                history.interactive = Boolean.valueOf(value[1]);\n'
+        '                history.sample(history.state, Long.parseLong(value[2]), true);\n'
+        '            } else if (args[0].equals("history") && (line.startsWith("STATE ")')
+
+    def test_cold_stationary_mouse_omits_initial_axes_and_reuses_id_zero(self):
+        for slot in (0, 3):
+            trace = (tap(1000, slot=slot, coordinates=False) + tap(1250, slot=slot, coordinates=False))
+            trace = trace.replace('00000011', '00000000')
+            self.assertIn('WAKES=1', self.execute(trace).stdout)
+        # A single unknown axis is stationary; the known axis still has bounds.
+        first = tap(1000).replace(event(1000, 'ABS_MT_POSITION_Y', 12000), '')
+        second = tap(1250).replace(event(1250, 'ABS_MT_POSITION_Y', 12000), '')
+        self.assertIn('WAKES=1', self.execute(first + second).stdout)
+        far = second.replace(event(1250, 'ABS_MT_POSITION_X', 16000),
+                             event(1250, 'ABS_MT_POSITION_X', 24000))
+        self.assertIn('WAKES=0', self.execute(first + far).stdout)
+
+    def test_unknown_axes_cannot_cross_slots_or_become_numeric_mid_gesture(self):
+        self.assertIn('WAKES=0', self.execute(tap(1000, coordinates=False)
+                                             + tap(1250, slot=1, coordinates=False)).stdout)
+        unknown_then_known = tap(1000, coordinates=False) + tap(1250)
+        self.assertIn('WAKES=0', self.execute(unknown_then_known).stdout)
+
+    def test_unreported_initial_slot_cannot_alias_explicit_slot_zero(self):
+        implicit = ''.join(line for line in tap(1000, coordinates=False).splitlines(True)
+                           if 'ABS_MT_SLOT' not in line)
+        second_implicit = ''.join(line for line in tap(1250, coordinates=False).splitlines(True)
+                                  if 'ABS_MT_SLOT' not in line)
+        self.assertIn('WAKES=1', self.execute(implicit + second_implicit).stdout)
+        self.assertIn('WAKES=0', self.execute(implicit + tap(1250, coordinates=False)).stdout)
+        invalid = event(1000, 'ABS_MT_SLOT', 11)
+        self.assertNotEqual(self.execute(invalid, check=False).returncode, 0)
+        # Both endpoints of a candidate must share their own immutable baseline.
+        first = tap(1000, coordinates=False).replace(event(1080, 'ABS_MT_TRACKING_ID', -1),
+                event(1080, 'ABS_MT_POSITION_X', 16000) + event(1080, 'ABS_MT_TRACKING_ID', -1))
+        self.assertIn('WAKES=0', self.execute(first + tap(1250, coordinates=False)).stdout)
+        self.assertIn('WAKES=1', self.execute(first + tap(1250, coordinates=False)
+                                             + tap(1500, coordinates=False)).stdout)
+        # A reported invalid axis is not the sentinel for an unobserved axis.
+        bad = tap(1000, x=-1) + tap(1250, coordinates=False)
+        self.assertIn('WAKES=0', self.execute(bad).stdout)
+
+    def test_initial_implicit_contact_released_by_explicit_slot_does_not_stick(self):
+        # The initial contact belongs to physical slot 3, which was selected
+        # before this reader opened. A second contact explicitly selects slot 0.
+        trace = (event(1000, 'ABS_MT_TRACKING_ID', 0) + event(1000, 'SYN_REPORT')
+                 + event(1030, 'ABS_MT_SLOT', 0) + event(1030, 'ABS_MT_TRACKING_ID', 1)
+                 + event(1030, 'SYN_REPORT') + event(1060, 'ABS_MT_TRACKING_ID', -1)
+                 + event(1060, 'SYN_REPORT') + event(1080, 'ABS_MT_SLOT', 3)
+                 + event(1080, 'ABS_MT_TRACKING_ID', -1) + event(1080, 'SYN_REPORT'))
+        self.assertIn('WAKES=0', self.execute(trace).stdout)
+        self.assertIn('WAKES=1', self.execute(trace + tap(2000) + tap(2250)).stdout)
+        # The same recovery applies when no second contact was introduced.
+        single = (event(1000, 'ABS_MT_TRACKING_ID', 0) + event(1000, 'SYN_REPORT')
+                  + event(1080, 'ABS_MT_SLOT', 3) + event(1080, 'ABS_MT_TRACKING_ID', -1)
+                  + event(1080, 'SYN_REPORT'))
+        self.assertIn('WAKES=0', self.execute(single).stdout)
+        self.assertIn('WAKES=1', self.execute(single + tap(2000) + tap(2250)).stdout)
+
+    def test_logical_sleep_arms_before_physical_fade_and_rejects_stale_sleep_taps(self):
+        fade = ('STATE 2 900\nINTERACTIVE false 1000\n' + tap(1100) + tap(1350))
+        self.assertIn('WAKES=1', self.execute(fade, 'history').stdout)
+        physical = ('STATE 2 900\nINTERACTIVE false 1000\n' + tap(1100)
+                    + 'STATE 4 1250\n' + tap(1350))
+        self.assertIn('WAKES=1', self.execute(physical, 'history').stdout)
+        awake = ('STATE 4 900\nINTERACTIVE true 1000\n' + tap(1100) + tap(1350))
+        self.assertIn('WAKES=0', self.execute(awake, 'history').stdout)
+        # A queued original sleep gesture cannot become a wake gesture.
+        stale = 'STATE 2 900\nINTERACTIVE false 1400\n' + tap(1000) + tap(1250)
+        self.assertIn('WAKES=0', self.execute(stale, 'history').stdout)
+        original = ('STATE 2 900\n' + tap(1000) + 'INTERACTIVE false 1200\n' + tap(1250))
+        self.assertIn('WAKES=0', self.execute(original, 'history').stdout)
 
     def test_original_time_and_panel_pixel_distance_boundaries(self):
         # Both DOWN->DOWN and UP->UP must match the OEM's strict 400 ms.

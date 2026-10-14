@@ -72,6 +72,15 @@ native_enabled() {
 
 native_eligible() {
     NATIVE_ELIGIBILITY_REASON=device-capability-unavailable
+    if [ "$1" = rear-input ]; then
+        # The fixed DEX gate targets logical rear ID 1. Require its exact
+        # retained image contract before zygote; a generic external panel or
+        # a different secondary ID cannot authorize a framework input edit.
+        if [ "$(getprop persist.sys.secondary_builtin_display_id)" = 1 ] &&
+                command -v core_rear_ready >/dev/null 2>&1 && core_rear_ready image; then return 0; fi
+        NATIVE_ELIGIBILITY_REASON=unverified-rear-input-topology
+        return 1
+    fi
     if [ "$1" = display-metadata ]; then
         NATIVE_ELIGIBILITY_REASON=unaudited-ranchu-mapper-capability
         native_privacy_eligible && native_metadata_eligible; return $?
