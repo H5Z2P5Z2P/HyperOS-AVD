@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,13 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(digest(catalog.canonical(frozen)),
                          '291b853daa919f9d06f9a568ad105521e126efa16927c556609d085697ed6c48')
 
+    def test_deployed_revision_four_is_frozen_before_runtime_changes(self):
+        frozen = json.loads((REPO / 'tests/fixtures/app-compat-v4-manifest.json').read_text())
+        self.assertEqual(frozen['revision'], 4)
+        self.assertIn(frozen, catalog.previous_manifests())
+        self.assertEqual(digest(catalog.canonical(frozen)),
+                         '06780882c2472b78fc2f65b0710f815f4c8e094ed0b8b6db7750e9fd4f978e53')
+
     def setUp(self):
         fixture.AppBridgeTests.setUp(self)
         # The namespace double models both file and directory overlays.
@@ -43,7 +51,10 @@ class CatalogTests(unittest.TestCase):
         body = body.replace("if args[0] == '-c':", """if not args:
         print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()+'  -'); sys.exit(0)
     if args[0] == '-c':""")
-        body = body.replace("form.replace('%u:%g', owner)", "form.replace('%n', args[2]).replace('%u:%g', owner)")
+        body = body.replace("form.replace('%u:%g', owner)",
+                            "form.replace('%n', args[2]).replace('%y', str(value.st_mtime_ns))"
+                            ".replace('%z', str(value.st_ctime_ns)).replace('%Z', str(int(value.st_ctime)))"
+                            ".replace('%f', format(value.st_mode, 'x')).replace('%u:%g', owner)")
         self.bb.write_text(body)
         self.pm_map = {'com.fixture.app': self.apk}
         self.write_pm()
@@ -63,6 +74,9 @@ else:
         (self.bin / 'settings').chmod(0o755)
         (self.root / 'settings.json').write_text('{}')
         self.env['HYPEROS_APP_COMPAT_PREFS'] = str(self.root / 'preferences')
+        self.env['HYPEROS_APP_COMPAT_RECOVERY_DIR'] = str(self.root / 'recovery')
+        self.env['HYPEROS_APP_COMPAT_SERVICE_DIR'] = str(self.root / 'service')
+        self.env['HYPEROS_APP_COMPAT_TEST_ROOT'] = str(self.root)
         self.preference = self.root / 'preferences'
         self.preference.mkdir()
         self.recipes = [self.recipe('first', 'weather', 'com.fixture.app', True, self.apk_data)]
@@ -341,12 +355,290 @@ else:
         values['angle_gl_driver_selection_pkgs']+=',com.foreign.app'
         values['angle_gl_driver_selection_values']+=',native'
         (self.root/'settings.json').write_text(json.dumps(values))
+        receipt = self.module / 'contexts/first/state/angle-owned.tsv'
+        before = receipt.read_bytes()
+        self.shell('catalog_pass early')
+        self.assertEqual(receipt.read_bytes(), before)
+        self.assertEqual(json.loads((self.root / 'settings.json').read_text()), values)
         (self.preference/'weather').write_text('off\n')
         self.shell('catalog_pass late')
         values=json.loads((self.root/'settings.json').read_text())
         self.assertEqual(values['angle_gl_driver_selection_pkgs'],'com.foreign.app')
         self.assertEqual(values['angle_gl_driver_selection_values'],'native')
         self.assertEqual(self.statuses()['weather'],'disabled')
+
+    def defer_framework(self):
+        for name in ('settings', 'pm', 'am', 'cmd'):
+            command = self.bin / name
+            command.write_text('#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(name) +
+                               ' >> "$BRIDGE_TEST_ROOT/framework-trace"\nexit 99\n')
+            command.chmod(0o755)
+        prop = self.bin / 'getprop'
+        prop.write_text(prop.read_text().replace('sys.boot_completed) echo 1',
+                                                'sys.boot_completed) echo 0'))
+
+    def assert_prezygote_cleanup(self, variant):
+        if variant != 'late-only':
+            self.factory_preopt()
+        self.recipes[0]['policy'] = {'angle': {'driver': 'angle', 'features': ['exposeES32ForTesting']}}
+        self.publish_catalog()
+        self.shell('catalog_pass late')
+        receipt = self.module / 'contexts/first/state/angle-owned.tsv'
+        original = receipt.read_bytes()
+        settings = (self.root / 'settings.json').read_bytes()
+        preference = self.preference / 'weather'
+        if variant == 'disabled':
+            preference.write_text('off\n')
+            (self.root / 'proc/1/maps').write_text('0-1 r--p 0 1:2 12 ' +
+                                                   self.pm_map['com.fixture.app'] + '\n')
+            loaded_mounts = self.mounts()
+        elif variant == 'unmatched':
+            # A new boot has no prior namespace bindings, while userdata
+            # receipts and the old mirror cache persist across the update.
+            (self.root / 'mounts.json').write_text('{}')
+            (self.root / self.pm_map['com.fixture.app'].lstrip('/')).write_bytes(b'unknown replacement')
+        self.defer_framework()
+        self.shell('catalog_early')
+        self.assertFalse((self.root / 'framework-trace').exists())
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertEqual((self.root / 'settings.json').read_bytes(), settings)
+        if variant == 'disabled':
+            self.assertEqual(preference.read_text(), 'off\n')
+            self.assertEqual(self.mounts(), loaded_mounts)
+
+    def test_prezygote_policy_helpers_and_late_selection_fail_without_framework_calls(self):
+        self.defer_framework()
+        self.shell('CATALOG_PHASE=early\n'
+                   'catalog_settings && exit 1\n'
+                   'catalog_policy_write a b c && exit 1\n'
+                   'catalog_select weather late com.fixture.app && exit 1\n'
+                   'catalog_pass late && exit 1\nexit 0')
+        self.assertFalse((self.root / 'framework-trace').exists())
+
+    def test_early_late_only_receipt_never_calls_framework(self):
+        self.assert_prezygote_cleanup('late-only')
+
+    def test_early_disabled_factory_receipt_never_calls_framework(self):
+        self.assert_prezygote_cleanup('disabled')
+
+    def test_early_unmatched_factory_receipt_never_calls_framework(self):
+        self.assert_prezygote_cleanup('unmatched')
+
+    def test_late_angle_restore_preserves_changed_driver_and_receipt(self):
+        self.recipes[0]['policy'] = {'angle': {'driver': 'angle', 'features': []}}
+        self.publish_catalog()
+        self.shell('catalog_pass late')
+        receipt = self.module / 'contexts/first/state/angle-owned.tsv'
+        original = receipt.read_bytes()
+        values = json.loads((self.root / 'settings.json').read_text())
+        values['angle_gl_driver_selection_values'] = 'native'
+        (self.root / 'settings.json').write_text(json.dumps(values))
+        (self.preference / 'weather').write_text('off\n')
+        self.shell('catalog_pass late')
+        self.assertEqual(json.loads((self.root / 'settings.json').read_text()), values)
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertEqual(self.statuses()['weather'], 'pending')
+
+    def factory_candidates(self):
+        factory, apk, _ = self.factory_preopt()
+        recipe = self.recipes[0]
+        self.recipes = []
+        for identity, checksum in (('candidate-a', digest(b'other signed APK A')),
+                                   ('candidate-b', digest(b'other signed APK B')),
+                                   ('candidate-c', digest(apk.read_bytes()))):
+            item = copy.deepcopy(recipe)
+            item.update(id=identity, apk_sha256=checksum)
+            self.recipes.append(item)
+        self.publish_catalog()
+        return factory, apk
+
+    def factory_hashes(self, apk):
+        trace = self.root / 'hash-trace'
+        return trace.read_text().splitlines().count(str(apk)) if trace.exists() else 0
+
+    def test_early_selection_hashes_one_factory_inode_once_per_call(self):
+        _, apk = self.factory_candidates()
+        result = self.shell('catalog_select weather early com.fixture.app')
+        self.assertEqual(result.stdout.strip(), 'candidate-c')
+        self.assertEqual(self.factory_hashes(apk), 1)
+        self.shell('catalog_select weather early com.fixture.app')
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def test_early_selection_rejects_unknown_and_ambiguous_content(self):
+        _, apk = self.factory_candidates()
+        original = apk.read_bytes()
+        apk.write_bytes(b'unknown replacement')
+        self.assertNotEqual(self.shell('catalog_select weather early com.fixture.app', check=False).returncode, 0)
+        self.assertEqual(self.factory_hashes(apk), 1)
+        apk.write_bytes(original)
+        # Exercise the runtime ambiguity guard independently of the producer's
+        # own duplicate-workload rejection. No apply step runs with this table.
+        profile = 'candidate-b|' + digest(original) + '|' + self.recipes[1]['factory_apk'] + '|' + self.recipes[1]['native']
+        result = self.shell('printf "%s\\n" ' + shlex.quote(profile) +
+                            ' > "$OWNERDIR/contexts/candidate-b/profiles.tsv"\n'
+                            'catalog_select weather early com.fixture.app', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def changing_factory_identity(self, mutation):
+        _, apk = self.factory_candidates()
+        injection = '''
+if command == 'stat' and args[0] == '-c' and args[1] == '%d:%i:%s:%Y:%y:%Z:%z:%h:%f':
+    calls = root / 'identity-calls'
+    count = int(calls.read_text()) + 1 if calls.exists() else 1
+    calls.write_text(str(count))
+    if count == 3:
+        target = pathlib.Path(args[2])
+        previous = target.stat()
+        MUTATION
+'''.replace('MUTATION', mutation)
+        self.bb.write_text(self.bb.read_text().replace("if command == 'stat' and args[0] == '-c':",
+                                                      injection + "\nif command == 'stat' and args[0] == '-c':"))
+        return apk
+
+    def test_early_selection_rehashes_replaced_inode_with_same_size_and_mtime(self):
+        apk = self.changing_factory_identity("replacement = target.with_suffix('.replacement'); replacement.write_bytes(target.read_bytes()); os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns)); os.replace(replacement, target)")
+        result = self.shell('catalog_select weather early com.fixture.app')
+        self.assertEqual(result.stdout.strip(), 'candidate-c')
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def test_early_selection_rehashes_nanosecond_mtime_change(self):
+        apk = self.changing_factory_identity('os.utime(target, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1))')
+        self.shell('catalog_select weather early com.fixture.app')
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def test_early_selection_rehashes_size_change_and_rejects_new_unknown_content(self):
+        apk = self.changing_factory_identity("target.write_bytes(target.read_bytes() + b'unknown addition')")
+        self.assertNotEqual(self.shell('catalog_select weather early com.fixture.app', check=False).returncode, 0)
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def test_early_selection_rehashes_same_size_write_with_restored_mtime(self):
+        apk = self.changing_factory_identity("body = target.read_bytes(); target.write_bytes(bytes([body[0] ^ 1]) + body[1:]); os.utime(target, ns=(previous.st_atime_ns, previous.st_mtime_ns))")
+        self.assertNotEqual(self.shell('catalog_select weather early com.fixture.app', check=False).returncode, 0)
+        self.assertEqual(self.factory_hashes(apk), 2)
+
+    def test_early_selection_rejects_factory_alias_during_identity_check(self):
+        apk = self.changing_factory_identity("saved = target.with_suffix('.saved'); target.rename(saved); target.symlink_to(saved)")
+        self.assertNotEqual(self.shell('catalog_select weather early com.fixture.app', check=False).returncode, 0)
+        self.assertEqual(self.factory_hashes(apk), 1)
+        self.assertTrue(apk.is_symlink())
+
+    def uninstall_handoff(self):
+        self.recipes[0]['policy'] = {'angle': {'driver': 'angle', 'features': ['exposeES32ForTesting']}}
+        self.publish_catalog()
+        self.shell('catalog_pass late')
+        commands = {name: (self.bin / name).read_bytes() for name in ('settings', 'pm', 'am', 'cmd') if (self.bin / name).exists()}
+        prop = (self.bin / 'getprop').read_bytes()
+        original = (self.module / 'contexts/first/state/angle-owned.tsv').read_bytes()
+        self.defer_framework()
+        self.shell('catalog_uninstall')
+        self.assertFalse((self.root / 'framework-trace').exists())
+        callbacks = list((self.root / 'service').glob('*.sh'))
+        self.assertEqual(len(callbacks), 1)
+        receipts = list((self.root / 'recovery').glob('*/state/angle-owned.tsv'))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].read_bytes(), original)
+        # Model KernelSU's real prune_modules: delete the module directory
+        # before either SettingsProvider or the asynchronous service callback.
+        shutil.rmtree(self.module)
+        for name, body in commands.items(): (self.bin / name).write_bytes(body)
+        (self.bin / 'getprop').write_bytes(prop)
+        return callbacks[0], receipts[0]
+
+    def recovery_callback(self, callback):
+        return subprocess.run(['sh', str(callback)], env=self.env, text=True,
+                              capture_output=True, timeout=20)
+
+    def test_uninstall_handoff_survives_module_deletion_and_cleans_owned_files(self):
+        callback, receipt = self.uninstall_handoff()
+        values = json.loads((self.root / 'settings.json').read_text())
+        values['angle_gl_driver_selection_pkgs'] += ',com.foreign.app'
+        values['angle_gl_driver_selection_values'] += ',native'
+        (self.root / 'settings.json').write_text(json.dumps(values))
+        result = self.recovery_callback(callback)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads((self.root / 'settings.json').read_text())
+        self.assertEqual(values['angle_gl_driver_selection_pkgs'], 'com.foreign.app')
+        self.assertEqual(values['angle_gl_driver_selection_values'], 'native')
+        self.assertFalse(callback.exists())
+        self.assertFalse(receipt.parent.parent.exists())
+
+    def test_uninstall_handoff_preserves_changed_policy_and_receipt(self):
+        callback, receipt = self.uninstall_handoff()
+        original = receipt.read_bytes()
+        values = json.loads((self.root / 'settings.json').read_text())
+        values['angle_gl_driver_selection_values'] = 'native'
+        (self.root / 'settings.json').write_text(json.dumps(values))
+        result = self.recovery_callback(callback)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('preserved unknown or changed state', result.stderr)
+        self.assertEqual(json.loads((self.root / 'settings.json').read_text()), values)
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertTrue(callback.exists())
+
+    def test_uninstall_handoff_rejects_changed_helper_or_alias(self):
+        callback, receipt = self.uninstall_handoff()
+        helper = receipt.parent.parent / 'runtime.sh'
+        original = helper.read_bytes()
+        helper.write_bytes(original + b'\n# foreign change\n')
+        self.assertNotEqual(self.recovery_callback(callback).returncode, 0)
+        helper.write_bytes(original)
+        external = self.root / 'foreign-helper'
+        helper.rename(external)
+        helper.symlink_to(external)
+        self.assertNotEqual(self.recovery_callback(callback).returncode, 0)
+        self.assertTrue(helper.is_symlink())
+        self.assertTrue(receipt.exists())
+        self.assertTrue(callback.exists())
+
+    def test_uninstall_handoff_preserves_active_reinstallation(self):
+        callback, receipt = self.uninstall_handoff()
+        self.module.mkdir()
+        (self.module / 'module.prop').write_text('id=hyperos_avd_app_compat\nauthor=HyperOS-AVD\n')
+        values = (self.root / 'settings.json').read_bytes()
+        result = self.recovery_callback(callback)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / 'settings.json').read_bytes(), values)
+        self.assertTrue(receipt.exists())
+        (self.module / 'disable').touch()
+        result = self.recovery_callback(callback)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(callback.exists())
+
+    def test_recovery_paths_and_callback_source_reject_noncanonical_values(self):
+        for suffix in ('/not-created/..', '/not-created/.', '//child', '/child/', "/quo'te", '/pipe|x', '/amp&x', '/line\nbreak'):
+            path = str(self.root) + suffix
+            result = self.shell('catalog_recovery_dir ' + shlex.quote(path), check=False)
+            self.assertNotEqual(result.returncode, 0, path)
+        self.shell('BB="$BB&foreign"\ncatalog_recovery_emit /data/ok /data/callback ' +
+                   ' '.join(['0' * 64] * 4) + ' && exit 1\nexit 0')
+
+    def test_uninstall_handoff_rejects_undiscoverable_or_module_internal_overrides(self):
+        self.recipes[0]['policy'] = {'angle': {'driver': 'angle', 'features': []}}
+        self.publish_catalog()
+        self.shell('catalog_pass late')
+        (self.bin / 'getprop').write_text((self.bin / 'getprop').read_text().replace('sys.boot_completed) echo 1', 'sys.boot_completed) echo 0'))
+        for root in (self.module, self.module / 'contexts', self.root / 'unknown-service-parent'):
+            result = self.shell('HYPEROS_APP_COMPAT_RECOVERY_DIR=' + shlex.quote(str(root)) +
+                                '\ncatalog_uninstall', check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('preserved unknown state', result.stderr)
+        self.env.pop('HYPEROS_APP_COMPAT_TEST_ROOT')
+        result = self.shell('catalog_uninstall', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'service').exists())
+
+    def test_uninstall_handoff_rejects_production_busybox_override_before_path_access(self):
+        self.recipes[0]['policy'] = {'angle': {'driver': 'angle', 'features': []}}
+        self.publish_catalog()
+        self.shell('catalog_pass late')
+        self.env.pop('HYPEROS_APP_COMPAT_TEST_ROOT')
+        self.env['HYPEROS_APP_COMPAT_RECOVERY_DIR'] = '/data/adb/hyperos_app_compat/restore'
+        self.env['HYPEROS_APP_COMPAT_SERVICE_DIR'] = '/data/adb/service.d'
+        result = self.shell('catalog_recovery_dir() { echo reached > "$BRIDGE_TEST_ROOT/path-access"; return 1; }\n'
+                            'MODDIR="$OWNERDIR/contexts/first"\ncatalog_angle_handoff', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'path-access').exists())
 
     def test_archive_and_recipe_aliases_are_rejected_without_guessing(self):
         self.second()

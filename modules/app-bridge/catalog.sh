@@ -328,8 +328,14 @@ catalog_mirror_apply() {
             [ "$(bridge_ns_hash 1 "$apk")" = "$APK_HASH" ] && am force-stop "$PACKAGE" || return 1
     fi
 }
+catalog_framework_ready() {
+    # post-fs-data blocks zygote: SettingsProvider and PackageManager cannot
+    # answer until this synchronous hook has returned. Never wait for them.
+    [ "${CATALOG_PHASE:-late}" = late ] && [ "$(getprop sys.boot_completed)" = 1 ]
+}
 catalog_settings() {
     local key value
+    catalog_framework_ready || return 1
     for key in angle_gl_driver_selection_pkgs angle_gl_driver_selection_values angle_egl_features; do
         value=$(settings get global "$key") || return 1
         [ "$value" != null ] || value=
@@ -339,6 +345,7 @@ catalog_settings() {
 }
 catalog_policy_write() {
     local packages=$1 values=$2 features=$3 guard=${4:-1}
+    catalog_framework_ready || return 1
     [ "$guard" != 1 ] || bridge_guard || return 1
     settings put global angle_gl_driver_selection_pkgs "$packages" &&
         { [ "$guard" != 1 ] || bridge_guard; } &&
@@ -350,6 +357,7 @@ catalog_policy_write() {
 catalog_angle() {
     local driver features extra packages values old_features index desired_packages desired_values desired_features prior stage receipt="$MODDIR/state/angle-owned.tsv"
     [ -s "$MODDIR/angle.tsv" ] || return 0
+    catalog_framework_ready || return 1
     IFS='|' read -r driver features extra < "$MODDIR/angle.tsv"
     [ "$driver" = angle ] && [ -z "$extra" ] || return 1
     prior=$(catalog_settings) || return 1
@@ -389,6 +397,9 @@ catalog_angle() {
 catalog_angle_restore() {
     local receipt="$MODDIR/state/angle-owned.tsv" before_packages before_values before_features after_packages after_values after_features current packages values features extra
     [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
+    # Native cleanup is safe before zygote, but policy restoration belongs to
+    # the late worker. Retain the exact receipt for its compare-and-restore.
+    catalog_framework_ready || return 0
     bridge_state_file "$receipt" && [ "$("$BB" wc -l < "$receipt")" -eq 2 ] || return 1
     IFS='|' read -r before_packages before_values before_features extra < "$receipt"
     [ -z "$extra" ] || return 1
@@ -426,6 +437,165 @@ EOF
     [ "$features" != "$after_features" ] || new_features=$before_features
     catalog_policy_write "$new_packages" "$new_values" "$new_features" 0 && rm -f "$receipt"
 }
+catalog_recovery_dir() {
+    local path=$1 owner
+    case "$path" in /*) ;; *) return 1 ;; esac
+    case "$path" in /|*[!A-Za-z0-9_./-]*|*'/../'*|*'/./'*|*'//'*|*/..|*/.|*/) return 1 ;; esac
+    while [ "$path" != / ]; do
+        [ ! -L "$path" ] || return 1
+        if [ -e "$path" ]; then
+            [ -d "$path" ] || return 1
+            owner=$("$BB" stat -c %u "$path")
+            [ "$owner" = 0 ] || { [ "$path" = /data ] && [ "$owner" = 1000 ]; } || return 1
+        fi
+        path=${path%/*}; [ -n "$path" ] || path=/
+    done
+}
+catalog_recovery_inventory() {
+    local path root=$1
+    for path in "$root"/* "$root"/.[!.]* "$root"/..?* "$root/state"/* "$root/state"/.[!.]* "$root/state"/..?*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        case "$path" in "$root/runtime.sh"|"$root/catalog.sh"|"$root/package.txt"|"$root/state"|"$root/state/angle-owned.tsv"|"$root/lock") ;; *) return 1 ;; esac
+    done
+    if [ -e "$root/lock" ] || [ -L "$root/lock" ]; then
+        bridge_state_file "$root/lock" && [ ! -s "$root/lock" ] || return 1
+    fi
+}
+catalog_recovery_emit() {
+    # Reuse the authenticated restoration code, not a second policy algorithm.
+    local path
+    for path in "$BB" "$1" "$2" "$OWNERDIR"; do
+        case "$path" in /*) ;; *) return 1 ;; esac
+        case "$path" in *[!A-Za-z0-9_./-]*|*'/../'*|*'/./'*|*'//'*|*/..|*/.|*/) return 1 ;; esac
+    done
+    bridge_hex "$3" && bridge_hex "$4" && bridge_hex "$5" && bridge_hex "$6" || return 1
+    "$BB" sed -e "s|@BB@|$BB|g" -e "s|@DIR@|$1|g" -e "s|@WRAPPER@|$2|g" \
+        -e "s|@MODULE@|$OWNERDIR|g" -e "s|@RUNTIME@|$3|g" -e "s|@CATALOG@|$4|g" \
+        -e "s|@PACKAGE@|$5|g" -e "s|@RECEIPT@|$6|g" <<'RECOVERY'
+#!/system/bin/sh
+# Android mksh closes extra descriptors for child programs. Enter KernelSU's
+# required native shell once so the audited flock lease survives execution.
+exec '@BB@' sh -s -- <<'HYPEROS_ANGLE_RECOVERY'
+BB='@BB@'
+DIR='@DIR@'
+WRAPPER='@WRAPPER@'
+MODULE='@MODULE@'
+umask 077
+safe_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$("$BB" stat -c %u:%h "$1")" = 0:1 ]; }
+safe_dir() {
+    local path=$1 owner
+    while [ "$path" != / ]; do
+        [ -d "$path" ] && [ ! -L "$path" ] || return 1
+        owner=$("$BB" stat -c %u "$path")
+        [ "$owner" = 0 ] || { [ "$path" = /data ] && [ "$owner" = 1000 ]; } || return 1
+        path=${path%/*}; [ -n "$path" ] || path=/
+    done
+}
+recovery_hash() { "$BB" sha256sum "$1" 2>/dev/null | "$BB" cut -d ' ' -f 1; }
+preserve() { printf '%s\n' 'HyperOS AVD Apps: ANGLE recovery preserved unknown or changed state.' >&2; exit 1; }
+safe_dir "$DIR/state" && safe_dir "${WRAPPER%/*}" && safe_file "$WRAPPER" || preserve
+for row in 'runtime.sh|@RUNTIME@' 'catalog.sh|@CATALOG@' 'package.txt|@PACKAGE@'; do
+    name=${row%%\|*}; pin=${row#*\|}
+    safe_file "$DIR/$name" && [ "$(recovery_hash "$DIR/$name")" = "$pin" ] || preserve
+done
+if [ -e "$DIR/state/angle-owned.tsv" ] || [ -L "$DIR/state/angle-owned.tsv" ]; then
+    safe_file "$DIR/state/angle-owned.tsv" && [ "$(recovery_hash "$DIR/state/angle-owned.tsv")" = '@RECEIPT@' ] || preserve
+fi
+MODDIR=$DIR; OWNERDIR=$MODULE
+. "$DIR/runtime.sh"
+. "$DIR/catalog.sh"
+BB='@BB@'
+catalog_recovery_inventory "$DIR" || preserve
+[ "$(catalog_recovery_emit "$DIR" "$WRAPPER" '@RUNTIME@' '@CATALOG@' '@PACKAGE@' '@RECEIPT@' | "$BB" sha256sum | "$BB" cut -d ' ' -f 1)" = "$(recovery_hash "$WRAPPER")" ] || preserve
+wrapper_hash=$(recovery_hash "$WRAPPER")
+if [ -e "$DIR/lock" ] || [ -L "$DIR/lock" ]; then safe_file "$DIR/lock" && [ ! -s "$DIR/lock" ] || preserve; fi
+exec 8>>"$DIR/lock" || preserve
+safe_file "$DIR/lock" && "$BB" flock -n 8 || exit 0
+count=0
+while [ "$(getprop sys.boot_completed)" != 1 ]; do
+    count=$((count+1)); [ "$count" -lt 300 ] || exit 0
+    sleep 1
+done
+# A later enabled installation owns its current policy. Keep recovery until
+# removal/disable rather than racing that installation's application worker.
+if [ -e "$MODULE" ] || [ -L "$MODULE" ]; then
+    safe_dir "$MODULE" && safe_file "$MODULE/module.prop" &&
+        "$BB" grep -Fxq 'id=hyperos_avd_app_compat' "$MODULE/module.prop" &&
+        "$BB" grep -Fxq 'author=HyperOS-AVD' "$MODULE/module.prop" || preserve
+    if [ ! -e "$MODULE/disable" ] && [ ! -L "$MODULE/disable" ] && [ ! -e "$MODULE/remove" ] && [ ! -L "$MODULE/remove" ]; then exit 0; fi
+fi
+PACKAGE=$(cat "$DIR/package.txt")
+bridge_word "$PACKAGE" || preserve
+CATALOG_PHASE=late
+catalog_angle_restore && [ ! -e "$DIR/state/angle-owned.tsv" ] && [ ! -L "$DIR/state/angle-owned.tsv" ] || preserve
+for row in 'runtime.sh|@RUNTIME@' 'catalog.sh|@CATALOG@' 'package.txt|@PACKAGE@'; do
+    name=${row%%\|*}; pin=${row#*\|}
+    safe_file "$DIR/$name" && [ "$(recovery_hash "$DIR/$name")" = "$pin" ] || preserve
+done
+safe_file "$WRAPPER" && [ "$(recovery_hash "$WRAPPER")" = "$wrapper_hash" ] || preserve
+rm "$WRAPPER" "$DIR/runtime.sh" "$DIR/catalog.sh" "$DIR/package.txt" "$DIR/lock" && rmdir "$DIR/state" "$DIR"
+HYPEROS_ANGLE_RECOVERY
+RECOVERY
+}
+catalog_angle_handoff() {
+    local receipt="$MODDIR/state/angle-owned.tsv" root service runtime catalog package pin key bundle wrapper stage file expected actual
+    [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
+    bridge_state_file "$receipt" &&
+        "$BB" awk -F '|' 'NF != 3 || $0 ~ /[^A-Za-z0-9_.,|\-]/ {bad=1} END {exit bad || NR != 2}' "$receipt" || return 1
+    root=${HYPEROS_APP_COMPAT_RECOVERY_DIR:-/data/adb/hyperos_app_compat/restore}
+    service=${HYPEROS_APP_COMPAT_SERVICE_DIR:-/data/adb/service.d}
+    # Production recovery must be discoverable by KernelSU. Overrides are
+    # confined to an explicit, completely isolated shell-test filesystem.
+    if [ -n "${HYPEROS_APP_COMPAT_TEST_ROOT:-}" ]; then
+        [ "$OWNERDIR" = "$HYPEROS_APP_COMPAT_TEST_ROOT/module" ] &&
+            [ "$PROC" = "$HYPEROS_APP_COMPAT_TEST_ROOT/proc" ] &&
+            [ "$BB" = "$HYPEROS_APP_COMPAT_TEST_ROOT/bin/busybox" ] &&
+            [ "$root" = "$HYPEROS_APP_COMPAT_TEST_ROOT/recovery" ] &&
+            [ "$service" = "$HYPEROS_APP_COMPAT_TEST_ROOT/service" ] || return 1
+    else
+        [ "$BB" = /data/adb/ksu/bin/busybox ] &&
+            [ "$root" = /data/adb/hyperos_app_compat/restore ] && [ "$service" = /data/adb/service.d ] || return 1
+    fi
+    catalog_recovery_dir "$root" && catalog_recovery_dir "$service" && catalog_recovery_dir "$OWNERDIR" || return 1
+    bridge_state_file "$OWNERDIR/runtime.sh" && bridge_state_file "$OWNERDIR/catalog.sh" && bridge_state_file "$MODDIR/package.txt" || return 1
+    runtime=$(bridge_hash "$OWNERDIR/runtime.sh"); catalog=$(bridge_hash "$OWNERDIR/catalog.sh")
+    package=$(bridge_hash "$MODDIR/package.txt"); pin=$(bridge_hash "$receipt")
+    key=$(printf '%s\n' "$runtime|$catalog|$package|$pin|$OWNERDIR" | "$BB" sha256sum | "$BB" cut -d ' ' -f 1)
+    bridge_hex "$key" || return 1
+    bundle="$root/$key"; wrapper="$service/hyperos-avd-app-angle-$key.sh"
+    mkdir -p "$root" "$service" && catalog_recovery_dir "$root" && catalog_recovery_dir "$service" || return 1
+    if [ ! -e "$bundle" ] && [ ! -L "$bundle" ]; then
+        stage=$("$BB" mktemp -d "$root/.handoff.XXXXXX") || return 1
+        mkdir "$stage/state" && chmod 700 "$stage" "$stage/state" &&
+            cp "$OWNERDIR/runtime.sh" "$stage/runtime.sh" && cp "$OWNERDIR/catalog.sh" "$stage/catalog.sh" &&
+            cp "$MODDIR/package.txt" "$stage/package.txt" && cp "$receipt" "$stage/state/angle-owned.tsv" &&
+            chmod 600 "$stage/runtime.sh" "$stage/catalog.sh" "$stage/package.txt" "$stage/state/angle-owned.tsv" &&
+            [ ! -e "$bundle" ] && [ ! -L "$bundle" ] && mv "$stage" "$bundle" || return 1
+    fi
+    catalog_recovery_dir "$bundle/state" && catalog_recovery_inventory "$bundle" || return 1
+    for expected in "runtime.sh|$runtime" "catalog.sh|$catalog" "package.txt|$package" "state/angle-owned.tsv|$pin"; do
+        file=${expected%%\|*}; actual=${expected#*\|}
+        bridge_state_file "$bundle/$file" && [ "$(bridge_hash "$bundle/$file")" = "$actual" ] || return 1
+    done
+    expected=$(catalog_recovery_emit "$bundle" "$wrapper" "$runtime" "$catalog" "$package" "$pin" | "$BB" sha256sum | "$BB" cut -d ' ' -f 1)
+    if [ -e "$wrapper" ] || [ -L "$wrapper" ]; then
+        bridge_state_file "$wrapper" && [ "$(bridge_hash "$wrapper")" = "$expected" ] || return 1
+    else
+        stage=$("$BB" mktemp "$root/.callback.XXXXXX") || return 1
+        catalog_recovery_emit "$bundle" "$wrapper" "$runtime" "$catalog" "$package" "$pin" > "$stage" &&
+            chmod 700 "$stage" && [ "$(bridge_hash "$stage")" = "$expected" ] &&
+            ln "$stage" "$wrapper" && rm "$stage" || return 1
+    fi
+}
+catalog_uninstall_handoff() {
+    local id feature package default result=0
+    while IFS='|' read -r id feature package default; do
+        MODDIR="$OWNERDIR/contexts/$id"
+        catalog_angle_handoff || { printf '%s\n' "HyperOS AVD Apps: ANGLE uninstall handoff preserved unknown state for $id." >&2; result=1; }
+    done < "$OWNERDIR/catalog.tsv"
+    MODDIR=$OWNERDIR
+    [ "$result" = 0 ]
+}
 catalog_cleanup_context() {
     BRIDGE_FEATURE=; BRIDGE_KEEP_EARLY=0; BRIDGE_CATALOG=1
     bridge_assets && bridge_recover && bridge_cleanup && catalog_angle_restore || return 1
@@ -440,10 +610,18 @@ catalog_cleanup_feature() {
     done < "$OWNERDIR/catalog.tsv"
     [ "$result" = 0 ]
 }
+catalog_factory_identity() {
+    local identity
+    bridge_regular 1 "$1" 0 &&
+        identity=$(bridge_ns 1 "$BB" stat -c '%d:%i:%s:%Y:%y:%Z:%z:%h:%f' "$1") &&
+        bridge_regular 1 "$1" 0 && printf '%s\n' "$identity"
+}
 catalog_select() {
     local feature=$1 phase=$2 package=$3 id selected default profile expected factory native paths apk token cached selection cache stage
+    local early_hashes= identity retained cache_factory cache_identity cache_hash
     cache="$OWNERDIR/state/select-$phase-$feature"
     if [ "$phase" = late ]; then
+        catalog_framework_ready || return 1
         paths=$(pm path "$package" 2>/dev/null | "$BB" sed -n 's/^package://p')
         [ -n "$paths" ] && [ "$(printf '%s\n' "$paths" | "$BB" wc -l)" -eq 1 ] || return 1
         apk=$paths; bridge_regular 1 "$apk" 0 || return 1
@@ -466,8 +644,29 @@ catalog_select() {
         IFS='|' read -r profile checksum factory native < "$OWNERDIR/contexts/$id/profiles.tsv"
         if [ "$phase" = early ]; then
             [ -s "$OWNERDIR/contexts/$id/targets.tsv" ] || [ "$(cat "$OWNERDIR/contexts/$id/mirror.txt")" = 1 ] || continue
-            [ "$factory" != '-' ] && bridge_regular 1 "$factory" 0 || continue
-            [ "$(bridge_ns_hash 1 "$factory")" = "$checksum" ] || continue
+            [ "$factory" != '-' ] || continue
+            identity=$(catalog_factory_identity "$factory") || { early_hashes=; continue; }
+            retained=; cached=
+            while IFS='|' read -r cache_factory cache_identity cache_hash; do
+                [ -n "$cache_factory" ] || continue
+                if [ "$cache_factory" = "$factory" ]; then
+                    [ "$cache_identity" != "$identity" ] || cached=$cache_hash
+                else retained="$retained
+$cache_factory|$cache_identity|$cache_hash"; fi
+            done <<EOF
+$early_hashes
+EOF
+            early_hashes=$retained
+            if [ -z "$cached" ]; then
+                cached=$(bridge_ns_hash 1 "$factory")
+                bridge_hex "$cached" && [ "$(catalog_factory_identity "$factory")" = "$identity" ] || continue
+            fi
+            # This cache lives only inside one selection. Revalidate the path
+            # and exact inode metadata for each candidate, then perform every
+            # normal ABI, mirror and post-bind content check after selection.
+            early_hashes="$early_hashes
+$factory|$identity|$cached"
+            [ "$cached" = "$checksum" ] || continue
         else [ "$expected" = "$checksum" ] || continue; fi
         [ "$selection" = '-' ] || return 1
         selection=$id
@@ -481,7 +680,9 @@ catalog_select() {
 }
 catalog_pass() {
     local phase=$1 feature package id default selected profile checksum factory native apk result token previous stage failed
+    case "$phase" in early|late) ;; *) return 1 ;; esac
     CATALOG_PHASE=$phase
+    [ "$phase" != late ] || catalog_framework_ready || return 1
     CATALOG_STATUS=$("$BB" mktemp "$OWNERDIR/state/status.XXXXXX") || return 1
     for feature in $("$BB" cut -d '|' -f 2 "$OWNERDIR/catalog.tsv" | "$BB" sort -u); do
         BRIDGE_FEATURE=; BRIDGE_KEEP_EARLY=0
@@ -584,5 +785,8 @@ catalog_uninstall_contexts() {
 }
 catalog_uninstall() {
     catalog_assets && bridge_lock || return 1
+    # KernelSU deletes this directory before zygote, even when uninstall.sh
+    # returns an error. Handoff verified recovery before that deletion.
+    if ! catalog_framework_ready; then catalog_uninstall_handoff || return 1; fi
     catalog_uninstall_contexts
 }
