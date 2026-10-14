@@ -572,7 +572,7 @@ def default_release_version(variant, metadata):
         if metadata['hyperos'] == '4.0.18.0.XFRCNXM':
             return 'v0.2.2-a17-hyperos4-hongkong-r3'
         return 'v0.2.1-a17-hyperos4-hongkong-r2'
-    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.1-a17-hyperos4-yingtian-r2'}[variant]
+    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.2-a17-hyperos4-yingtian-r3'}[variant]
 
 
 def runtime_files():

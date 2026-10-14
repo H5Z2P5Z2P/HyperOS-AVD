@@ -130,10 +130,30 @@ class PadReleaseTests(unittest.TestCase):
             payload = root / 'system.img'
             payload.write_bytes(b'fixture')
             version = package_release.default_release_version('os4-pad', {'hyperos': PROFILE['hyperos']})
-            self.assertEqual(version, 'pad-v0.1.1-a17-hyperos4-yingtian-r2')
+            self.assertEqual(version, 'pad-v0.1.2-a17-hyperos4-yingtian-r3')
             result = package_release.write_bundle(root / 'bundle', version,
                 {'format': 3, 'variant': 'os4-pad', 'build': {}}, {'images/system.img': payload}, 1)
             self.assertEqual(result['version'], version)
+
+    def test_pad_default_retains_generic_forward_upgrade_compatibility(self):
+        import manage
+        version = package_release.default_release_version('os4-pad', {'hyperos': PROFILE['hyperos']})
+        current = {'format': 3, 'variant': 'os4-pad', 'version': version,
+                   'files': {'images/encryptionkey.img': {'sha256': 'stable-key'}},
+                   'compatibility': {'userdata_family': 'os4-yingtian-api37-ranchu-4k'}}
+        self.assertEqual(manage.release_variant({'tag_name': version}), 'os4-pad')
+        for previous in ('pad-v0.1.0-a17-hyperos4-yingtian-r1',
+                         'pad-v0.1.1-a17-hyperos4-yingtian-r2'):
+            old = {**current, 'version': previous}
+            with self.subTest(previous=previous):
+                manage.compatible(old, current)
+                with self.assertRaisesRegex(RuntimeError, 'downgrade'):
+                    manage.compatible(current, old)
+        future = {**current, 'version': 'pad-v0.1.2-a17-hyperos4-yingtian-r999'}
+        self.assertEqual(manage.release_variant({'tag_name': future['version']}), 'os4-pad')
+        manage.compatible(current, future)
+        with self.assertRaisesRegex(RuntimeError, 'downgrade'):
+            manage.compatible(future, current)
 
     def test_signed_factory_apk_keeps_original_native_inputs(self):
         data = io.BytesIO()
