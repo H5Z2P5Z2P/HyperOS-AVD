@@ -1,6 +1,6 @@
 # HyperOS-AVD Installer v1.2.2
 
-Tag：`installer-v1.2.2`，目标为 **正式 Release / Latest**。当前仅本地准备，尚未发布；最终附件的两端 headless 新装及手机 r4 → r5 保数据升级已验收；Pad r1 → r2 实际升级本轮未测。镜像继续分别使用 Pre-release。
+Tag：`installer-v1.2.2`，正式 **Release / Latest**。最终附件的双端 headless 新装及 Phone r4 → r5 保数据升级已验收；Pad r1 → r2 实际升级未测。镜像使用独立的 Pre-release。
 
 ## 相比 1.2.1
 
@@ -12,7 +12,7 @@ Tag：`installer-v1.2.2`，目标为 **正式 Release / Latest**。当前仅本�
 
 ## 附件与状态
 
-上传同目录 **Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS`**，共 4 件。发布后可使用公共安装入口，或解压 ZIP 后运行 `Install.command`；本地准备状态不代表公开入口已更新。
+发行附件为同目录 **Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS`**，共 4 件。可通过公共安装入口获取，也可下载 ZIP 后运行 `Install.command`。
 
 TLS、磁盘事务、恢复和受控来宾容量路径已有定向回归；最终安装器 ZIP 的 108 项源码、收据、权限、哈希，以及双端新装、手机 r4 → r5 升级与备份恢复通过；逐页 OOBE、Pad r1 → r2 实际升级与长期稳定性未由本轮自动测试覆盖。1.2.1 已能读取 format 3 冻结运行包，但不包含本页新增 TLS 回退与加密磁盘增长路径；新镜像要求 1.2.2 以保证配套流程一致。
 

@@ -1,6 +1,6 @@
 # HyperOS 4.0.18.0 · v0.2.4 · Apple Silicon · r5
 
-Tag：`v0.2.4-a17-hyperos4-hongkong-r5`，目标为 **Pre-release**。最终附件已在本地准备，尚未发布；r4 → r5 保数据升级与冷启动已验收，新装与冷启动已验收。继续使用小米 18 Pro（hongkong）官方 **OS4.0.18.0.XFRCNXM / Android 17**。
+Tag：`v0.2.4-a17-hyperos4-hongkong-r5`，GitHub **Pre-release**。Phone r4 → r5 保数据升级、冷启动与新装验收均按本版验证记录执行；本版使用小米 18 Pro（hongkong）官方 **OS4.0.18.0.XFRCNXM / Android 17**。
 
 ## 相比 r4
 

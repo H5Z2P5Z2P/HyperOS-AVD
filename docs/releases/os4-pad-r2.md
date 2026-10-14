@@ -1,6 +1,6 @@
 # HyperOS Pad 4.0.15.0 · v0.1.1 · Apple Silicon · r2
 
-Tag：`pad-v0.1.1-a17-hyperos4-yingtian-r2`，目标为 **Pre-release**。最终附件已在本地准备，尚未发布；最终冻结 Installer 新装与冷启动已验收，公开 r1 → r2 的实际来宾升级本轮未测。继续使用 Xiaomi Pad 9 Pro Max（yingtian）官方 **OS4.0.15.0.XBMCNXM / Android 17**，保持独立 `pad-v*` 版本线。
+Tag：`pad-v0.1.1-a17-hyperos4-yingtian-r2`，GitHub **Pre-release**。最终冻结 Installer 新装与冷启动已验收；公开 r1 → r2 的实际来宾升级未测。继续使用 Xiaomi Pad 9 Pro Max（yingtian）官方 **OS4.0.15.0.XBMCNXM / Android 17**，保持独立 `pad-v*` 版本线。
 
 ## 相比 r1
 
