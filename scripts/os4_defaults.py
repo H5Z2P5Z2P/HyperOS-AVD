@@ -555,6 +555,8 @@ def finddevice_apk_identity(apk, sdk):
 
 def finddevice_package_block(text):
     """Use the active package, never a disabled factory package printed later."""
+    text = re.split(r'^[ \t]*(?:Hidden|Disabled) system packages:', text,
+                    maxsplit=1, flags=re.MULTILINE)[0]
     match = re.search(r'^[ \t]*Package \[' + re.escape(FINDDEVICE) + r'\].*$', text, re.MULTILINE)
     if not match:
         return ''
@@ -573,6 +575,11 @@ def finddevice_user_choice(block):
     next_user = re.search(r'^[ \t]*User [1-9][0-9]*:', user_block, re.MULTILINE)
     if next_user:
         user_block = user_block[:next_user.start()]
+    for state, value, choice in (('installed', 'false', 'uninstalled-package-choice'),
+                                 ('hidden', 'true', 'hidden-package-choice'),
+                                 ('suspended', 'true', 'suspended-package-choice')):
+        if re.search(r'\b' + state + '=' + value + r'\b', user[0]):
+            return choice
     enabled = re.search(r'\benabled=([0-9]+)\b', user[0])
     if not enabled or enabled[1] != '0':
         return 'explicit-package-choice'
@@ -590,12 +597,6 @@ def apply_finddevice_workaround(config, factory_sha256):
     from common import adb
     reason = 'unverified package'
     try:
-        paths = root(config, 'pm path ' + FINDDEVICE).splitlines()
-        if len(paths) != 1 or not paths[0].startswith('package:'):
-            raise RuntimeError('active base APK is unavailable or split')
-        apk = paths[0].removeprefix('package:')
-        if not re.fullmatch(r'/(?:data/app/|product/priv-app/)[A-Za-z0-9_./+=@~-]+\.apk', apk) or '..' in Path(apk).parts:
-            raise RuntimeError('active APK path is unsupported')
         block = finddevice_package_block(root(config, 'dumpsys package ' + FINDDEVICE))
         choice = finddevice_user_choice(block)
         if choice == 'unknown':
@@ -603,6 +604,12 @@ def apply_finddevice_workaround(config, factory_sha256):
         if choice != 'default':
             print('FindDevice provider workaround: preserving ' + choice + '.', flush=True)
             return choice
+        paths = root(config, 'pm path ' + FINDDEVICE).splitlines()
+        if len(paths) != 1 or not paths[0].startswith('package:'):
+            raise RuntimeError('active base APK is unavailable or split')
+        apk = paths[0].removeprefix('package:')
+        if not re.fullmatch(r'/(?:data/app/|product/priv-app/)[A-Za-z0-9_./+=@~-]+\.apk', apk) or '..' in Path(apk).parts:
+            raise RuntimeError('active APK path is unsupported')
         checksum = root(config, 'sha256sum ' + shlex.quote(apk)).split()[0]
         if apk == FINDDEVICE_FACTORY_APK and checksum == factory_sha256:
             reason = 'verified factory component'

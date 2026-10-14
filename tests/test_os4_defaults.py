@@ -116,6 +116,43 @@ class FindDeviceUpdateTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 os4_defaults.finddevice_provider_contract(text)
 
+    def test_unavailable_package_choices_are_preserved_without_querying_hidden_apk(self):
+        for state, expected in (('installed=false', 'uninstalled-package-choice'),
+                                ('hidden=true', 'hidden-package-choice'),
+                                ('suspended=true', 'suspended-package-choice')):
+            with self.subTest(state=state):
+                block = self.package().replace('installed=true', state if state.startswith('installed=')
+                                               else 'installed=true ' + state)
+                def read_state(config, command):
+                    self.assertEqual(command, 'dumpsys package ' + os4_defaults.FINDDEVICE)
+                    return block
+                with patch('apply_flutter_fix.root', side_effect=read_state) as root, \
+                        patch('common.adb') as adb, \
+                        patch.object(os4_defaults, 'finddevice_apk_identity') as identity:
+                    result = os4_defaults.apply_finddevice_workaround({}, 'a' * 64)
+                self.assertEqual(result, expected)
+                self.assertEqual(root.call_count, 1)
+                adb.assert_not_called()
+                identity.assert_not_called()
+
+    def test_stopped_package_remains_eligible_for_verified_provider_workaround(self):
+        block = self.package().replace('installed=true', 'installed=true stopped=true')
+        self.assertEqual(os4_defaults.finddevice_user_choice(block), 'default')
+
+    def test_hidden_factory_block_alone_never_supplies_active_user_state(self):
+        active = self.package().split('\nHidden system packages:')[0]
+        for heading in ('Hidden system packages:', 'Disabled system packages:'):
+            with self.subTest(heading=heading):
+                text = heading + '\n' + active
+                self.assertEqual(os4_defaults.finddevice_package_block(text), '')
+                with patch('apply_flutter_fix.root', return_value=text) as root, \
+                        patch('common.adb') as adb:
+                    result = os4_defaults.apply_finddevice_workaround({}, 'a' * 64)
+                self.assertEqual(result, 'skipped')
+                self.assertEqual(root.call_args.args[1], 'dumpsys package ' + os4_defaults.FINDDEVICE)
+                self.assertEqual(root.call_count, 1)
+                adb.assert_not_called()
+
     def test_apk_identity_requires_successful_apksigner_and_parses_literal_provider(self):
         import common
         certificate = 'a' * 64
