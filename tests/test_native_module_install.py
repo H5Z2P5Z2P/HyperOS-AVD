@@ -337,6 +337,29 @@ class NativeModuleInstallTests(unittest.TestCase):
         self.assertEqual(result['reason'],'unreviewed-core-controls')
         self.assertFalse(any('module install' in command for command in commands));adb.assert_not_called()
 
+    def test_final_frozen_core11_controls_are_authenticated_before_rear_gesture_helper(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v11-final-manifest.json').read_text()
+        saved = json.loads(previous)
+        self.assertEqual(saved['revision'], 11)
+        expected = '340f419d0cd201e96c9af1b62ec9338b6a1ba883d96ed795c8a6008139e87f23'
+        self.assertEqual(history.checksum_for(saved),expected)
+        record = next(row for row in history.REVIEWED if row['revision']==11)
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'],saved['files_sha256'][feature+'-policy.sh'])
+            self.assertEqual(controls['recovery'],saved['files_sha256'][feature+'-recovery.sh'])
+        prop = PROPERTY.rsplit('=',1)[0]+'=11'
+        result, commands, adb = self.run_install(active={'ownership':prop,'manifest':previous})
+        self.assertTrue(result['installed']);self.assertTrue(result['reboot_required'])
+        verification=next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage=next(command for command in commands if 'module install' in command)
+        self.assertIn(expected,verification);self.assertIn(expected,stage)
+        self.assertLess(commands.index(verification),commands.index(stage));self.assertEqual(adb.call_count,1)
+        saved['files_sha256']['runtime.sh']='a'*64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership':prop,'manifest':json.dumps(saved)})
+        self.assertEqual(result['reason'],'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands));adb.assert_not_called()
+
     def test_final_frozen_core6_migrates_only_complete_controls_to_policy_revision(self):
         previous = (REPO / 'tests/fixtures/native-compat-v6-final-manifest.json').read_text()
         saved = json.loads(previous)

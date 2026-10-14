@@ -92,7 +92,7 @@ class NativeModulePackageTests(unittest.TestCase):
                 self.assertIn('service.sh', names)
                 self.assertIn('skip_mount', names)
                 self.assertFalse(any(name.startswith('system/') for name in names))
-                self.assertFalse(any(name.endswith(('.so', '.apk', '.jar')) for name in names))
+                self.assertEqual([name for name in names if name.endswith(('.so', '.apk', '.jar'))], ['rear-wake.jar'])
                 for row in archive.read('SHA256SUMS').decode().splitlines():
                     expected, name = row.split('  ', 1)
                     self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), expected)
@@ -129,6 +129,22 @@ class NativeModulePackageTests(unittest.TestCase):
         self.assertNotIn(name, manifest['install_only_files'])
         self.assertFalse((REPO / 'modules/native-compat' / name).exists(),
                          'The module must reuse the canonical CPU helper, not a second copy.')
+
+    def test_rear_helper_is_offline_canonical_and_integrity_bound(self):
+        from rear_display_wake_runtime import files as rear_files
+        files = package.module_files()
+        assets = rear_files()
+        self.assertEqual(set(assets), {'rear-wake.jar', 'rear-wake.tsv'})
+        manifest = json.loads(files['manifest.json'])
+        checked = dict(row.split('  ', 1)[::-1]
+                       for row in files['SHA256SUMS'].decode().splitlines())
+        for name, body in assets.items():
+            self.assertEqual(files[name], body)
+            self.assertEqual(checked[name], hashlib.sha256(body).hexdigest())
+            self.assertEqual(manifest['files_sha256'][name], checked[name])
+            self.assertNotIn(name, manifest['install_only_files'])
+        self.assertEqual(files['rear-wake.tsv'].decode().splitlines()[2],
+                         'jar|rear-wake.jar|' + checked['rear-wake.jar'])
 
     def test_foreign_template_ownership_is_rejected_before_cpu_policy_delivery(self):
         import shutil

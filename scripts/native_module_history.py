@@ -47,6 +47,8 @@ REVIEWED = (
     # Deployed complete IMS/performance controls, frozen before the graphics
     # producer's missing physical frame-boost capability gate.
     {'revision': 10, 'source_kind': 'unpublished-final-canonical-development-package', 'package_sha256': 'a3b7d3e9a19fd2156664e4562dc5b4416c5b52e7dbbca02660baa75bd4b9d4b9', 'manifest_sha256': '08e3c8dba6856fb4d0fe2e5705228797433f31b3a2980ce5e1a9041122df8a7f', 'checksums_sha256': 'eafe2c308408582aa9e89d6b37afb4baee2a5b74905afaabaf5840efc36d4af8', 'policy_controls': {'finddevice': {'helper': '02310734be16af14eb2089ca93375eb9f2ab2c2971a9f7441e48293389a91087', 'recovery': 'c443829f14cd3ad883787995330f8380719ed1d5381c5145fcc661c9dc004b9a'}, 'vendor-ims': {'helper': 'b748953c98e0c4b6b60e113cbb415104c42acd5f5f3b34096594ee91822957fb', 'recovery': '5a953696cb582d7ce15aa258350810af41ee0b0c16b0272ac49145bab905feb7'}}},
+    # Complete deployed Core11 controls, frozen before the owned rear gesture helper.
+    {'revision': 11, 'source_commit': '03cccfa', 'source_kind': 'unpublished-final-canonical-development-package', 'package_sha256': 'e30e3554ec7b23e585897476f34ec8a5a5252c401b5931a6ac60c2462fff304b', 'manifest_sha256': '608c98a60b915c6ef2a4bc3abd8868d010ba4d41634604f2aac37be1acb2da67', 'checksums_sha256': '340f419d0cd201e96c9af1b62ec9338b6a1ba883d96ed795c8a6008139e87f23', 'policy_controls': {'finddevice': {'helper': 'cbcb899d940af66aedf810dc3d3bb9c3b32f6c1baa57d1cdb3700b9f28994d16', 'recovery': '234f14a7aae93ba1a81f1db957f59ae547747dd5a474c23d631686f28b092e9e'}, 'vendor-ims': {'helper': 'ca4cbd524d437294224d118c686d96f813242cbd1118882a0f10be0445366909', 'recovery': '9886ef31f038f4321922ddd7ccbd6a99c614dec553beeaad8a05bf61a9268b48'}}},
 )
 
 

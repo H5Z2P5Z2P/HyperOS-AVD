@@ -172,6 +172,9 @@ class CorePlatformShellTests(unittest.TestCase):
     def setUp(self):
         fixture.NativeModuleRuntimeTests.setUp(self)
         (self.module / 'boot-prerequisites.tsv').write_bytes(package_native_module.boot_prerequisites())
+        from rear_display_wake_runtime import files as rear_files
+        for name, body in rear_files().items():
+            (self.module / name).write_bytes(body)
         fixture.NativeModuleRuntimeTests.checksums(self)
     profile = fixture.NativeModuleRuntimeTests.profile
     file_metadata = fixture.NativeModuleRuntimeTests.file_metadata
@@ -533,13 +536,25 @@ native_ns_hash() {
         result, _ = self.run_platform('core_context_ready boot', overrides, check=False)
         self.assertNotEqual(result.returncode, 0, 'The next check must reject the changed userdata context.')
 
-    def rear_process(self, pid, start=42, owned=True):
+    def rear_process(self, pid, start=42, owned=True, current=False):
         directory = self.proc / str(pid); directory.mkdir(exist_ok=True)
         (directory / 'cmdline').write_bytes(b'app_process\0' + (b'io.github.hyperosavd.RearDisplayWake' if owned else b'foreign.Main') + b'\0')
-        (directory / 'environ').write_bytes(b'CLASSPATH=/system_ext/framework/rear-display-wake.jar\0')
+        classpath = str(self.module / 'rear-wake.jar') if current else '/system_ext/framework/rear-display-wake.jar'
+        (directory / 'environ').write_bytes(('CLASSPATH=' + classpath + '\0').encode())
         (directory / 'status').write_text('Uid:\t0\t0\t0\t0\n')
         # Field 22 is the process start tick, after a parenthesized comm.
         (directory / 'stat').write_text(f'{pid} (app process) ' + ' '.join(['S'] + ['0'] * 18 + [str(start)] + ['0'] * 20) + '\n')
+
+    def rear_hash_override(self):
+        return '''native_ns_hash() {
+    case "$2" in
+        /system_ext/framework/rear-display-wake.jar) echo d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077 ;;
+        /system_ext/bin/rear-display-wake) echo f98ea740ae450ea4e2e0815c7e74f698ee2fe5cfcd6a367247f2f91021ed16e7 ;;
+        "$MODDIR/rear-wake.jar") native_hash "$2" ;;
+        *) return 1 ;;
+    esac
+}
+'''
 
     def test_rear_disable_stops_only_the_exact_adopted_process_lifetime(self):
         child = subprocess.Popen(['sleep', '30'])
@@ -548,7 +563,7 @@ native_ns_hash() {
         state = self.root / 'persistent'; state.mkdir()
         (state / 'rear-daemon.record').write_text(f'1|test-boot|{child.pid}|42\n')
         (self.module / 'features.disabled').write_text('rear-wake\n')
-        overrides = 'native_ns_hash() { echo d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077; }'
+        overrides = self.rear_hash_override()
         self.run_platform('core_rear', overrides)
         self.assertEqual(child.wait(timeout=2), -15)
         self.assertIn('verified-daemon-stopped', (self.module / 'state/status.tsv').read_text())
@@ -556,8 +571,7 @@ native_ns_hash() {
     def test_rear_missing_empty_alias_dead_boot_pid_reuse_and_foreign_are_preserved(self):
         state = self.root / 'persistent'; state.mkdir()
         file = state / 'rear-daemon.record'; self.rear_process(123)
-        overrides = '''native_ns_hash() { echo d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077; }
-kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
+        overrides = self.rear_hash_override() + '''kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
 '''
         for record in (None, '', '1|earlier-boot|123|42\n', '1|test-boot|123|99\n', '1|test-boot|124|42\n'):
             if record is None: file.unlink(missing_ok=True)
@@ -571,11 +585,10 @@ kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
     def test_rear_lease_serializes_start_adoption_and_cleanup(self):
         import fcntl
         state = self.root / 'persistent'; state.mkdir()
-        self.rear_process(123)
+        self.rear_process(123, current=True)
         record = state / 'rear-daemon.record'; record.write_text('1|test-boot|123|42\n')
         inode = record.stat().st_ino
-        overrides = '''core_rear_ready() { return 0; }
-native_ns_hash() { echo d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077; }
+        overrides = self.rear_hash_override() + '''core_rear_ready() { return 0; }
 kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
 '''
         with (state / 'rear.guard').open('a') as lease:
@@ -586,6 +599,116 @@ kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
         self.run_platform('core_rear', overrides)
         self.assertEqual(record.stat().st_ino, inode)
         self.assertIn('verified-existing-daemon', (self.module / 'state/status.tsv').read_text())
+
+    def test_rear_unleased_unknown_or_stale_owner_is_preserved(self):
+        state = self.root / 'persistent'; state.mkdir()
+        self.rear_process(123)
+        record = state / 'rear-daemon.record'
+        overrides = self.rear_hash_override() + '''core_rear_ready() { return 0; }
+kill() { echo unwanted-signal >> "$CORE_STATE/signals"; }
+'''
+        for value in (None, '1|earlier-boot|123|42\n', '1|test-boot|123|999\n'):
+            if value is None: record.unlink(missing_ok=True)
+            else: record.write_text(value)
+            self.run_platform('core_rear', overrides)
+            self.assertIn('unowned-daemon-preserved', (self.module / 'state/status.tsv').read_text())
+        record.write_text('1|test-boot|123|42\n')
+        (self.proc / '123/environ').write_bytes(b'CLASSPATH=/data/foreign.jar\0')
+        self.run_platform('core_rear', overrides)
+        self.assertIn('unowned-daemon-preserved', (self.module / 'state/status.tsv').read_text())
+        self.assertFalse((state / 'signals').exists())
+
+    def test_rear_migration_waits_for_the_exact_legacy_owner_to_exit(self):
+        state = self.root / 'persistent'; state.mkdir()
+        self.rear_process(123)
+        (state / 'rear-daemon.record').write_text('1|test-boot|123|42\n')
+        overrides = self.rear_hash_override() + '''core_rear_ready() { return 0; }
+kill() { printf '%s\n' "$*" >> "$CORE_STATE/signals"; }
+sleep() { :; }
+'''
+        self.run_platform('core_rear', overrides)
+        self.assertEqual((state / 'signals').read_text(), '-TERM 123\n')
+        self.assertIn('previous-daemon-stopping', (self.module / 'state/status.tsv').read_text())
+        # It never starts a second listener or changes the immutable image jar.
+        rows = (self.module / 'runtime.log').read_text().splitlines()
+        self.assertEqual(len(rows), 2)
+        self.assertIn('verified-daemon-stopped', rows[0])
+        self.assertIn('previous-daemon-stopping', rows[1])
+
+    def test_rear_runtime_recipe_rejects_unknown_code_and_extra_rows(self):
+        valid = (self.module / 'rear-wake.tsv').read_text()
+        overrides = self.rear_hash_override()
+        self.rear_process(123, current=True)
+        self.run_platform('core_rear_kind 123', overrides)
+        for changed in (valid + 'extra|ignored\n', valid.replace('schema|1', 'schema|2'),
+                        valid.replace('class|io.github.hyperosavd.RearDisplayWake', 'class|foreign.Main'),
+                        valid.replace('jar|rear-wake.jar|', 'jar|foreign.jar|'),
+                        valid.replace('legacy-launcher|/system_ext/bin/rear-display-wake|',
+                                      'legacy-launcher|/data/foreign|')):
+            (self.module / 'rear-wake.tsv').write_text(changed)
+            fixture.NativeModuleRuntimeTests.checksums(self)
+            result, _ = self.run_platform('core_rear_kind 123', overrides, check=False)
+            self.assertNotEqual(result.returncode, 0, changed)
+        (self.module / 'rear-wake.tsv').write_text(valid)
+        (self.module / 'rear-wake.jar').write_bytes(b'unreviewed-runtime')
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        result, _ = self.run_platform('core_rear_kind 123', overrides, check=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_rear_cold_start_executes_only_the_verified_module_jar_and_reuses_lease(self):
+        import signal
+        import textwrap
+        helper = self.bin / 'app_process'
+        helper.write_text('#!' + sys.executable + '\n' + textwrap.dedent(r'''
+            import os, pathlib, shutil, signal, sys, time
+            directory = pathlib.Path(os.environ['HYPEROS_NATIVE_PROC']) / str(os.getpid())
+            directory.mkdir()
+            (directory / 'cmdline').write_bytes(b'app_process\0io.github.hyperosavd.RearDisplayWake\0')
+            (directory / 'environ').write_bytes(('CLASSPATH=' + os.environ['CLASSPATH'] + '\0').encode())
+            (directory / 'status').write_text('Uid:\t0\t0\t0\t0\n')
+            (directory / 'stat').write_text(str(os.getpid()) + ' (app process) ' +
+                                          ' '.join(['S'] + ['0'] * 18 + ['42'] + ['0'] * 20) + '\n')
+            (pathlib.Path(os.environ['HYPEROS_CORE_STATE']) / 'started-pid').write_text(str(os.getpid()))
+            print('owned-helper-started:' + os.environ['CLASSPATH'], flush=True)
+            signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
+            try:
+                while True: time.sleep(0.1)
+            finally:
+                shutil.rmtree(directory)
+        '''))
+        helper.chmod(0o755)
+        script = self.module / 'platform.sh'
+        script.write_text(script.read_text().replace('/system/bin/app_process', shlex.quote(str(helper))))
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        state = self.root / 'persistent'
+        def stop_fixture():
+            path = state / 'started-pid'
+            if path.exists():
+                try: os.kill(int(path.read_text()), signal.SIGTERM)
+                except ProcessLookupError: pass
+        self.addCleanup(stop_fixture)
+        overrides = self.rear_hash_override() + 'core_rear_ready() { return 0; }\n'
+        self.run_platform('core_rear; core_rear', overrides)
+        pid = int((state / 'started-pid').read_text())
+        self.assertEqual((state / 'rear-daemon.record').read_text(), f'1|test-boot|{pid}|42\n')
+        log = (self.module / 'runtime.log').read_text()
+        self.assertEqual(log.count('owned-helper-started:'), 1)
+        self.assertIn('owned-helper-started:' + str(self.module / 'rear-wake.jar'), log)
+        self.assertIn('verified-existing-daemon', (self.module / 'state/status.tsv').read_text())
+        (self.module / 'features.disabled').write_text('rear-wake\n')
+        self.run_platform('core_rear', overrides)
+        self.assertIn('verified-daemon-stopped', (self.module / 'state/status.tsv').read_text())
+
+    def test_rear_current_helper_disable_uses_the_same_verified_lifetime_lease(self):
+        child = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.rear_process(child.pid, current=True)
+        state = self.root / 'persistent'; state.mkdir()
+        (state / 'rear-daemon.record').write_text(f'1|test-boot|{child.pid}|42\n')
+        (self.module / 'features.disabled').write_text('rear-wake\n')
+        self.run_platform('core_rear', self.rear_hash_override())
+        self.assertEqual(child.wait(timeout=2), -15)
+        self.assertIn('verified-daemon-stopped', (self.module / 'state/status.tsv').read_text())
 
 
 class CoreContextTests(unittest.TestCase):
@@ -633,6 +756,11 @@ class CoreMigrationShellTests(CorePlatformShellTests):
     test_rear_disable_stops_only_the_exact_adopted_process_lifetime = None
     test_rear_missing_empty_alias_dead_boot_pid_reuse_and_foreign_are_preserved = None
     test_rear_lease_serializes_start_adoption_and_cleanup = None
+    test_rear_unleased_unknown_or_stale_owner_is_preserved = None
+    test_rear_migration_waits_for_the_exact_legacy_owner_to_exit = None
+    test_rear_runtime_recipe_rejects_unknown_code_and_extra_rows = None
+    test_rear_current_helper_disable_uses_the_same_verified_lifetime_lease = None
+    test_rear_cold_start_executes_only_the_verified_module_jar_and_reuses_lease = None
 
     def setUp(self):
         super().setUp()

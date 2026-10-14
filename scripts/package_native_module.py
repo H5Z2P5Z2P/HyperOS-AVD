@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 11
+REVISION = 12
 
 
 def boot_prerequisites():
@@ -56,6 +56,8 @@ def module_files(value=None, template=None):
         raise RuntimeError('Unexpected native module template ownership.')
     if properties.get('versionCode') != str(REVISION):
         raise RuntimeError('Native module revision and template disagree.')
+    from rear_display_wake_runtime import files as rear_wake_files
+    files.update(rear_wake_files())
     files['skip_mount'] = b''
     files['boot-prerequisites.tsv'] = boot_prerequisites()
     from patch_display_privacy import capability_recipe

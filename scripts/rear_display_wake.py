@@ -317,15 +317,15 @@ public final class RearDisplayWake {
 '''
 
 
-def compile_assets(sdk, work):
+def compile_assets(sdk, work, java_source=JAVA_SOURCE):
     """Compile one app_process DEX jar locally, without installing anything."""
     from patch_gnss import java
     sdk, work = Path(sdk), Path(work)
     work.mkdir(parents=True, exist_ok=True)
     source = work / 'src/io/github/hyperosavd/RearDisplayWake.java'
     source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_text(JAVA_SOURCE)
-    revision = hashlib.sha256(JAVA_SOURCE.encode()).hexdigest()[:16]
+    source.write_text(java_source)
+    revision = hashlib.sha256(java_source.encode()).hexdigest()[:16]
     classes, dex = work / 'classes' / revision, work / 'dex' / revision
     classes.mkdir(parents=True, exist_ok=True)
     dex.mkdir(parents=True, exist_ok=True)

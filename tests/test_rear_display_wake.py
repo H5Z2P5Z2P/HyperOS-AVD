@@ -91,6 +91,8 @@ def tap(time, duration=80, x=16000, y=12000, slot=0, coordinates=True):
 
 
 class RearDisplayWakeJavaTest(unittest.TestCase):
+    JAVA_SOURCE = bridge.JAVA_SOURCE
+
     @classmethod
     def setUpClass(cls):
         try:
@@ -106,7 +108,7 @@ class RearDisplayWakeJavaTest(unittest.TestCase):
         package = cls.folder / 'src/io/github/hyperosavd'
         package.mkdir(parents=True)
         source, harness = package / 'RearDisplayWake.java', package / 'WakeHarness.java'
-        source.write_text(bridge.JAVA_SOURCE)
+        source.write_text(cls.JAVA_SOURCE)
         harness.write_text(HARNESS)
         subprocess.run([str(javac), '-source', '8', '-target', '8', '-d', str(cls.folder),
                         str(source), str(harness)], check=True, capture_output=True)
@@ -230,6 +232,75 @@ class RearDisplayWakeJavaTest(unittest.TestCase):
         self.assertNotIn('touch.wake', bridge.LAUNCHER.decode())
         self.assertIn('"-d", "1", "keyevent", "224"', bridge.JAVA_SOURCE)
         self.assertEqual(bridge.compile_assets(SDK, self.folder / 'second-assets'), jar)
+
+
+class CoreRearDisplayWakeJavaTest(RearDisplayWakeJavaTest):
+    from rear_display_wake_runtime import JAVA_SOURCE
+
+    def test_original_time_and_panel_pixel_distance_boundaries(self):
+        # Both DOWN->DOWN and UP->UP must match the OEM's strict 400 ms.
+        self.assertIn('WAKES=1', self.execute(tap(1000) + tap(1399)).stdout)
+        self.assertIn('WAKES=0', self.execute(tap(1000) + tap(1400)).stdout)
+        self.assertIn('WAKES=0', self.execute(tap(1000) + tap(1250, duration=230)).stdout)
+        # OEM distance uses a rectangle, including its diagonal corners.
+        self.assertIn('WAKES=1', self.execute(tap(1000) + tap(1250, x=19592, y=17496)).stdout)
+        self.assertIn('WAKES=0', self.execute(tap(1000) + tap(1250, x=19593)).stdout)
+
+    def test_oem_press_duration_and_mouse_drift_are_accepted(self):
+        self.assertIn('WAKES=1', self.execute(tap(1000, duration=300) + tap(1350)).stdout)
+        first = (event(1000, 'ABS_MT_TRACKING_ID', 1)
+                 + event(1000, 'ABS_MT_POSITION_X', 16000)
+                 + event(1000, 'ABS_MT_POSITION_Y', 12000) + event(1000, 'SYN_REPORT')
+                 + event(1050, 'ABS_MT_POSITION_X', 17600) + event(1050, 'SYN_REPORT')
+                 + event(1080, 'ABS_MT_TRACKING_ID', -1) + event(1080, 'SYN_REPORT'))
+        # 44.5 physical pixels of mouse drift exceed the old 24-pixel guard.
+        self.assertIn('WAKES=1', self.execute(first + tap(1250, x=17600)).stdout)
+        # Moving outside the rectangle and returning before UP matches stock.
+        excursion = first.replace(event(1050, 'ABS_MT_POSITION_X', 17600),
+                                  event(1040, 'ABS_MT_POSITION_X', 26000) + event(1040, 'SYN_REPORT')
+                                  + event(1050, 'ABS_MT_POSITION_X', 17600))
+        self.assertIn('WAKES=1', self.execute(excursion + tap(1250, x=17600)).stdout)
+
+    def test_final_up_axes_and_each_endpoint_match_first_down(self):
+        first = tap(1000)
+        second = tap(1250, x=12408).replace(event(1330, 'ABS_MT_TRACKING_ID', -1),
+                event(1330, 'ABS_MT_POSITION_X', 19592) + event(1330, 'ABS_MT_TRACKING_ID', -1))
+        # Opposite rectangle corners are both within the first DOWN tolerance.
+        self.assertIn('WAKES=1', self.execute(first + second).stdout)
+        outside = second.replace(event(1330, 'ABS_MT_POSITION_X', 19592),
+                                 event(1330, 'ABS_MT_POSITION_X', 24000))
+        self.assertIn('WAKES=0', self.execute(first + outside).stdout)
+
+    def test_equivalent_sleep_states_keep_one_epoch(self):
+        for before, after in ((1, 3), (3, 4), (4, 1)):
+            trace = f'STATE {before} 900\n' + tap(1000) + f'STATE {after} 1200\n' + tap(1250)
+            self.assertIn('WAKES=1', self.execute(trace, 'history').stdout)
+
+    def test_failed_second_up_cannot_seed_a_third_tap(self):
+        dragged = tap(1200, x=17000).replace(event(1280, 'ABS_MT_TRACKING_ID', -1),
+                event(1280, 'ABS_MT_POSITION_X', 26000) + event(1280, 'ABS_MT_TRACKING_ID', -1))
+        self.assertIn('WAKES=0', self.execute(tap(1000) + dragged + tap(1400, x=17000)).stdout)
+
+    @unittest.skipUnless((SDK / 'build-tools/37.0.0/d8').is_file(), 'Android D8 is unavailable')
+    def test_assets_compile_and_manifest_hashes_match(self):
+        from unittest.mock import patch
+        import rear_display_wake_runtime as current
+        assets = current.files()
+        self.assertEqual(bridge.compile_assets(SDK, self.folder / 'current-assets', self.JAVA_SOURCE),
+                         assets['rear-wake.jar'])
+        self.assertEqual(hashlib.sha256(self.JAVA_SOURCE.encode()).hexdigest(),
+                         current.COMPILED_SOURCE_SHA256)
+        with patch.object(current, 'compile_assets', side_effect=AssertionError('Offline consumer')):
+            self.assertEqual(current.files(), assets)
+        with patch.object(current, 'JAVA_SOURCE', self.JAVA_SOURCE + '// changed'):
+            with self.assertRaisesRegex(RuntimeError, 'rebuild'):
+                current.files()
+        with patch.object(current, 'JAR_HEX', '00'):
+            with self.assertRaisesRegex(RuntimeError, 'asset changed'):
+                current.files()
+        self.assertIn('wakeUpWithDisplayId', self.JAVA_SOURCE)
+        self.assertNotIn('"/system/bin/input"', self.JAVA_SOURCE)
+        self.assertEqual(len(assets['rear-wake.tsv'].decode().splitlines()), 5)
 
 
 if __name__ == '__main__':

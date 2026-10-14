@@ -310,38 +310,97 @@ core_kernel() {
     native_status boot-services kernel ready verified-capability-probe
 }
 
-core_rear_owned() {
+core_rear_recipe() {
+    # Only the complete installed package may supply executable helper bytes.
+    # The legacy image contract stays immutable; the current helper lives in
+    # Core's directory and is never bound over a loaded image inode.
+    native_assets || return 1
+    local recipe="$MODDIR/rear-wake.tsv" expected
+    core_safe_file "$recipe" && core_safe_file "$MODDIR/rear-wake.jar" || return 1
+    expected=$("$BB" awk '$2 == "rear-wake.tsv" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1;
+        checksum=$1} END {if (found != 1) exit 1; print checksum}' "$MODDIR/SHA256SUMS") || return 1
+    native_hex "$expected" && [ "$(native_hash "$recipe")" = "$expected" ] || return 1
+    "$BB" awk -F '|' '
+        function hex(value) {return length(value) == 64 && value !~ /[^0-9a-f]/}
+        NR == 1 {if ($0 != "schema|1") bad=1; next}
+        NR == 2 {if ($0 != "class|io.github.hyperosavd.RearDisplayWake") bad=1; next}
+        NR == 3 {if (NF != 3 || $1 != "jar" || $2 != "rear-wake.jar" || !hex($3)) bad=1; jar=$3; next}
+        NR == 4 {if (NF != 3 || $1 != "legacy-jar" || $2 != "/system_ext/framework/rear-display-wake.jar" || !hex($3)) bad=1; legacy=$3; next}
+        NR == 5 {if (NF != 3 || $1 != "legacy-launcher" || $2 != "/system_ext/bin/rear-display-wake" || !hex($3)) bad=1; launcher=$3; next}
+        {bad=1}
+        END {if (bad || NR != 5) exit 1; print jar "|" legacy "|" launcher}' "$recipe"
+}
+
+core_rear_process() {
     local pid=$1 directory="$PROC/$1"
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ -r "$directory/cmdline" ] && [ -r "$directory/environ" ] && [ -r "$directory/status" ] || return 1
     "$BB" tr '\000' '\n' < "$directory/cmdline" | "$BB" grep -Fxq io.github.hyperosavd.RearDisplayWake || return 1
-    "$BB" tr '\000' '\n' < "$directory/environ" | "$BB" grep -Fxq CLASSPATH=/system_ext/framework/rear-display-wake.jar || return 1
     "$BB" awk '$1 == "Uid:" {found=1; for(i=2;i<=5;i++) if($i!=0) exit 1} END {exit !found}' "$directory/status"
 }
+
+core_rear_kind() {
+    local pid=$1 directory="$PROC/$1" recipe jar legacy launcher extra classpath
+    core_rear_process "$pid" || return 1
+    recipe=$(core_rear_recipe) || return 1
+    IFS='|' read -r jar legacy launcher extra <<EOF
+$recipe
+EOF
+    [ -z "$extra" ] && [ "$(native_hash "$MODDIR/rear-wake.jar")" = "$jar" ] || return 1
+    classpath=$("$BB" tr '\000' '\n' < "$directory/environ" | "$BB" awk '
+        /^CLASSPATH=/ {if (found++) exit 1; value=substr($0,11)}
+        END {if (found != 1) exit 1; print value}') || return 1
+    case "$classpath" in
+        "$MODDIR/rear-wake.jar")
+            [ "$(native_ns_hash "$pid" "$classpath")" = "$jar" ] || return 1
+            echo current ;;
+        /system_ext/framework/rear-display-wake.jar)
+            [ "$(native_ns_hash "$pid" "$classpath")" = "$legacy" ] &&
+                [ "$(native_ns_hash "$pid" /system_ext/bin/rear-display-wake)" = "$launcher" ] || return 1
+            echo legacy ;;
+        *) return 1 ;;
+    esac
+}
+
+core_rear_owned() { core_rear_kind "$1" >/dev/null; }
 
 core_rear_start_time() {
     [ -r "$PROC/$1/stat" ] || return 1
     "$BB" awk '{sub(/^.*\) /, ""); print $20}' "$PROC/$1/stat"
 }
 
+core_rear_record_safe() {
+    local file="$CORE_STATE/rear-daemon.record" schema boot pid start extra
+    [ -e "$file" ] || [ -L "$file" ] || return 0
+    core_safe_file "$file" && [ "$("$BB" wc -l < "$file")" -eq 1 ] || return 1
+    IFS='|' read -r schema boot pid start extra < "$file"
+    [ "$schema" = 1 ] && [ -n "$boot" ] && [ -z "$extra" ] || return 1
+    case "$pid:$start" in *[!0-9:]*) return 1 ;; esac
+    [ -n "$pid" ] && [ -n "$start" ]
+}
+
+core_rear_lease_pid() {
+    local file="$CORE_STATE/rear-daemon.record" schema boot pid start extra
+    core_rear_record_safe && core_safe_file "$file" || return 1
+    IFS='|' read -r schema boot pid start extra < "$file"
+    [ "$schema" = 1 ] && [ -z "$extra" ] && [ -n "$pid" ] && [ -n "$start" ] || return 1
+    case "$pid:$start" in *[!0-9:]*) return 1 ;; esac
+    [ "$boot" = "$(cat "$PROC/sys/kernel/random/boot_id")" ] && core_rear_owned "$pid" || return 1
+    [ "$(core_rear_start_time "$pid")" = "$start" ] || return 1
+    printf '%s\n' "$pid"
+}
+
 core_rear_receipt() {
-    local pid=$1 boot start next="$CORE_STATE/rear-daemon.record.next.$$" schema prior_boot prior_pid prior_start extra row
-    core_rear_owned "$pid" || return 1
+    local pid=$1 boot start next="$CORE_STATE/rear-daemon.record.next.$$" row
+    core_rear_owned "$pid" && core_rear_record_safe || return 1
     boot=$(cat "$PROC/sys/kernel/random/boot_id") && start=$(core_rear_start_time "$pid") || return 1
     case "$start" in ''|*[!0-9]*) return 1 ;; esac
     [ -n "$boot" ] && [ ! -e "$next" ] && [ ! -L "$next" ] || return 1
-    if [ -e "$CORE_STATE/rear-daemon.record" ] || [ -L "$CORE_STATE/rear-daemon.record" ]; then
-        core_safe_file "$CORE_STATE/rear-daemon.record" &&
-            [ "$("$BB" wc -l < "$CORE_STATE/rear-daemon.record")" -eq 1 ] || return 1
-        IFS='|' read -r schema prior_boot prior_pid prior_start extra < "$CORE_STATE/rear-daemon.record"
-        [ "$schema" = 1 ] && [ -n "$prior_boot" ] && [ -z "$extra" ] || return 1
-        case "$prior_pid:$prior_start" in *[!0-9:]*) return 1 ;; esac
-        [ -n "$prior_pid" ] && [ -n "$prior_start" ] || return 1
-        row="1|$boot|$pid|$start"
-        [ "$(cat "$CORE_STATE/rear-daemon.record")" != "$row" ] || return 0
-    fi
+    row="1|$boot|$pid|$start"
+    if [ -f "$CORE_STATE/rear-daemon.record" ] && [ "$(cat "$CORE_STATE/rear-daemon.record")" = "$row" ]; then return 0; fi
     core_rear_owned "$pid" && [ "$(core_rear_start_time "$pid")" = "$start" ] || return 1
-    (set -C; printf '1|%s|%s|%s\n' "$boot" "$pid" "$start" > "$next") &&
+    (set -C; printf '%s\n' "$row" > "$next") &&
         chmod 600 "$next" && mv "$next" "$CORE_STATE/rear-daemon.record"
 }
 
@@ -355,19 +414,13 @@ core_rear_lock() {
 }
 
 core_rear_cleanup_locked() {
-    # Stop only the exact daemon adopted/started by this Core, from this boot
-    # and process lifetime. PID reuse or a different app_process is preserved.
+    # The lease binds ownership to this boot and process lifetime. Unknown
+    # helper bytes, stale leases and PID reuse never authorize a signal.
     core_state_safe || return 0
-    local file="$CORE_STATE/rear-daemon.record" schema boot pid start extra current
-    core_safe_file "$file" && [ "$("$BB" wc -l < "$file")" -eq 1 ] || return 0
-    IFS='|' read -r schema boot pid start extra < "$file"
-    [ "$schema" = 1 ] && [ -z "$extra" ] && [ "$boot" = "$(cat "$PROC/sys/kernel/random/boot_id")" ] || return 0
-    case "$pid:$start" in *[!0-9:]*) return 0 ;; esac
-    [ -n "$pid" ] && [ -n "$start" ] && core_rear_owned "$pid" || return 0
-    [ "$(core_rear_start_time "$pid")" = "$start" ] || return 0
-    [ "$(native_ns_hash 1 /system_ext/framework/rear-display-wake.jar)" = d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077 ] || return 0
-    # Recheck immediately before the signal; do not search or kill by name.
-    core_rear_owned "$pid" && [ "$(core_rear_start_time "$pid")" = "$start" ] || return 0
+    local pid start
+    pid=$(core_rear_lease_pid) || return 0
+    start=$(core_rear_start_time "$pid") || return 0
+    [ "$(core_rear_lease_pid)" = "$pid" ] && [ "$(core_rear_start_time "$pid")" = "$start" ] || return 0
     kill -TERM "$pid" || return 1
     native_status rear-wake display disabled verified-daemon-stopped
 }
@@ -383,13 +436,18 @@ core_rear_cleanup() {
 
 core_rear_ready() {
     native_eligible rear-display && core_context_ready rear || return 1
-    local row id group unique extra
+    local row id group unique extra recipe jar legacy launcher
     core_safe_file "$CORE_STATE/rear.record" || return 1
     IFS='|' read -r row id group unique extra < "$CORE_STATE/rear.record"
     [ "$row" = 1 ] && [ "$id" = 1 ] && [ "$group" = 1 ] &&
         [ "$unique" = local:4619827551948147201 ] && [ -z "$extra" ] || return 1
-    [ "$(native_ns_hash 1 /system_ext/framework/rear-display-wake.jar)" = d38aef457215fe9f5f397af2e58ece05c3baa61f742a8a9e3d7a3b577bd5c077 ] &&
-        [ "$(native_ns_hash 1 /system_ext/bin/rear-display-wake)" = f98ea740ae450ea4e2e0815c7e74f698ee2fe5cfcd6a367247f2f91021ed16e7 ] || return 1
+    recipe=$(core_rear_recipe) || return 1
+    IFS='|' read -r jar legacy launcher extra <<EOF
+$recipe
+EOF
+    [ -z "$extra" ] && [ "$(native_hash "$MODDIR/rear-wake.jar")" = "$jar" ] &&
+        [ "$(native_ns_hash 1 /system_ext/framework/rear-display-wake.jar)" = "$legacy" ] &&
+        [ "$(native_ns_hash 1 /system_ext/bin/rear-display-wake)" = "$launcher" ] || return 1
     dumpsys display | "$BB" awk -v unique="$unique" '
         /DisplayInfo/ && /displayId[ =:]*1([, }]|$)/ && /displayGroupId[ =:]*1([, }]|$)/ && index($0,unique) {found=1}
         END {exit !found}'
@@ -398,21 +456,40 @@ core_rear_ready() {
 core_rear() {
     if ! core_permitted rear-wake; then core_rear_cleanup; return 0; fi
     if ! core_rear_ready; then native_status rear-wake display skipped physical-display-prerequisite; return 0; fi
-    local directory pid count=0
+    local directory pid count=0 kind
     core_rear_lock || return 0
-    for directory in "$PROC"/[0-9]*; do
-        if core_rear_owned "${directory##*/}"; then
+    if ! core_rear_record_safe; then
+        exec 7>&-; native_status rear-wake display skipped unsafe-daemon-lease; return 0
+    fi
+    pid=$(core_rear_lease_pid) || pid=
+    if [ -n "$pid" ]; then
+        kind=$(core_rear_kind "$pid") || { exec 7>&-; return 1; }
+        if [ "$kind" = current ]; then
             core_permitted rear-wake && core_rear_ready || { exec 7>&-; return 0; }
-            core_rear_receipt "${directory##*/}" || { exec 7>&-; return 1; }
             exec 7>&-; native_status rear-wake display ready verified-existing-daemon; return 0
         fi
+        core_rear_cleanup_locked || { exec 7>&-; return 1; }
+        # Do not race a still-running getevent owner after a reviewed migration.
+        while [ -d "$PROC/$pid" ] && [ "$count" -lt 20 ]; do count=$((count + 1)); sleep 0.1; done
+        if [ -d "$PROC/$pid" ]; then
+            exec 7>&-; native_status rear-wake display pending previous-daemon-stopping; return 0
+        fi
+    fi
+    # Existing unleased or customized owners remain intact. Do not duplicate
+    # their raw input listener, adopt them or terminate them by class name.
+    for directory in "$PROC"/[0-9]*; do
+        if core_rear_process "${directory##*/}"; then
+            exec 7>&-; native_status rear-wake display skipped unowned-daemon-preserved; return 0
+        fi
     done
+    count=0
     while [ "$count" -lt 30 ]; do
         core_permitted rear-wake && core_rear_ready || { exec 7>&-; return 0; }
         count=$((count + 1))
-        "$BB" nohup /system_ext/bin/rear-display-wake >> "$MODDIR/runtime.log" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+        (export CLASSPATH="$MODDIR/rear-wake.jar"
+         exec "$BB" nohup /system/bin/app_process /system/bin io.github.hyperosavd.RearDisplayWake) >> "$MODDIR/runtime.log" 2>&1 < /dev/null 7>&- 8>&- 9>&- &
         pid=$!; sleep 2
-        if core_rear_owned "$pid"; then
+        if [ "$(core_rear_kind "$pid")" = current ]; then
             core_rear_receipt "$pid" || { exec 7>&-; return 1; }
             if ! core_permitted rear-wake; then core_rear_cleanup_locked; exec 7>&-; return 0; fi
             exec 7>&-; native_status rear-wake display ready verified-started-daemon; return 0
