@@ -28,6 +28,7 @@ RETURN_VOID = bytes.fromhex('0e000000')
 SCENE_CLASS = 'Lcom/miui/server/SceneContextCollector;'
 SCENE_METHOD = SCENE_CLASS + '->readBackShellTemp()I'
 UNAVAILABLE_BOARD = bytes.fromhex('12f0' + '0000' * 5)
+MULTIDEX_SOURCE = 'a15133a28eb0d336832957908aa3461f76dab679c7be2ed0809dabdd789dc941'
 
 # Share input identities and archive layout with the prerequisite producer.
 # Keep its frozen receipts unchanged; register only these new derivatives.
@@ -53,7 +54,7 @@ for _source, _extra in (
                   (17184439, '1a00b32e7110111000000a00', '12f000000000000000000000'),
                   (20737164, 'e2e43050', '12ac5110')),
     }),
-    ('a15133a28eb0d336832957908aa3461f76dab679c7be2ed0809dabdd789dc941', {
+    (MULTIDEX_SOURCE, {
         'after': '3fe9549794c29da738574f9b17da496f95e7a6408dcf5db5a82d5499872075a6',
         'dex_after': '525e189c7bca1df00fc3e6b6e250f3b39ba69878f6e29c82469b77c7fc3fde4d',
         'code_offset': 1818852, 'code_header': (6, 3, 2, 1, 4056019, 68),
@@ -74,6 +75,31 @@ for _source, _extra in (
         'dex_before': _input['dex_after'], **_extra,
     }
 del _source, _extra, _input
+
+# Core15's classes2 monitor result remains a frozen producer output. The
+# independent scene collector is in classes.dex on this audited archive;
+# register a successor edge instead of reinterpreting the old producer.
+_monitor = RECIPES[UNIPERF_RECIPES[MULTIDEX_SOURCE]['after']]
+SCENE_RECIPES = {
+    _monitor['after']: {
+        'after': 'd756234045b02391c94a3eaa22c9a836a9781760994c17a54a97d6e4d7f05505',
+        'size': _monitor['size'], 'count': _monitor['count'], 'member': 'classes.dex',
+        'dex_magic': b'dex\n039\0', 'dex_offset': 44, 'dex_size': 12063412,
+        'dex_before': '45396ae38e9cae4dbf44581826895d621765814914d9d3fe5a517b8c31d08172',
+        'dex_after': '34c6e1cacf10da9f5b28b63c55aa7f378a80ce08de867774a18592a8e9c66799',
+        'preserved_member': _monitor['member'], 'preserved_sha256': _monitor['dex_after'],
+        'code_offset': 6686008, 'code_header': (3, 1, 1, 0, 7878545, 22), 'method_id': 60553,
+        'body_before': '233fe4e13a30fc3e45f1df2ede714dcd5085f71bf6446ad65ae7329c99317556',
+        'body_after': 'deb6cf074ab8b395abe9eb2b9d09d7fe624689f1224660e5a094429bf8ee16a8',
+        'original': '1a00d630711090ec00000a00',
+        'sites': ((14, '0459774a', '04424150'),
+                  (52, '40385ac937c62e7479bf93124188b5e6755c363c2160d7a6',
+                   '76375ba3bd92428fd79ab1d10ab1a91b977090ef6a560c98'),
+                  (6686068, '1a00d630711090ec00000a00', '12f000000000000000000000'),
+                  (19634666, '0459774a', '04424150')),
+    },
+}
+del _monitor
 
 
 def _sha(data):
@@ -232,7 +258,8 @@ def recipe_receipt(before):
 
 
 def catalog_recipes():
-    return tuple(recipe_receipt(before) for before in RECIPES)
+    return (tuple(recipe_receipt(before) for before in RECIPES) +
+            tuple(scene_recipe_receipt(before) for before in SCENE_RECIPES))
 
 
 def receipt(data):
@@ -240,12 +267,86 @@ def receipt(data):
     return recipe_receipt(select_recipe(data)[0])
 
 
-def patch(source, destination):
+def select_scene_recipe(data):
+    """Keep successor selection distinct from the frozen monitor producer."""
+    digest = _sha(data) if isinstance(data, (bytes, bytearray)) else data
+    for before, rule in SCENE_RECIPES.items():
+        if digest in (before, rule['after']):
+            return before, rule, digest != before
+    raise RuntimeError('Unsupported thermal scene framework JAR SHA-256: ' + str(digest))
+
+
+def scene_audit(data):
+    if not isinstance(data, (bytes, bytearray)):
+        raise RuntimeError('Unsupported thermal scene framework JAR input.')
+    data = bytes(data)
+    _, rule, patched = select_scene_recipe(data)
+    if (len(data) != rule['size'] or _stored_dex_layout(data, rule['member'], rule['count']) !=
+            (rule['dex_offset'], rule['dex_size'], rule['sites'][0][0], rule['sites'][-1][0])):
+        raise RuntimeError('Unexpected thermal scene unsigned ZIP layout.')
+    dex = data[rule['dex_offset']:rule['dex_offset'] + rule['dex_size']]
+    if (dex[:8] != rule['dex_magic']
+            or _unpack(dex, 32, '<III') != (rule['dex_size'], 112, 0x12345678)
+            or _sha(dex) != rule['dex_after' if patched else 'dex_before']
+            or dex[12:32] != hashlib.sha1(dex[32:]).digest()
+            or _unpack(dex, 8, '<I')[0] != zlib.adler32(dex[12:]) & 0xffffffff):
+        raise RuntimeError('Unexpected thermal scene DEX checksum/header.')
+    code = _method(dex, rule, scene=True)
+    body = dex[code + 16:code + 16 + rule['code_header'][5] * 2]
+    if (_unpack(dex, code, '<4H2I') != rule['code_header']
+            or _sha(body) != rule['body_after' if patched else 'body_before']
+            or body[:12] != (UNAVAILABLE_BOARD if patched else bytes.fromhex(rule['original']))):
+        raise RuntimeError('Unexpected thermal scene fallback body.')
+    # Prove the already-audited monitor and Uniperf DEX stays intact through
+    # this separate member edit, not merely that the JAR has a known path.
+    offset, size, _, _ = _stored_dex_layout(data, rule['preserved_member'], rule['count'])
+    if _sha(data[offset:offset + size]) != rule['preserved_sha256']:
+        raise RuntimeError('Thermal scene successor changed its prerequisite DEX.')
+    for offset, original, replacement in rule['sites']:
+        expected = bytes.fromhex(replacement if patched else original)
+        if data[offset:offset + len(expected)] != expected:
+            raise RuntimeError('Unexpected thermal scene canonical patch site.')
+    return patched
+
+
+def scene_patch_bytes(data):
+    if scene_audit(data):
+        return bytes(data)
+    _, rule, _ = select_scene_recipe(data)
+    output = bytearray(data)
+    for offset, _, replacement in rule['sites']:
+        value = bytes.fromhex(replacement)
+        output[offset:offset + len(value)] = value
+    result = bytes(output)
+    if len(result) != len(data) or _sha(result) != rule['after'] or not scene_audit(result):
+        raise RuntimeError('Thermal scene deterministic derivative mismatch.')
+    return result
+
+
+def scene_recipe_receipt(before):
+    if before not in SCENE_RECIPES:
+        raise RuntimeError('Unsupported thermal scene receipt source.')
+    rule = SCENE_RECIPES[before]
+    return {'schema': 1, 'id': 'thermal-board-scene-capability-v1', 'path': PATH,
+            'format': 'framework-jar', 'before': before, 'after': rule['after'], 'size': rule['size'],
+            'dex_before': rule['dex_before'], 'dex_after': rule['dex_after'], 'methods': [SCENE_METHOD],
+            'requires': 'ranchu-without-board-temperature-node', 'absent_node': NODE,
+            'sites': [{'offset': offset, 'before': original, 'after': replacement,
+                       **({'method': SCENE_METHOD} if offset == rule['dex_offset'] + rule['code_offset'] + 16 else {})}
+                      for offset, original, replacement in rule['sites']]}
+
+
+def scene_receipt(data):
+    scene_audit(data)
+    return scene_recipe_receipt(select_scene_recipe(data)[0])
+
+
+def patch(source, destination, scene=False):
     """Publish exclusively without replacing factory or customized content."""
     source, destination = Path(source), Path(destination)
     if source.resolve() == destination.resolve():
         raise RuntimeError('Keep the factory thermal JAR and derivative separate.')
-    output = patch_bytes(source.read_bytes())
+    output = (scene_patch_bytes if scene else patch_bytes)(source.read_bytes())
 
     def verify_existing():
         info = destination.lstat()
@@ -276,5 +377,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path)
     parser.add_argument('destination', type=Path)
+    parser.add_argument('--scene', action='store_true', help='Apply only the independent audited scene successor.')
     args = parser.parse_args()
-    print(patch(args.source, args.destination))
+    print(patch(args.source, args.destination, scene=args.scene))

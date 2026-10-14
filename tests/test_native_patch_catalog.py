@@ -67,8 +67,8 @@ class NativePatchCatalogTests(unittest.TestCase):
         self.assertEqual(data, native.dump_catalog())
         self.assertEqual(json.loads(data), self.value)
         self.assertEqual(native.validate_catalog(self.value), self.value)
-        self.assertEqual(len(self.value['profiles']), 32)
-        self.assertEqual(len(self.value['targets']), 23)
+        self.assertEqual(len(self.value['profiles']), 34)
+        self.assertEqual(len(self.value['targets']), 24)
         self.assertEqual(set(row['feature'] for row in self.value['profiles']), native.FEATURES)
         self.assertEqual([row['id'] for row in self.value['profiles']],
                          sorted(row['id'] for row in self.value['profiles']))
@@ -305,8 +305,9 @@ class NativePatchCatalogTests(unittest.TestCase):
         import patch_qti_perf as qti
         import patch_uniperf as uniperf
         import patch_bufferqueue_perf as bufferqueue
+        import patch_perfflinger as perfflinger
         rows={row['before']:row for row in self.value['profiles'] if row['feature']=='perf-hardware'}
-        sources=(*qti.catalog_recipes(),*uniperf.catalog_recipes(),*bufferqueue.catalog_recipes())
+        sources=(*qti.catalog_recipes(),*uniperf.catalog_recipes(),*bufferqueue.catalog_recipes(),*perfflinger.catalog_recipes())
         self.assertEqual(set(rows),{source['before'] for source in sources})
         for source in sources:
             row=rows[source['before']]
@@ -314,8 +315,8 @@ class NativePatchCatalogTests(unittest.TestCase):
             self.assertEqual(row['sites'],[[site['offset'],site['before'],site['after']] for site in sorted(source['sites'],key=lambda item:item['offset'])])
             self.assertEqual(row['legacy'],[])
         targets=[row for row in self.value['targets'] if row['feature']=='perf-hardware']
-        self.assertEqual({row['path'] for row in targets},{qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE})
-        for source in (qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE):
+        self.assertEqual({row['path'] for row in targets},{qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE,perfflinger.PATH})
+        for source in (qti.NATIVE,uniperf.PATH,uniperf.MIUI_SERVICES,bufferqueue.NATIVE,perfflinger.PATH):
             def target(value):return next(row for row in value['targets'] if row['path']==source)
             for change in ({'phase':'late'},{'kind':'app','path':'','package':'com.miui.home'},
                            {'path':'/system_ext/lib64/custom.so','library':'custom.so'},

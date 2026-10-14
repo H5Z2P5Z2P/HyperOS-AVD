@@ -153,9 +153,10 @@ def validate_catalog(value):
                 raise RuntimeError('Unsafe display metadata consumer target.')
         if row['feature'] == 'perf-hardware':
             from patch_bufferqueue_perf import NATIVE as BUFFERQUEUE
+            from patch_perfflinger import PATH as PERF_FLINGER
             from patch_qti_perf import NATIVE as QTI
             from patch_uniperf import MIUI_SERVICES, PATH
-            if (row['kind'] != 'system' or path not in (QTI, PATH, MIUI_SERVICES, BUFFERQUEUE) or row['phase'] != 'early'
+            if (row['kind'] != 'system' or path not in (QTI, PATH, MIUI_SERVICES, BUFFERQUEUE, PERF_FLINGER) or row['phase'] != 'early'
                     or row['library'] != PurePosixPath(path).name or package != ''):
                 raise RuntimeError('Unsafe proprietary performance patch target.')
         if row['kind'] == 'system':
@@ -209,6 +210,7 @@ def catalog():
     import patch_bufferqueue_perf as bufferqueue
     import patch_display_metadata as metadata
     import patch_thermal_capability as thermal
+    import patch_perfflinger as perfflinger
     import patch_display_brightness as brightness
 
     profiles = []
@@ -247,7 +249,8 @@ def catalog():
         profiles.append(_profile('rear-input-' + recipe['before'][:12], 'rear-input',
                                  recipe['before'], recipe['after'],
                                  [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
-    for producer, label in ((qti, 'qti-perf'), (uniperf, 'uniperf'), (bufferqueue, 'bufferqueue-perf')):
+    for producer, label in ((qti, 'qti-perf'), (uniperf, 'uniperf'), (bufferqueue, 'bufferqueue-perf'),
+                            (perfflinger, 'perfflinger')):
         for recipe in producer.catalog_recipes():
             profiles.append(_profile(label + '-' + recipe['before'][:12], 'perf-hardware',
                                      recipe['before'], recipe['after'],
@@ -277,6 +280,7 @@ def catalog():
         _target('perf-hardware', 'early', uniperf.PATH),
         _target('perf-hardware', 'early', uniperf.MIUI_SERVICES),
         _target('perf-hardware', 'early', bufferqueue.NATIVE),
+        _target('perf-hardware', 'early', perfflinger.PATH),
         _target('thermal-monitor', 'early', thermal.PATH),
         *[_target('flutter', 'late', package=package,
                   library=PurePosixPath(flutter_targets.SYSTEM_LIB).name)
