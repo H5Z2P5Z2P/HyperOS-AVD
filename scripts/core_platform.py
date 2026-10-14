@@ -206,17 +206,50 @@ def migrate_serial(root, config, guard, legacy):
     return {'status': 'pending', 'reason': 'first-boot-identity'}
 
 
+def image_guard(files, directory, checksum):
+    """Verify image pins, retaining only authenticated early Core derivatives.
+
+    The installed runtime owns the chain and capability rules. Source its
+    verified definitions only when an original boot pin has an owned overlay;
+    host consumers must not duplicate or broaden that catalog.
+    """
+    from apply_native_compat import PENDING
+    commands = [module_guard(directory, checksum), 'core_pin_runtime_loaded=false']
+    for row in files['image.tsv'].splitlines():
+        kind, path, expected = row.split('|')
+        quoted = shlex.quote(path)
+        failure = shlex.quote('Core image prerequisite is unavailable or changed: ' + path)
+        commands.append(f'''core_pin_failure() {{ printf '%s\\n' {failure} >&2; exit 1; }}
+[ -f {quoted} ] && [ ! -L {quoted} ] || core_pin_failure
+core_pin_inode=$("$BB" stat -c %d:%i {quoted}) || core_pin_failure
+core_pin_actual=$("$BB" sha256sum {quoted} | "$BB" cut -d ' ' -f 1)
+if [ "$core_pin_actual" != {expected} ]; then
+    [ {shlex.quote(kind)} = boot ] || core_pin_failure
+    if [ "$core_pin_runtime_loaded" != true ]; then
+        MODDIR={shlex.quote(directory)}
+        HYPEROS_NATIVE_BB=$BB
+        HYPEROS_NATIVE_PROC=/proc
+        HYPEROS_NATIVE_PACKAGES_XML=/data/system/packages.xml
+        HYPEROS_CORE_STATE={STATE}
+        HYPEROS_CORE_SYS=/sys
+        HYPEROS_CORE_PENDING={PENDING}
+        . "$MODDIR/runtime.sh"
+        . "$MODDIR/platform.sh"
+        core_pin_runtime_loaded=true
+    fi
+    core_reviewed_native_derivative '{path}' {expected} "$core_pin_actual" || core_pin_failure
+fi
+[ -f {quoted} ] && [ ! -L {quoted} ] &&
+    [ "$("$BB" stat -c %d:%i {quoted})" = "$core_pin_inode" ] || core_pin_failure''')
+    return '\n'.join(commands)
+
+
 def configure(root, config, context, directory, checksum):
     """Publish state only after Core assets and image files are authenticated."""
     files = context_files(context)
     guard = module_guard(directory, checksum)
     # Source pin verification precedes any persistent state or legacy mutation.
-    commands = [guard]
-    for row in files['image.tsv'].splitlines():
-        _, path, expected = row.split('|')
-        commands.append(f'''[ -f {path} ] && [ ! -L {path} ] || exit 1
-[ "$("$BB" sha256sum {path} | "$BB" cut -d ' ' -f 1)" = {expected} ] || exit 1''')
-    root(config, '\n'.join(commands))
+    root(config, image_guard(files, directory, checksum))
     # An OTA may replace valid prior image defaults. Unknown local state is
     # not a migration receipt and must never be overwritten opportunistically.
     previous_json = read_record(root, config, STATE + '/image.json')

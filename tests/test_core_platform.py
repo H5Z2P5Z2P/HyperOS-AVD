@@ -875,6 +875,7 @@ class CoreMigrationShellTests(CorePlatformShellTests):
         self.image = self.root / 'system/build.prop'; self.image.parent.mkdir()
         self.image.write_text('ro.product.model=Future Xiaomi\n')
         self.context = {'schema': 1, 'identity_sources': [{'path': '/system/build.prop', 'sha256': platform.digest(self.image.read_bytes())}], 'rear': None}
+        self.guest_paths = {'/system/build.prop': self.image}
 
     def guest(self, config, command):
         command = command.replace('/data/adb/ksu/bin/busybox', str(self.bb))
@@ -882,12 +883,153 @@ class CoreMigrationShellTests(CorePlatformShellTests):
         command = command.replace('/data/adb', str(self.root / 'data'))
         command = re.sub(r'(?<=\s)/data(?=[\s);]|$)', str(self.android_data), command)
         # Translate shell path operands, preserving quoted context bytes.
-        command = re.sub(r'(?<=\s)/system/build\.prop(?=[\s);]|$)', str(self.image), command)
+        for original, actual in self.guest_paths.items():
+            command = re.sub(r'(?<=\s)' + re.escape(original) + r'(?=[\s);]|$)', str(actual), command)
+        command = command.replace('HYPEROS_NATIVE_PROC=/proc', 'HYPEROS_NATIVE_PROC=' + str(self.proc))
         result = subprocess.run(['sh', '-c', 'set -e\n' + command], env=self.environment,
                                 capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError('Local authenticated guard rejected unsafe state: ' + result.stderr)
         return result.stdout.strip()
+
+    def image_derivative(self, capability='return 0', rear=False):
+        """Use real chain/mount parsing with disposable content and capability."""
+        self.pin_path = '/system/framework/services.jar' if rear else '/system_ext/framework/miui-services.jar'
+        self.pin_file = self.root / Path(self.pin_path).name
+        self.pin_file.write_bytes(b'Final authenticated framework fixture.\n')
+        self.pin_before = platform.digest(b'Original immutable framework fixture.\n')
+        self.pin_middle = platform.digest(b'First audited framework derivative.\n')
+        self.pin_after = platform.digest(self.pin_file.read_bytes())
+        self.guest_paths[self.pin_path] = self.pin_file
+        self.environment['HYPEROS_NATIVE_TEST_FILES'] = json.dumps({self.pin_path: str(self.pin_file)})
+        (self.owner / 'cache').mkdir(); (self.owner / 'state').mkdir()
+        features = ('rear-input', 'display-brightness') if rear else ('perf-hardware', 'thermal-monitor')
+        (self.owner / 'targets.tsv').write_text(''.join(
+            f'early|system|{feature}|{self.pin_path}||{Path(self.pin_path).name}\n' for feature in features))
+        prefix = features[0] if rear else 'uniperf'
+        (self.owner / 'profiles.tsv').write_text(
+            f'{self.pin_before}|{self.pin_middle}||{features[0]}|{prefix}-{self.pin_before[:12]}\n'
+            f'{self.pin_middle}|{self.pin_after}||{features[1]}|{features[1]}-{self.pin_middle[:12]}\n')
+        # Hardware capability is the only simulated function. The complete
+        # catalog parser, canonical asset check and PID1 ownership stay real.
+        with (self.owner / 'runtime.sh').open('a') as output:
+            output.write('\nnative_eligible() { ' + capability + '; }\n')
+        (self.proc / '1/mountinfo').write_text(
+            f'40 1 253:1 {self.owner}/cache/trusted.jar {self.pin_path} ro - ext4 /dev/block/test rw\n')
+        self.refresh_owner_checksums()
+        return {'image.tsv': f'boot|{self.pin_path}|{self.pin_before}\n'}
+
+    def refresh_owner_checksums(self):
+        rows = (self.owner / 'SHA256SUMS').read_text().splitlines()
+        data = ''.join(platform.digest((self.owner / line.split(None, 1)[1]).read_bytes()) +
+                       '  ' + line.split(None, 1)[1] + '\n' for line in rows)
+        (self.owner / 'SHA256SUMS').write_text(data)
+        self.checksum = platform.digest(data)
+
+    def check_image_pins(self, files):
+        return self.guest({}, platform.image_guard(
+            files, '/data/adb/modules/hyperos_avd_native_compat', self.checksum))
+
+    def test_host_image_pins_reuse_authenticated_runtime_chain_without_changing_defaults(self):
+        files = self.image_derivative()
+        self.check_image_pins(files)
+        (self.owner / 'features.disabled').write_text('perf-hardware\nthermal-monitor\n')
+        self.check_image_pins(files)
+        self.assertFalse((self.root / 'persistent/image.tsv').exists())
+        self.assertEqual(files['image.tsv'], f'boot|{self.pin_path}|{self.pin_before}\n')
+        self.assertEqual(self.pin_file.read_bytes(), b'Final authenticated framework fixture.\n')
+
+    def test_host_original_image_pin_does_not_require_derivative_capability(self):
+        files = self.image_derivative('return 1')
+        files['image.tsv'] = f'boot|{self.pin_path}|{self.pin_after}\n'
+        (self.proc / '1/mountinfo').write_text('')
+        self.check_image_pins(files)
+
+    def test_host_rear_input_and_brightness_use_the_same_audited_consumer(self):
+        files = self.image_derivative(rear=True)
+        self.check_image_pins(files)
+        self.assertFalse((self.root / 'persistent/image.tsv').exists())
+
+    def test_host_derivative_does_not_bypass_module_lifecycle(self):
+        files = self.image_derivative()
+        pending = self.root / 'data/modules_update/hyperos_avd_native_compat'
+        pending.parent.mkdir()
+        for marker in (self.owner / 'disable', self.owner / 'remove', pending):
+            with self.subTest(marker=marker.name):
+                marker.touch()
+                with self.assertRaises(RuntimeError):
+                    self.check_image_pins(files)
+                marker.unlink()
+
+    def test_host_derivative_rejects_foreign_mount_namespace_and_missing_capability(self):
+        files = self.image_derivative('[ ! -e "$MODDIR/unsupported-fixture" ]')
+        mountinfo = self.proc / '1/mountinfo'; original_mount = mountinfo.read_text()
+        foreign = self.root / 'foreign.jar'; foreign.write_text('Unowned namespace content\n')
+        for mode in ('foreign-mount', 'wrong-namespace', 'capability'):
+            with self.subTest(mode=mode):
+                if mode == 'foreign-mount':
+                    mountinfo.write_text(original_mount.replace(str(self.owner / 'cache'), '/foreign/cache'))
+                elif mode == 'wrong-namespace':
+                    self.environment['HYPEROS_NATIVE_TEST_FILES'] = json.dumps({self.pin_path: str(foreign)})
+                else:
+                    (self.owner / 'unsupported-fixture').touch()
+                with self.assertRaisesRegex(RuntimeError, 'Core image prerequisite.*miui-services.jar'):
+                    self.check_image_pins(files)
+                mountinfo.write_text(original_mount)
+                self.environment['HYPEROS_NATIVE_TEST_FILES'] = json.dumps({self.pin_path: str(self.pin_file)})
+                (self.owner / 'unsupported-fixture').unlink(missing_ok=True)
+
+    def test_host_unknown_bytes_aliases_and_nonboot_derivatives_are_preserved(self):
+        files = self.image_derivative()
+        original = self.pin_file.read_bytes()
+        for mode in ('unknown', 'alias', 'identity', 'rear'):
+            with self.subTest(mode=mode):
+                current = files.copy()
+                if mode == 'unknown':
+                    self.pin_file.write_text('Unknown customized framework\n')
+                elif mode == 'alias':
+                    target = self.root / 'aliased.jar'; target.write_bytes(original)
+                    self.pin_file.unlink(); self.pin_file.symlink_to(target)
+                else:
+                    current['image.tsv'] = current['image.tsv'].replace('boot|', mode + '|')
+                with self.assertRaisesRegex(RuntimeError, 'Core image prerequisite.*miui-services.jar'):
+                    self.check_image_pins(current)
+                if self.pin_file.is_symlink():
+                    self.pin_file.unlink()
+                self.pin_file.write_bytes(original)
+
+    def test_host_derivative_rejects_wrong_scope_ambiguous_chain_and_tampered_controls(self):
+        files = self.image_derivative()
+        targets, profiles = self.owner / 'targets.tsv', self.owner / 'profiles.tsv'
+        original_targets, original_profiles = targets.read_text(), profiles.read_text()
+        for mode in ('late', 'foreign-target', 'ambiguous', 'tampered-runtime'):
+            with self.subTest(mode=mode):
+                if mode == 'late':
+                    targets.write_text(original_targets.replace('early|', 'late|'))
+                elif mode == 'foreign-target':
+                    targets.write_text(original_targets.replace('thermal-monitor|', 'unreviewed|'))
+                elif mode == 'ambiguous':
+                    profiles.write_text(original_profiles + original_profiles.splitlines(True)[0])
+                else:
+                    with (self.owner / 'runtime.sh').open('a') as output:
+                        output.write('\n# Unauthenticated local customization\n')
+                if mode != 'tampered-runtime':
+                    self.refresh_owner_checksums()
+                with self.assertRaises(RuntimeError):
+                    self.check_image_pins(files)
+                targets.write_text(original_targets); profiles.write_text(original_profiles)
+                self.refresh_owner_checksums()
+
+    def test_host_derivative_rejects_current_inode_replacement_during_capability_check(self):
+        replacement = self.root / 'replacement.jar'
+        files = self.image_derivative(
+            'if [ -f ' + shlex.quote(str(replacement)) + ' ]; then mv ' +
+            shlex.quote(str(replacement)) + ' ' + shlex.quote(str(self.root / 'miui-services.jar')) + '; fi; return 0')
+        replacement.write_bytes(self.pin_file.read_bytes())
+        original_inode = self.pin_file.stat().st_ino
+        with self.assertRaisesRegex(RuntimeError, 'Core image prerequisite.*miui-services.jar'):
+            self.check_image_pins(files)
+        self.assertNotEqual(self.pin_file.stat().st_ino, original_inode)
 
     def navigation(self):
         import apply_navigation_fix as nav
