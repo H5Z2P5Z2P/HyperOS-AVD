@@ -1,6 +1,6 @@
 id=hyperos_avd_native_compat
 name=HyperOS AVD Core
-version=16
-versionCode=16
+version=18
+versionCode=18
 author=HyperOS-AVD
 description=Unified verified native, identity, display and kernel capability compatibility

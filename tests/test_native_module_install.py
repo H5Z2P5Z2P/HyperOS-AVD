@@ -447,7 +447,7 @@ class NativeModuleInstallTests(unittest.TestCase):
         for feature, controls in record['policy_controls'].items():
             self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
             self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
-        self.assertEqual(json.loads(self.current_manifest())['revision'], 16)
+        self.assertEqual(json.loads(self.current_manifest())['revision'], install.REVISION)
         prop = PROPERTY.rsplit('=', 1)[0] + '=15'
         result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
         self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
@@ -457,6 +457,62 @@ class NativeModuleInstallTests(unittest.TestCase):
         self.assertLess(commands.index(verification), commands.index(stage))
         self.assertEqual(adb.call_count, 1)
         saved['files_sha256']['platform.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
+
+    def test_final_deployed_core16_controls_authenticate_before_verified_cache_reuse(self):
+        previous_bytes = (REPO / 'tests/fixtures/native-compat-v16-final-manifest.json').read_bytes()
+        saved = json.loads(previous_bytes)
+        expected = '78ea6b5cb42eca9a8c22755e2edc4542be9e30a1a6a140e616195b0f7a59f85d'
+        self.assertEqual(hashlib.sha256(previous_bytes).hexdigest(),
+                         '907bfe60a7814493facc12f0fa1a8dff708157d089bf21205451b7b79aff9985')
+        self.assertEqual(saved['revision'], 16)
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 16)
+        self.assertEqual(record['package_sha256'],
+                         '42ccf7b92c0ba41a08ee4b5e63ff806d09827adc29fdb4d4c8ae3263615f3417')
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=16'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous_bytes.decode()})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(expected, verification); self.assertIn(expected, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['runtime.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
+
+    def test_final_deployed_core17_controls_authenticate_before_process_map_batching(self):
+        previous_bytes = (REPO / 'tests/fixtures/native-compat-v17-final-manifest.json').read_bytes()
+        saved = json.loads(previous_bytes)
+        expected = '31e5461352a04a5771e2dbfd2a9ecba429451be03dc5c3d53595eb28d5cd1910'
+        self.assertEqual(hashlib.sha256(previous_bytes).hexdigest(),
+                         '706e655f1a2235dd2284803c68dec063c7b52831bea41c1d78ac4c601e25e687')
+        self.assertEqual(saved['revision'], 17)
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 17)
+        self.assertEqual(record['package_sha256'],
+                         '797ff25ee6b32c212ed6cf38eb7228cc50dd9ae33de61a31c17737bd849cc66e')
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=17'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous_bytes.decode()})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(expected, verification); self.assertIn(expected, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['runtime.sh'] = 'a' * 64
         self.assertIsNone(history.checksum_for(saved))
         result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
         self.assertEqual(result['reason'], 'unreviewed-core-controls')

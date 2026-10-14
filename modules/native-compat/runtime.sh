@@ -446,12 +446,82 @@ native_patch_sites() {
     rm -f "$current"
 }
 
+native_chain_output() {
+    local feature=$1 current=$2 selected before after legacy selected_feature profile chain=0
+    native_word "$feature" && native_hex "$current" || return 1
+    while :; do
+        selected=$(native_profile "$feature" "$current")
+        [ -n "$selected" ] || break
+        [ "$(printf '%s\n' "$selected" | "$BB" wc -l)" -eq 1 ] || return 1
+        IFS='|' read -r before after legacy selected_feature profile <<EOF
+$selected
+EOF
+        native_hex "$before" && native_hex "$after" && native_word "$profile" &&
+            [ "$selected_feature" = "$feature" ] || return 1
+        chain=$((chain + 1)); [ "$chain" -le "$NATIVE_CHAIN_LIMIT" ] && [ "$current" != "$after" ] || return 1
+        current=$after
+    done
+    [ "$chain" -gt 0 ] || return 2
+    printf '%s\n' "$current"
+}
+
+native_cache_directory_safe() {
+    local directory
+    for directory in "$MODDIR" "$MODDIR/cache"; do
+        [ -d "$directory" ] && [ ! -L "$directory" ] && [ "$("$BB" stat -c %u "$directory")" = 0 ] || return 1
+    done
+}
+
+native_cached_output() {
+    local file=$1 expected=$2 mode=$3 owner=$4 context=$5 identity directory module cached_context
+    native_cache_directory_safe && [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    module=$("$BB" stat -c %d:%i "$MODDIR") && directory=$("$BB" stat -c %d:%i "$MODDIR/cache") || return 1
+    identity=$("$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%h:%u:%g "$file") || return 1
+    [ "$("$BB" stat -c %h "$file")" = 1 ] &&
+        [ "$(native_ns 1 "$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%h:%u:%g "$file")" = "$identity" ] &&
+        [ "$("$BB" stat -c %a "$file")" = "$mode" ] &&
+        [ "$("$BB" stat -c %u:%g "$file")" = "$owner" ] &&
+        [ "$(native_hash "$file")" = "$expected" ] || return 1
+    cached_context=$(native_ns 1 /system/bin/ls -Zd "$file" 2>/dev/null |
+        "$BB" awk '{for(i=1;i<=NF;i++) if($i ~ /^u:object_r:[A-Za-z0-9_]+:s0$/) {print $i; exit}}')
+    [ "$cached_context" = "$context" ] && native_cache_directory_safe &&
+        [ -f "$file" ] && [ ! -L "$file" ] &&
+        [ "$("$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%h:%u:%g "$file")" = "$identity" ] &&
+        [ "$("$BB" stat -c %d:%i "$MODDIR")" = "$module" ] &&
+        [ "$("$BB" stat -c %d:%i "$MODDIR/cache")" = "$directory" ]
+}
+
 native_prepare() {
     # Return a content-addressed local copy. Published payload inodes are never
     # truncated, even when an older copy remains mapped by a running process.
     local target=$1 feature=$2 initial=$3 current=$3 selected before after legacy selected_feature profile chain=0
-    local working="$MODDIR/cache/candidate.next.$$" mode owner uid gid extra context cached_context key result
-    [ ! -e "$working" ] && [ ! -L "$working" ] || return 1
+    local working="$MODDIR/cache/candidate.next.$$" mode owner uid gid extra context key result predicted identity
+    native_cache_directory_safe && [ ! -e "$working" ] && [ ! -L "$working" ] || return 1
+    predicted=$(native_chain_output "$feature" "$initial") || return $?
+    native_ns 1 "$BB" test -f "$target" && native_ns 1 "$BB" test ! -L "$target" || return 1
+    identity=$(native_ns 1 "$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%u:%g "$target") || return 1
+    mode=$(native_ns 1 "$BB" stat -c %a "$target") || return 1
+    case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+    owner=$(native_ns 1 "$BB" stat -c %u:%g "$target") || return 1
+    IFS=':' read -r uid gid extra <<EOF
+$owner
+EOF
+    case "$uid:$gid" in *[!0-9:]*) return 1 ;; esac
+    [ -n "$uid" ] && [ -n "$gid" ] && [ -z "$extra" ] || return 1
+    context=$(native_ns 1 /system/bin/ls -Zd "$target" 2>/dev/null |
+        "$BB" awk '{for(i=1;i<=NF;i++) if($i ~ /^u:object_r:[A-Za-z0-9_]+:s0$/) {print $i; exit}}')
+    [ -n "$context" ] || return 1
+    key=$(printf '%s' "$context" | "$BB" tr ':' '_')
+    result="$MODDIR/cache/$predicted-$mode-$uid-$gid-$key.so"
+    if [ -e "$result" ] || [ -L "$result" ]; then
+        # Reuse complete authenticated bytes, never a cached hash result.
+        # Retain fresh source/control checks and all later namespace checks.
+        native_assets && native_cached_output "$result" "$predicted" "$mode" "$owner" "$context" &&
+            [ "$(native_ns_hash 1 "$target")" = "$initial" ] &&
+            [ "$(native_ns 1 "$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%u:%g "$target")" = "$identity" ] || return 1
+        printf '%s\n' "$result"
+        return 0
+    fi
     (set -C; native_ns 1 "$BB" cat "$target" > "$working") || return 1
     [ "$(native_hash "$working")" = "$initial" ] || { rm -f "$working"; return 1; }
     while :; do
@@ -468,28 +538,11 @@ EOF
         [ "$current" != "$after" ] || { rm -f "$working"; return 1; }
         current=$after
     done
-    [ "$chain" -gt 0 ] || { rm -f "$working"; return 2; }
-    mode=$(native_ns 1 "$BB" stat -c %a "$target") || { rm -f "$working"; return 1; }
-    case "$mode" in ''|*[!0-7]*) rm -f "$working"; return 1 ;; esac
-    owner=$(native_ns 1 "$BB" stat -c %u:%g "$target") || { rm -f "$working"; return 1; }
-    IFS=':' read -r uid gid extra <<EOF
-$owner
-EOF
-    case "$uid:$gid" in *[!0-9:]*) rm -f "$working"; return 1 ;; esac
-    [ -n "$uid" ] && [ -n "$gid" ] && [ -z "$extra" ] || { rm -f "$working"; return 1; }
-    context=$(native_ns 1 /system/bin/ls -Zd "$target" 2>/dev/null |
-        "$BB" awk '{for(i=1;i<=NF;i++) if($i ~ /^u:object_r:[A-Za-z0-9_]+:s0$/) {print $i; exit}}')
-    [ -n "$context" ] || { rm -f "$working"; return 1; }
-    key=$(printf '%s' "$context" | "$BB" tr ':' '_')
-    result="$MODDIR/cache/$current-$mode-$uid-$gid-$key.so"
+    [ "$chain" -gt 0 ] && [ "$current" = "$predicted" ] &&
+        [ "$(native_ns 1 "$BB" stat -c %d:%i:%s:%Y:%y:%Z:%z:%f:%u:%g "$target")" = "$identity" ] || { rm -f "$working"; return 1; }
     chown "$owner" "$working" && chmod "$mode" "$working" && chcon "$context" "$working" || { rm -f "$working"; return 1; }
     if [ -e "$result" ] || [ -L "$result" ]; then
-        [ -f "$result" ] && [ ! -L "$result" ] && [ "$(native_hash "$result")" = "$current" ] || { rm -f "$working"; return 1; }
-        cached_context=$(native_ns 1 /system/bin/ls -Zd "$result" 2>/dev/null |
-            "$BB" awk '{for(i=1;i<=NF;i++) if($i ~ /^u:object_r:[A-Za-z0-9_]+:s0$/) {print $i; exit}}')
-        [ "$(native_ns 1 "$BB" stat -c %a "$result")" = "$mode" ] &&
-            [ "$(native_ns 1 "$BB" stat -c %u:%g "$result")" = "$owner" ] &&
-            [ "$cached_context" = "$context" ] || { rm -f "$working"; return 1; }
+        native_cached_output "$result" "$current" "$mode" "$owner" "$context" || { rm -f "$working"; return 1; }
         rm -f "$working"
     else
         mv "$working" "$result" || return 1
@@ -581,7 +634,7 @@ native_mount() {
 }
 
 native_loaded_stale() {
-    local target=$1 identity device inode major minor expected directory
+    local target=$1 identity device inode major minor expected
     identity=$(native_ns 1 "$BB" stat -c '%d %i' "$target" 2>/dev/null) || return 1
     IFS=' ' read -r device inode <<EOF
 $identity
@@ -593,14 +646,28 @@ EOF
     major=$(((device >> 8) & 4095 | (device >> 32) & -4096))
     minor=$((device & 255 | (device >> 12) & -256))
     expected=$(printf '%x:%x' "$major" "$minor")
-    for directory in "$PROC"/[0-9]*; do
-        [ -r "$directory/maps" ] || continue
-        if "$BB" awk -v target="$target" -v expected="$expected" -v inode="$inode" \
-            'function normal(value) {sub(/^0+/, "", value); return value == "" ? "0" : value}
-             $6 == target && $5 != 0 {split($4, parts, ":"); device=normal(parts[1]) ":" normal(parts[2]);
-                 if ($5 != inode || device != expected) found=1} END {exit !found}' "$directory/maps"; then return 0; fi
-    done
-    return 1
+    # Read fresh maps on every call; one awk avoids a process per PID while
+    # preserving disappearing or unreadable processes as skipped observations.
+    "$BB" awk -v target="$target" -v expected="$expected" -v inode="$inode" '
+        function normal(value) {sub(/^0+/, "", value); return value == "" ? "0" : value}
+        BEGIN {
+            for (i=1; i<ARGC; i++) {
+                path=ARGV[i]
+                while ((getline line < path) > 0) {
+                    if (!index(line, target)) continue
+                    count=split(line, fields, " ")
+                    if (count >= 6 && fields[6] == target && fields[5] != 0) {
+                        split(fields[4], parts, ":")
+                        device=normal(parts[1]) ":" normal(parts[2])
+                        if (fields[5] != inode || device != expected) {
+                            close(path); exit 0
+                        }
+                    }
+                }
+                close(path)
+            }
+            exit 1
+        }' "$PROC"/[0-9]*/maps
 }
 
 native_resetprop() {

@@ -27,6 +27,12 @@ BUSYBOX = r'''#!/usr/bin/env python3
 import fcntl, hashlib, json, os, pathlib, stat, subprocess, sys
 args = sys.argv[1:]
 command, args = args[0], args[1:]
+if command == 'awk' and os.environ.get('HYPEROS_NATIVE_TEST_AWK_TRACE'):
+    with open(os.environ['HYPEROS_NATIVE_TEST_AWK_TRACE'], 'a') as output:
+        output.write('awk\n')
+    disappearing = os.environ.get('HYPEROS_NATIVE_TEST_DISAPPEARING_MAPS')
+    if disappearing:
+        pathlib.Path(disappearing).unlink(missing_ok=True)
 metadata = json.loads(pathlib.Path(os.environ['HYPEROS_NATIVE_TEST_METADATA']).read_text())
 if command == 'nsenter':
     args = args[args.index('--') + 1:]
@@ -69,7 +75,8 @@ if command == 'stat' and args[0] in ('-c', '-Lc'):
         form = args[1]
         print(form.replace('%a', format(stat.S_IMODE(value.st_mode), 'o'))
               .replace('%s', str(value.st_size)).replace('%i', str(value.st_ino))
-              .replace('%Y', str(int(value.st_mtime))).replace('%d', str(value.st_dev))
+              .replace('%Y', str(int(value.st_mtime))).replace('%y', str(value.st_mtime_ns))
+              .replace('%Z', str(int(value.st_ctime))).replace('%z', str(value.st_ctime_ns)).replace('%d', str(value.st_dev))
               .replace('%u:%g', owner).replace('%u', owner.split(':')[0])
               .replace('%h', str(value.st_nlink)).replace('%f', format(value.st_mode, 'x')))
     except OSError:
@@ -147,6 +154,9 @@ class NativeModuleRuntimeTests(unittest.TestCase):
                             'HYPEROS_NATIVE_BB': str(self.bb), 'HYPEROS_NATIVE_PROC': str(self.proc),
                             'HYPEROS_NATIVE_PACKAGES_XML': str(self.packages),
                             'HYPEROS_NATIVE_TEST_METADATA': str(self.metadata)}
+        self.file_metadata(self.module, owner='0:0')
+        self.file_metadata(self.module / 'cache', owner='0:0')
+        NativeModuleRuntimeTests.checksums(self)
 
     def file_metadata(self, path, **attributes):
         values = json.loads(self.metadata.read_text()); value = path.stat()
@@ -195,10 +205,14 @@ class NativeModuleRuntimeTests(unittest.TestCase):
                               text=True, capture_output=True, check=check)
 
     def checksums(self):
+        # Match the producer's immutable controls, not later user/runtime state.
+        mutable = {'SHA256SUMS', 'features.disabled', 'disable', 'remove', 'runtime.log',
+                   'runtime.log.next', 'restart-packages.next', 'service.lock.guard'}
         files = sorted(path for path in self.module.rglob('*') if path.is_file()
                        and 'cache' not in path.relative_to(self.module).parts
                        and 'state' not in path.relative_to(self.module).parts
-                       and path.name != 'SHA256SUMS')
+                       and 'service.lock' not in path.relative_to(self.module).parts
+                       and path.name not in mutable)
         (self.module / 'SHA256SUMS').write_text(''.join(
             digest(path.read_bytes()) + '  ' + str(path.relative_to(self.module)) + '\n'
             for path in files))
@@ -396,6 +410,7 @@ print(os.environ['CPU_TEST_COUNT'])''',
         (self.module / 'targets.tsv').write_text(
             f'early|system|composer|{self.target}||libtest.so\n'
             f'early|system|rear-display|{self.target}||libtest.so\n')
+        self.checksums()
         return final
 
     def mount_fixture(self, executable=True, pids=('1',)):
@@ -868,6 +883,153 @@ sleep() {
                 if invalid == 'mode': self.assertEqual(payload.stat().st_mode & 0o777, 0o644)
                 payload.chmod(0o755); self.file_metadata(payload, owner='0:2000', context=label)
 
+    def prepared_cache(self):
+        body = 'native_prepare ' + shlex.quote(str(self.target)) + ' fixture ' + digest(self.original)
+        payload = Path(self.shell(body).stdout.strip())
+        return body, payload
+
+    def test_verified_cache_reuse_does_not_copy_or_patch_candidate_again(self):
+        body, payload = self.prepared_cache()
+        original_inode = payload.stat().st_ino
+        overrides = '''native_patch_sites() { echo unexpected-repatch >&2; return 1; }
+native_ns() {
+    local pid=$1; shift
+    if [ "${2:-}" = cat ]; then echo unexpected-source-copy >&2; return 1; fi
+    "$BB" nsenter -t "$pid" -m -- "$@"
+}
+'''
+        result = self.shell(body, overrides=overrides)
+        self.assertEqual(result.stdout.strip(), str(payload))
+        self.assertEqual(payload.stat().st_ino, original_inode)
+        self.assertEqual(payload.read_bytes(), self.after)
+        self.assertFalse(list((self.module / 'cache').glob('candidate.next.*')))
+
+    def test_verified_cache_reuses_only_the_complete_feature_chain(self):
+        final = self.after.replace(b'tail', b'done')
+        self.profile('second', 'fixture', self.after, final,
+                     [(len(self.after) - 4, b'tail', b'done')], append=True)
+        self.profile('other-feature', 'unrelated', self.original, b'Unrelated terminal',
+                     [(7, b'original', b'patched!')], append=True)
+        self.checksums()
+        body, payload = self.prepared_cache()
+        self.assertEqual(payload.read_bytes(), final)
+        self.assertIn(digest(final), payload.name)
+        result = self.shell(body, overrides='native_patch_sites() { return 1; }')
+        self.assertEqual(result.stdout.strip(), str(payload))
+        self.assertEqual(payload.read_bytes(), final)
+        self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_verified_cache_refuses_same_inode_content_change_after_full_hash(self):
+        body, payload = self.prepared_cache()
+        changed = self.after.replace(b'tail', b'gone')
+        inode = payload.stat().st_ino
+        overrides = '''native_hash() {
+    "$BB" sha256sum "$1" | "$BB" cut -d ' ' -f 1
+    if [ "$1" = ''' + shlex.quote(str(payload)) + ''' ]; then
+        printf '%s' ''' + shlex.quote(changed.decode()) + ' > ' + shlex.quote(str(payload)) + '''
+    fi
+}
+'''
+        result = self.shell(body, check=False, overrides=overrides)
+        self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+        self.assertEqual(payload.stat().st_ino, inode)
+        self.assertEqual(payload.read_bytes(), changed)
+        self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_verified_cache_refuses_unknown_content_alias_and_multiple_links(self):
+        body, payload = self.prepared_cache()
+        original_inode = payload.stat().st_ino
+        for mode in ('content', 'symlink', 'hardlink'):
+            with self.subTest(mode=mode):
+                original_inode = payload.stat().st_ino
+                other = self.root / 'external-cache'
+                if mode == 'content': payload.write_bytes(b'Unknown customized published payload')
+                elif mode == 'symlink':
+                    other.write_bytes(self.after); payload.unlink(); payload.symlink_to(other)
+                else: os.link(payload, other)
+                before = payload.read_bytes()
+                result = self.shell(body, check=False)
+                self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+                self.assertEqual(payload.read_bytes(), before)
+                self.assertEqual(self.target.read_bytes(), self.original)
+                self.assertFalse(list((self.module / 'cache').glob('candidate.next.*')))
+                if mode == 'symlink':
+                    self.assertTrue(payload.is_symlink()); payload.unlink(); payload.write_bytes(self.after)
+                elif mode == 'hardlink':
+                    self.assertEqual(payload.stat().st_ino, original_inode)
+                    other.unlink()
+                else:
+                    self.assertEqual(payload.stat().st_ino, original_inode)
+                    payload.write_bytes(self.after)
+                other.unlink(missing_ok=True)
+
+    def test_verified_cache_refuses_unowned_module_cache_or_directory_alias(self):
+        body, payload = self.prepared_cache()
+        cache = self.module / 'cache'
+        for mode in ('module-owner', 'cache-owner', 'cache-alias'):
+            with self.subTest(mode=mode):
+                if mode == 'module-owner': self.file_metadata(self.module, owner='1000:1000')
+                elif mode == 'cache-owner': self.file_metadata(cache, owner='1000:1000')
+                else:
+                    moved = self.root / 'external-cache'; cache.rename(moved); cache.symlink_to(moved)
+                result = self.shell(body, check=False)
+                self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+                self.assertEqual(payload.read_bytes(), self.after)
+                if mode == 'cache-alias': cache.unlink(); moved.rename(cache)
+                else: self.file_metadata(self.module if mode == 'module-owner' else cache, owner='0:0')
+
+    def test_verified_cache_retains_fresh_source_hash_and_control_integrity(self):
+        body, payload = self.prepared_cache()
+        for mode in ('source', 'sites'):
+            with self.subTest(mode=mode):
+                changed = self.target if mode == 'source' else self.module / 'sites/test/000.before'
+                original = changed.read_bytes(); changed.write_bytes(b'Unrecognized external change')
+                result = self.shell(body, check=False)
+                self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+                self.assertEqual(changed.read_bytes(), b'Unrecognized external change')
+                self.assertEqual(payload.read_bytes(), self.after)
+                self.assertFalse(list((self.module / 'cache').glob('candidate.next.*')))
+                changed.write_bytes(original)
+
+    def test_verified_cache_refuses_source_and_payload_inode_swaps_during_hash(self):
+        body, payload = self.prepared_cache()
+        for mode in ('source', 'payload'):
+            with self.subTest(mode=mode):
+                changed = self.target if mode == 'source' else payload
+                replacement = self.root / 'replacement'; replacement.write_bytes(changed.read_bytes())
+                inode = changed.stat().st_ino
+                overrides = '''native_hash() {
+    "$BB" sha256sum "$1" | "$BB" cut -d ' ' -f 1
+    if [ "$1" = ''' + shlex.quote(str(payload)) + ''' ] && [ -f ''' + shlex.quote(str(replacement)) + ''' ]; then
+        mv ''' + shlex.quote(str(replacement)) + ' ' + shlex.quote(str(changed)) + '''
+    fi
+}
+'''
+                result = self.shell(body, check=False, overrides=overrides)
+                self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+                self.assertNotEqual(changed.stat().st_ino, inode)
+                self.assertEqual(payload.read_bytes(), self.after)
+                self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_verified_cache_refuses_ambiguous_or_cyclic_profile_chains(self):
+        body, payload = self.prepared_cache()
+        profiles = self.module / 'profiles.tsv'; original = profiles.read_bytes()
+        for mode in ('ambiguous', 'cycle'):
+            with self.subTest(mode=mode):
+                if mode == 'ambiguous':
+                    self.profile('ambiguous', 'fixture', self.original, self.after,
+                                 [(7, b'original', b'patched!')], append=True)
+                else:
+                    self.profile('cycle', 'fixture', self.after, self.original,
+                                 [(7, b'patched!', b'original')], append=True)
+                self.checksums()
+                result = self.shell(body, check=False)
+                self.assertNotEqual(result.returncode, 0); self.assertEqual(result.stdout, '')
+                self.assertEqual(payload.read_bytes(), self.after)
+                self.assertEqual(self.target.read_bytes(), self.original)
+                self.assertFalse(list((self.module / 'cache').glob('candidate.next.*')))
+                profiles.write_bytes(original)
+
     def test_legacy_input_with_preexisting_sites_is_supported(self):
         old = self.original.replace(b'original', b'patched!')
         final = old.replace(b'tail', b'done')
@@ -1217,6 +1379,74 @@ sleep() {
         maps.write_text(f'1000-2000 r-xp 00000000 fe:38 123 {self.target}\n')
         self.shell('! native_loaded_stale ' + shlex.quote(str(self.target)), overrides=overrides)
 
+    def test_loaded_map_scan_batches_processes_and_finds_a_late_stale_mapping(self):
+        trace = self.root / 'awk-trace'
+        self.environment['HYPEROS_NATIVE_TEST_AWK_TRACE'] = str(trace)
+        for pid in ('1', '2', '3', '99'):
+            directory = self.proc / pid
+            directory.mkdir(exist_ok=True)
+            (directory / 'maps').write_text(
+                f'1000-2000 r-xp 00000000 00fe:0038 123 {self.target}\n')
+        (self.proc / '99/maps').write_text(
+            f'1000-2000 r-xp 00000000 fe:39 123 {self.target}\n')
+        self.shell('native_loaded_stale ' + shlex.quote(str(self.target)),
+                   overrides='native_ns() { echo "65080 123"; }')
+        self.assertEqual(trace.read_text(), 'awk\n')
+
+    def test_loaded_map_scan_skips_missing_empty_and_unreadable_maps(self):
+        trace = self.root / 'awk-trace'
+        self.environment['HYPEROS_NATIVE_TEST_AWK_TRACE'] = str(trace)
+        (self.proc / '1/maps').write_text('')
+        (self.proc / '2').mkdir()  # No maps file, as with an exiting PID.
+        (self.proc / '3/maps').mkdir(parents=True)  # getline read error.
+        (self.proc / '4').mkdir()
+        (self.proc / '4/maps').symlink_to(self.root / 'absent-maps')
+        (self.proc / '9').mkdir()
+        (self.proc / '9/maps').write_text(
+            f'1000-2000 r-xp 00000000 fe:39 999 {self.target}.other\n'
+            f'1000-2000 r-xp 00000000 00fe:0038 123 {self.target}\n'
+            f'1000-2000 r-xp 00000000 fe:39 0 {self.target}\n')
+        self.shell('! native_loaded_stale ' + shlex.quote(str(self.target)),
+                   overrides='native_ns() { echo "65080 123"; }')
+        self.assertEqual(trace.read_text(), 'awk\n')
+
+    def test_loaded_map_scan_skips_a_permission_denied_maps_file(self):
+        maps = self.proc / '1/maps'
+        maps.write_text(f'1000-2000 r-xp 00000000 fe:39 999 {self.target}\n')
+        maps.chmod(0)
+        if os.access(maps, os.R_OK):
+            self.skipTest('The test process can bypass file read permissions.')
+        self.shell('! native_loaded_stale ' + shlex.quote(str(self.target)),
+                   overrides='native_ns() { echo "65080 123"; }')
+
+    def test_loaded_map_scan_handles_a_pid_disappearing_before_awk_opens_maps(self):
+        trace = self.root / 'awk-trace'
+        disappearing = self.proc / '1/maps'
+        disappearing.write_text(f'1000-2000 r-xp 00000000 fe:39 999 {self.target}\n')
+        self.environment['HYPEROS_NATIVE_TEST_AWK_TRACE'] = str(trace)
+        self.environment['HYPEROS_NATIVE_TEST_DISAPPEARING_MAPS'] = str(disappearing)
+        (self.proc / '99').mkdir()
+        (self.proc / '99/maps').write_text(f'1000-2000 r-xp 00000000 fe:39 123 {self.target}\n')
+        self.shell('native_loaded_stale ' + shlex.quote(str(self.target)),
+                   overrides='native_ns() { echo "65080 123"; }')
+        self.assertFalse(disappearing.exists())
+        self.assertEqual(trace.read_text(), 'awk\n')
+
+    def test_loaded_map_scan_rechecks_namespace_inode_on_each_call(self):
+        identity = self.root / 'namespace-identity'
+        identity.write_text('65080 123\n')
+        (self.proc / '1/maps').write_text(
+            f'1000-2000 r-xp 00000000 00fe:0038 123 {self.target}\n')
+        overrides = 'native_ns() { cat ' + shlex.quote(str(identity)) + '; }'
+        self.shell('! native_loaded_stale ' + shlex.quote(str(self.target)), overrides=overrides)
+        identity.write_text('65080 124\n')
+        self.shell('native_loaded_stale ' + shlex.quote(str(self.target)), overrides=overrides)
+
+    def test_loaded_map_scan_has_no_stale_result_without_readable_processes(self):
+        (self.proc / '1/maps').unlink(missing_ok=True)
+        self.shell('! native_loaded_stale ' + shlex.quote(str(self.target)),
+                   overrides='native_ns() { echo "65080 123"; }')
+
     def test_hwui_preload_policy_is_early_and_requires_verified_output(self):
         self.profile('hwui', 'hwui', self.original, self.after, [(7, b'original', b'patched!')])
         marker = self.root / 'property'
@@ -1490,6 +1720,7 @@ sleep() {
                       for site in source['sites']])
         (self.module / 'targets.tsv').write_text(
             f'early|system|wifi-capabilities|{self.target}||miui-wifi-service.jar\n')
+        self.checksums()
         return self.safe_paths() + '\nnative_privacy_eligible() { return 0; }\n'
 
     def test_actual_wifi_jars_prepare_all_canonical_sites_and_preserve_factory_inode(self):
@@ -1565,6 +1796,7 @@ sleep() {
                       for site in ims.recipe_receipt()['sites']])
         (self.module/'targets.tsv').write_text(f'early|system|vendor-ims|{self.target}||xiaomi-opt-ims.jar\n')
         self.privacy_capability_fixture()
+        self.checksums()
         return self.safe_paths()
 
     def test_vendor_ims_jar_prepares_exact_sites_and_keeps_factory_and_payload_inodes(self):
@@ -1734,6 +1966,7 @@ sleep() {
             self.profile('metadata-'+before[:12],'display-metadata',original,changed,
                          [(site['offset'],bytes.fromhex(site['before']),bytes.fromhex(site['after'])) for site in recipe['sites']])
             (self.module/'targets.tsv').write_text(f'early|system|display-metadata|{self.target}||{self.target.name}\n')
+            self.checksums()
             trace=self.root/'metadata-binds';trace.write_text('')
             overrides=self.safe_paths()+'\nnative_mount() { echo "$5" >> '+shlex.quote(str(trace))+'; cp "$2" "$1"; }\n'
             self.shell('native_reconcile late',overrides=overrides)
@@ -1775,6 +2008,7 @@ sleep() {
         self.profile('perf-'+before[:12],'perf-hardware',original,self.after,
                      [(site['offset'],bytes.fromhex(site['before']),bytes.fromhex(site['after'])) for site in receipt['sites']])
         (self.module/'targets.tsv').write_text(f'early|system|perf-hardware|{self.target}||{self.target.name}\n')
+        self.checksums()
         return before
 
     def test_performance_backends_require_complete_declarations_not_failed_binder(self):
