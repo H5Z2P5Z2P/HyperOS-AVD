@@ -284,5 +284,166 @@ class AppCompatCollectorTests(unittest.TestCase):
         self.assertEqual(list(target.iterdir()), [])
 
 
+class PrebuiltPreparationTests(unittest.TestCase):
+    def setUp(self):
+        import app_compat_catalog as catalog
+        import apply_app_compat as consumer
+        self.catalog, self.consumer = catalog, consumer
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        payload = self.root / 'payload.so'; payload.write_bytes(b'complete audited output')
+        self.payloads = {digest(payload.read_bytes()): payload}
+        first = {'id': 'first', 'feature': 'weather', 'package': 'com.fixture.app',
+                 'default_enabled': True, 'apk_sha256': digest(b'original signed APK'),
+                 'libraries': [{'name': 'libtest.so', 'before': digest(b'input'),
+                                'after': digest(payload.read_bytes())}]}
+        self.previous = [first]
+        self.current = [first, {**first, 'id': 'second', 'apk_sha256': digest(b'another signed APK')}]
+        self.cache = self.root / 'verified-cache'
+        self.cached = self.write_prebuilt(self.cache, self.current)
+        self.workspace = self.root / 'release'
+        self.destination = self.write_prebuilt(self.workspace, self.previous)
+        with zipfile.ZipFile(self.destination / 'app-compat.zip') as archive:
+            old = json.loads(archive.read('manifest.json'))
+        mocked = patch.object(catalog, 'PREVIOUS_MANIFESTS', {digest(catalog.canonical(old)): old})
+        mocked.start(); self.addCleanup(mocked.stop)
+        mocked = patch.object(consumer, 'recipes', return_value=self.current)
+        mocked.start(); self.addCleanup(mocked.stop)
+        self.collect = patch.object(producer, 'collect_payloads', return_value=self.payloads)
+        self.collect_mock = self.collect.start(); self.addCleanup(self.collect.stop)
+
+    def write_prebuilt(self, workspace, recipes):
+        folder = workspace / 'tools/os4-app-compat'; folder.mkdir(parents=True)
+        receipt = self.catalog.package_catalog(folder / 'app-compat.zip', recipes, self.payloads)
+        (folder / 'receipt.json').write_bytes(self.catalog.canonical(receipt))
+        return folder
+
+    def contents(self, folder):
+        return {name: (folder / name).read_bytes() for name in ('app-compat.zip', 'receipt.json')}
+
+    def test_complete_explicit_prebuilt_replaces_reviewed_previous_without_native_caches(self):
+        original = self.contents(self.cached)
+        self.assertEqual(self.consumer.prepare_prebuilt(self.workspace, sdk='/no-ndk',
+            cache_roots=[self.workspace, self.cache]), self.destination)
+        self.assertEqual(self.contents(self.destination), original)
+        self.assertEqual(self.contents(self.cached), original)
+        self.catalog.verify_prebuilt(self.destination, self.current)
+        self.collect_mock.assert_not_called()
+        self.assertEqual(list(self.destination.parent.glob('.app-compat-*')), [])
+
+    def test_absent_destination_reuses_complete_explicit_prebuilt(self):
+        workspace = self.root / 'new-release'
+        result = self.consumer.prepare_prebuilt(workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(result), self.contents(self.cached))
+        self.collect_mock.assert_not_called()
+
+    def test_absent_current_cache_keeps_the_existing_complete_native_producer_path(self):
+        result = self.consumer.prepare_prebuilt(self.workspace, sdk='/no-ndk',
+                                                cache_roots=[self.workspace])
+        self.catalog.verify_prebuilt(result, self.current)
+        self.collect_mock.assert_called_once_with([self.workspace], sdk='/no-ndk')
+
+    def test_unknown_destination_is_preserved_before_cache_copy_or_native_collection(self):
+        (self.destination / 'receipt.json').write_bytes(b'custom receipt')
+        before = self.contents(self.destination)
+        with self.assertRaises((RuntimeError, ValueError)):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(self.destination), before)
+        self.collect_mock.assert_not_called()
+
+    def test_reviewed_previous_with_custom_extra_is_preserved_before_staging(self):
+        extra = self.destination / 'custom-notes.txt'
+        extra.write_bytes(b'user-owned extra content')
+        before = self.contents(self.destination)
+        with patch.object(self.consumer.shutil, 'copyfileobj') as copy, \
+                self.assertRaisesRegex(RuntimeError, 'Unknown files.*preserved'):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(extra.read_bytes(), b'user-owned extra content')
+        self.assertEqual(self.contents(self.destination), before)
+        copy.assert_not_called()
+        self.collect_mock.assert_not_called()
+
+    def test_extra_appearing_during_staging_blocks_previous_directory_replacement(self):
+        import shutil
+        original_copy, before = shutil.copyfileobj, self.contents(self.destination)
+        extra = self.destination / 'new-custom-directory'
+        copied = []
+        def copy(source, output):
+            original_copy(source, output)
+            copied.append(source.name)
+            if len(copied) == 2:
+                extra.mkdir()
+                (extra / 'notes.txt').write_bytes(b'concurrent user content')
+        with patch.object(self.consumer.shutil, 'copyfileobj', side_effect=copy), \
+                self.assertRaisesRegex(RuntimeError, 'Unknown files.*preserved'):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual((extra / 'notes.txt').read_bytes(), b'concurrent user content')
+        self.assertEqual(self.contents(self.destination), before)
+        self.collect_mock.assert_not_called()
+        self.assertEqual(list(self.destination.parent.glob('.app-compat-*')), [])
+
+    def test_current_destination_extra_is_retained_without_any_replacement(self):
+        extra = self.cached / 'custom-notes.txt'
+        extra.write_bytes(b'current archive user notes')
+        before = self.contents(self.cached)
+        self.assertEqual(self.consumer.prepare_prebuilt(self.cache, cache_roots=[self.workspace]), self.cached)
+        self.assertEqual(extra.read_bytes(), b'current archive user notes')
+        self.assertEqual(self.contents(self.cached), before)
+        self.collect_mock.assert_not_called()
+
+    def test_unknown_explicit_cache_is_preserved_and_never_rebuilt_silently(self):
+        (self.cached / 'app-compat.zip').write_bytes(b'unknown cache bytes')
+        source, before = self.contents(self.cached), self.contents(self.destination)
+        with self.assertRaises(RuntimeError):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(self.cached), source)
+        self.assertEqual(self.contents(self.destination), before)
+        self.collect_mock.assert_not_called()
+
+    def test_valid_source_change_after_copy_aborts_before_replacement(self):
+        import shutil
+        original_copy, before = shutil.copyfileobj, self.contents(self.destination)
+        copied = []
+        def copy(source, output):
+            original_copy(source, output)
+            copied.append(source.name)
+            if len(copied) == 2:
+                archive = self.cached / 'app-compat.zip'
+                with zipfile.ZipFile(archive, 'a') as packed:
+                    packed.comment = b'concurrently changed valid canonical archive'
+                receipt = self.catalog.receipt(archive, self.current)
+                (self.cached / 'receipt.json').write_bytes(self.catalog.canonical(receipt))
+                self.catalog.verify_prebuilt(self.cached, self.current)
+        with patch.object(self.consumer.shutil, 'copyfileobj', side_effect=copy), \
+                self.assertRaisesRegex(RuntimeError, 'changed during staging'):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(self.destination), before)
+        self.collect_mock.assert_not_called()
+        self.assertEqual(list(self.destination.parent.glob('.app-compat-*')), [])
+
+    def test_stage_corruption_and_publication_failure_preserve_previous_archive(self):
+        import shutil
+        original_copy, original_rename = shutil.copyfileobj, Path.rename
+        before = self.contents(self.destination)
+        def corrupt(source, output):
+            original_copy(source, output)
+            if source.name.endswith('app-compat.zip'):
+                output.write(b'corrupt staged archive')
+        with patch.object(self.consumer.shutil, 'copyfileobj', side_effect=corrupt), \
+                self.assertRaises(RuntimeError):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(self.destination), before)
+        def rename(path, target):
+            if path.name.startswith('.app-compat-') and not path.name.endswith('.previous'):
+                raise OSError('Publication failed')
+            return original_rename(path, target)
+        with patch.object(Path, 'rename', rename), self.assertRaisesRegex(OSError, 'Publication failed'):
+            self.consumer.prepare_prebuilt(self.workspace, cache_roots=[self.cache])
+        self.assertEqual(self.contents(self.destination), before)
+        self.collect_mock.assert_not_called()
+        self.assertEqual(list(self.destination.parent.glob('.app-compat-*')), [])
+
+
 if __name__ == '__main__':
     unittest.main()

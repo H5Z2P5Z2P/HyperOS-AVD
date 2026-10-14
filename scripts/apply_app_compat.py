@@ -33,22 +33,51 @@ def prepare_prebuilt(workspace, sdk=None, cache_roots=None):
     destination = workspace / 'tools/os4-app-compat'
     catalog = recipes()
     replacing = destination.exists() or destination.is_symlink()
+
+    def previous_destination():
+        verify_previous_prebuilt(destination)
+        if {path.name for path in destination.iterdir()} != {'app-compat.zip', 'receipt.json'}:
+            raise RuntimeError('Unknown files in previous application prebuilt are preserved.')
+
     if replacing:
         try:
             verify_prebuilt(destination, catalog)
         except RuntimeError:
-            verify_previous_prebuilt(destination)
+            previous_destination()
         else:
             return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payloads = collect_payloads(cache_roots or [workspace], sdk=sdk)
+    cached, source_hashes = None, None
+    for workspace_cache in cache_roots or []:
+        candidate = Path(workspace_cache) / 'tools/os4-app-compat'
+        if not (candidate.exists() or candidate.is_symlink()):
+            continue
+        try:
+            verify_prebuilt(candidate, catalog)
+        except RuntimeError:
+            verify_previous_prebuilt(candidate)
+            continue
+        cached = candidate
+        source_hashes = {name: sha256(candidate / name) for name in ('app-compat.zip', 'receipt.json')}
+        break
     with tempfile.TemporaryDirectory(prefix='.app-compat-', dir=destination.parent) as temporary:
         stage = Path(temporary)
-        metadata = package_catalog(stage / 'app-compat.zip', catalog, payloads)
-        (stage / 'receipt.json').write_bytes(canonical(metadata))
+        if cached is None:
+            payloads = collect_payloads(cache_roots or [workspace], sdk=sdk)
+            metadata = package_catalog(stage / 'app-compat.zip', catalog, payloads)
+            (stage / 'receipt.json').write_bytes(canonical(metadata))
+        else:
+            for name in source_hashes:
+                with (cached / name).open('rb') as source, (stage / name).open('xb') as output:
+                    shutil.copyfileobj(source, output)
         verify_prebuilt(stage, catalog)
+        if cached is not None:
+            verify_prebuilt(cached, catalog)
+            if any(sha256(cached / name) != checksum or sha256(stage / name) != checksum
+                   for name, checksum in source_hashes.items()):
+                raise RuntimeError('Verified application prebuilt changed during staging.')
         if replacing:
-            verify_previous_prebuilt(destination)
+            previous_destination()
             backup = stage.parent / (stage.name + '.previous')
             destination.rename(backup)
             try:
