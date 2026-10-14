@@ -677,6 +677,92 @@ class ProducerAndBundleTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b'custom cached output')
             self.assertFalse(list((self.workspace / 'work').glob('.kernelsu-boot-*')))
 
+    def test_zero_filled_host_output_is_normalized_only_after_full_stream_and_lkm_audit(self):
+        import ksu_ramdisk
+        from test_ksu_ramdisk import cpio
+        stack = phone_builder.prepare_kernelsu(self.repo, self.workspace)
+        archive = cpio([(b'kernelsu.ko', stack['lkm'].read_bytes(), {})])
+        canonical = ksu_ramdisk.pack('lz4-legacy', archive)
+        source = self.workspace / 'images/ramdisk.img'
+        for padding in (b'', bytes(4), bytes(128)):
+            with self.subTest(padding=len(padding)):
+                source.write_bytes(b'base ramdisk')
+                produced = canonical + padding
+                if padding:
+                    with self.assertRaises(RuntimeError):
+                        ksu_ramdisk.unpack(produced)
+
+                def build(command, **options):
+                    output = Path(command[command.index('-o') + 1]) / command[command.index('--out-name') + 1]
+                    output.write_bytes(produced)
+
+                with mock.patch.object(phone_builder.subprocess, 'run', side_effect=build):
+                    output = phone_builder.patch_kernelsu_ramdisk(self.workspace, stack)
+                self.assertEqual(output.read_bytes(), canonical)
+                self.assertEqual(source.read_bytes(), canonical)
+                self.assertEqual(ksu_ramdisk.unpack(source.read_bytes()), ('lz4-legacy', archive))
+
+    def test_producer_padding_does_not_allow_truncation_concatenation_or_unknown_lkm(self):
+        import ksu_ramdisk
+        from test_ksu_ramdisk import cpio
+        stack = phone_builder.prepare_kernelsu(self.repo, self.workspace)
+        archive = cpio([(b'kernelsu.ko', stack['lkm'].read_bytes(), {})])
+        canonical = ksu_ramdisk.pack('lz4-legacy', archive)
+        other = cpio([(b'kernelsu.ko', b'unknown module', {})])
+        invalid = (canonical[:-1], canonical + b'\0' * 3,
+                   canonical + bytes(4) + b'nonzero', canonical + canonical,
+                   canonical + bytes(4) + canonical,
+                   ksu_ramdisk.pack('lz4-legacy', other) + bytes(128),
+                   ksu_ramdisk.LZ4_MAGIC + bytes(128))
+        source = self.workspace / 'images/ramdisk.img'
+        source.write_bytes(b'base ramdisk')
+        for produced in invalid:
+            with self.subTest(size=len(produced)):
+                def build(command, **options):
+                    output = Path(command[command.index('-o') + 1]) / command[command.index('--out-name') + 1]
+                    output.write_bytes(produced)
+
+                with mock.patch.object(phone_builder.subprocess, 'run', side_effect=build), \
+                        self.assertRaises(RuntimeError):
+                    phone_builder.patch_kernelsu_ramdisk(self.workspace, stack)
+                self.assertEqual(source.read_bytes(), b'base ramdisk')
+                self.assertFalse(list((self.workspace / 'work').glob('ramdisk-kernelsu-*.img')))
+                self.assertFalse(list((self.workspace / 'work').glob('.kernelsu-boot-*')))
+
+    def test_real_pinned_host_zero_filled_output_keeps_exact_cpio_and_current_lkm(self):
+        import ksu_ramdisk
+        path = ROOT / 'work/formal-release-validation-20261014/ksu-lz4-format-probe/producer.img'
+        if not path.is_file():
+            self.skipTest('Private pinned-host output fixture unavailable; no producer execution attempted.')
+        produced = path.read_bytes()
+        self.assertEqual(hashlib.sha256(produced).hexdigest(),
+                         '8f3d8c512a79f81e284897eba99d299807647eac0dbfc423a541a861921895b1')
+        with self.assertRaises(RuntimeError):
+            ksu_ramdisk.unpack(produced)
+        stack = phone_builder.prepare_kernelsu(self.repo, self.workspace)
+        source = self.workspace / 'images/ramdisk.img'
+        source.write_bytes(b'base ramdisk')
+
+        def build(command, **options):
+            output = Path(command[command.index('-o') + 1]) / command[command.index('--out-name') + 1]
+            output.write_bytes(produced)
+
+        with mock.patch.object(phone_builder.subprocess, 'run', side_effect=build):
+            output = phone_builder.patch_kernelsu_ramdisk(self.workspace, stack)
+        self.assertEqual(output.stat().st_size, 2290636)
+        self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(),
+                         '7ab2ab7c861d842e7022c8bc99d816d03ed333e7d0bf5db5ba37723e89517acf')
+        _, archive = ksu_ramdisk.unpack(output.read_bytes())
+        self.assertEqual(hashlib.sha256(archive).hexdigest(),
+                         '6fa595d97e598a5c2a28b5be6e0f225efe51c85331b95e305c73695fa3510c5e')
+        entries = ksu_ramdisk.parse_cpio(archive)
+        self.assertEqual(len(entries), 32)
+        member = next(entry for entry in entries if entry['name'] == b'kernelsu.ko')
+        audited = patch_kernelsu.audit(archive[member['body']:member['body'] + member['size']])
+        self.assertEqual(audited['receipt'], stack['receipt'])
+        self.assertEqual(source.read_bytes(), output.read_bytes())
+        self.assertEqual(path.read_bytes(), produced)
+
     def test_portable_current_trio_requires_complete_authenticated_cache(self):
         metadata = {'format': 3, 'variant': 'os4-pad'}
         self.assertEqual(package_release.current_kernelsu_paths(self.workspace, metadata), {})

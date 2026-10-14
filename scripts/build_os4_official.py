@@ -85,9 +85,34 @@ def patch_kernelsu_ramdisk(workspace, stack):
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or not 0 < info.st_size < 64 * 1024**2 or archive_digest(original) != before):
             raise RuntimeError('KernelSU ramdisk producer output/input changed unexpectedly.')
-        from ksu_ramdisk import parse_cpio, unpack
+        from ksu_ramdisk import LZ4_MAGIC, MAX_LZ4_BLOCK, MAX_RAMDISK, parse_cpio, unpack
         from patch_kernelsu import audit
-        _, archive = unpack(staged.read_bytes())
+        produced = staged.read_bytes()
+        ramdisk = produced
+        # The pinned host producer can retain the input extent and zero-fill
+        # space after its complete legacy-LZ4 stream. Normalize only that
+        # explicit block boundary; ordinary consumer parsing remains strict.
+        if ramdisk.startswith(LZ4_MAGIC):
+            position, blocks = len(LZ4_MAGIC), 0
+            while position < len(ramdisk):
+                start = position
+                if position + 4 > len(ramdisk):
+                    raise RuntimeError('Truncated KernelSU producer LZ4 header.')
+                size = int.from_bytes(ramdisk[position:position + 4], 'little')
+                position += 4
+                if size == 0:
+                    if not blocks or any(ramdisk[start:]):
+                        raise RuntimeError('Invalid KernelSU producer LZ4 padding.')
+                    ramdisk = ramdisk[:start]
+                    break
+                if (size > MAX_LZ4_BLOCK + MAX_LZ4_BLOCK // 255 + 16
+                        or position + size > len(ramdisk)):
+                    raise RuntimeError('Invalid KernelSU producer LZ4 block.')
+                position += size
+                blocks += 1
+                if blocks > MAX_RAMDISK // MAX_LZ4_BLOCK:
+                    raise RuntimeError('Oversized KernelSU producer LZ4 stream.')
+        _, archive = unpack(ramdisk)
         entries = [entry for entry in parse_cpio(archive) if entry['name'] == b'kernelsu.ko']
         if len(entries) != 1:
             raise RuntimeError('KernelSU producer did not emit one canonical LKM.')
@@ -95,6 +120,8 @@ def patch_kernelsu_ramdisk(workspace, stack):
         loaded = audit(archive[entry['body']:entry['body'] + entry['size']])
         if not loaded['patched'] or loaded['receipt'] != stack['receipt']:
             raise RuntimeError('KernelSU producer did not embed the authenticated quiet LKM.')
+        if ramdisk != produced:
+            staged.write_bytes(ramdisk)
         expected = archive_digest(staged)
 
         def verify_existing():
