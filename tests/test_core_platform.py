@@ -830,6 +830,22 @@ class CoreContextTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             platform.serial_record('unknown')
 
+    def test_active_source_mode_check_uses_portable_octal_digits(self):
+        manifest = json.loads((REPO / 'tests/fixtures/native-compat-v16-final-manifest.json').read_text())
+        guard = platform.active_derivative_guard(manifest)
+        body = guard.split('core_active_sealed() {', 1)[1].split('\n}', 1)[0]
+        script = ('core_active_sealed() {' + body + '\n}\n'
+                  'mode_bb() { printf "%s\\n" "$MODE"; }\nBB=mode_bb\n')
+        script += ('while IFS="|" read -r MODE expected; do\n'
+                   '  if core_active_sealed ignored; then actual=0; else actual=1; fi\n'
+                   '  [ "$actual" = "$expected" ] || exit 1\ndone\n')
+        cases = [(format(value, 'o'), int(bool(value & 0o022))) for value in range(0o10000)]
+        cases += [('0755', 0), ('0644', 0), ('0777', 1), ('', 1), ('755x', 1), ('888', 1), ('77777', 1)]
+        table = ''.join(f'{mode}|{expected}\n' for mode, expected in cases)
+        result = subprocess.run(['sh', '-c', script], input=table, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('$((0$', body)
+
 
 class CoreMigrationShellTests(CorePlatformShellTests):
     """Host-produced guards run against disposable Android-like directories."""
@@ -930,6 +946,46 @@ class CoreMigrationShellTests(CorePlatformShellTests):
         return self.guest({}, platform.image_guard(
             files, '/data/adb/modules/hyperos_avd_native_compat', self.checksum))
 
+    def staged_derivative(self, capability='return 0'):
+        import native_module_history as history
+        files = self.image_derivative(capability)
+        manifest = json.loads((self.owner / 'manifest.json').read_text())
+        # Exercise complete controls on a small synthetic owner. Production
+        # content has hundreds of site files; per-stat Python command doubles
+        # would obscure this guard's actual staged-ownership behavior.
+        retained = {'module.prop', 'runtime.sh', 'platform.sh', 'device-credential.sh',
+                    'tcm-capability.sh', 'profiles.tsv', 'targets.tsv', 'catalog.json'}
+        retained.add(next(name for name in manifest['files_sha256'] if name.startswith('sites/')))
+        for name in set(manifest['files_sha256']) - retained:
+            (self.owner / name).unlink()
+        manifest['files_sha256'] = {name: manifest['files_sha256'][name] for name in retained}
+        # The test host reviews the entire synthetic active package, never
+        # allowing its guest manifest to authorize its own changed catalog.
+        for name in manifest['files_sha256']:
+            manifest['files_sha256'][name] = platform.digest((self.owner / name).read_bytes())
+        (self.owner / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+        controls = {**manifest['files_sha256'],
+                    'manifest.json': platform.digest((self.owner / 'manifest.json').read_bytes())}
+        (self.owner / 'SHA256SUMS').write_text(''.join(checksum + '  ' + name + '\n'
+                                                   for name, checksum in sorted(controls.items())))
+        self.checksum = platform.digest((self.owner / 'SHA256SUMS').read_bytes())
+        record = {'revision': manifest['revision'],
+                  'manifest_sha256': platform.digest((self.owner / 'manifest.json').read_bytes()),
+                  'checksums_sha256': self.checksum}
+        reviewed = patch.object(history, 'REVIEWED', (*history.REVIEWED, record))
+        reviewed.start(); self.addCleanup(reviewed.stop)
+        pending = self.root / 'data/modules_update/hyperos_avd_native_compat'
+        pending.mkdir(parents=True)
+        stage = package_native_module.module_files()
+        for name, body in stage.items():
+            path = pending / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(body)
+        self.pending_checksum = platform.digest(stage['SHA256SUMS'])
+        return files, manifest, pending
+
+    def check_staged_pins(self, files, manifest):
+        return self.guest({}, platform.image_guard(
+            files, '/data/adb/modules_update/hyperos_avd_native_compat', self.pending_checksum, manifest))
+
     def test_host_image_pins_reuse_authenticated_runtime_chain_without_changing_defaults(self):
         files = self.image_derivative()
         self.check_image_pins(files)
@@ -938,6 +994,109 @@ class CoreMigrationShellTests(CorePlatformShellTests):
         self.assertFalse((self.root / 'persistent/image.tsv').exists())
         self.assertEqual(files['image.tsv'], f'boot|{self.pin_path}|{self.pin_before}\n')
         self.assertEqual(self.pin_file.read_bytes(), b'Final authenticated framework fixture.\n')
+
+    def test_host_staged_image_pins_keep_the_running_active_mount_owner(self):
+        files, manifest, pending = self.staged_derivative()
+        self.check_staged_pins(files, manifest)
+        self.assertFalse((pending / 'cache').exists())
+        self.assertFalse((self.root / 'persistent/image.tsv').exists())
+        self.assertEqual(self.pin_file.read_bytes(), b'Final authenticated framework fixture.\n')
+        with self.assertRaises(RuntimeError):
+            self.guest({}, platform.module_guard('/data/adb/modules/hyperos_avd_native_compat', self.checksum))
+
+    def test_host_staged_derivative_requires_complete_frozen_active_controls(self):
+        files, manifest, pending = self.staged_derivative()
+        unknown = copy.deepcopy(manifest)
+        unknown['files_sha256']['catalog.json'] = '1' * 64
+        with self.assertRaisesRegex(RuntimeError, 'Unreviewed active Core'):
+            self.check_staged_pins(files, unknown)
+        with self.assertRaisesRegex(RuntimeError, 'Core image prerequisite'):
+            self.check_staged_pins(files, None)
+        runtime = self.owner / 'runtime.sh'; original = runtime.read_bytes()
+        marker = self.root / 'untrusted-runtime-sourced'
+        runtime.write_text(original.decode() + '\ntouch ' + shlex.quote(str(marker)) + '\n')
+        with self.assertRaises(RuntimeError):
+            self.check_staged_pins(files, manifest)
+        self.assertFalse(marker.exists())
+        runtime.write_bytes(original)
+        # Re-hashing a self-reported replacement does not extend frozen history.
+        (self.owner / 'manifest.json').write_text(json.dumps(unknown))
+        self.refresh_owner_checksums()
+        with self.assertRaises(RuntimeError):
+            self.check_staged_pins(files, manifest)
+        self.assertFalse((pending / 'cache').exists())
+
+    def test_host_staged_derivative_rejects_aliases_ownership_and_lifecycle_changes(self):
+        files, manifest, pending = self.staged_derivative()
+        runtime = self.owner / 'runtime.sh'
+        alias = self.root / 'runtime-hardlink'; os.link(runtime, alias)
+        with self.assertRaises(RuntimeError): self.check_staged_pins(files, manifest)
+        alias.unlink()
+        for path in (runtime, self.owner):
+            self.file_metadata(path, owner='1000:1000')
+            with self.subTest(owner=path.name), self.assertRaises(RuntimeError):
+                self.check_staged_pins(files, manifest)
+            self.file_metadata(path, owner='0:0')
+        for owner in (self.owner, pending):
+            for name in ('disable', 'remove'):
+                marker = owner / name; marker.touch()
+                with self.subTest(marker=marker), self.assertRaises(RuntimeError):
+                    self.check_staged_pins(files, manifest)
+                marker.unlink()
+
+    def test_host_staged_derivative_requires_active_pid1_mount_and_capability(self):
+        files, manifest, pending = self.staged_derivative('[ ! -e "$MODDIR/unsupported-fixture" ]')
+        mountinfo = self.proc / '1/mountinfo'; original = mountinfo.read_text()
+        for source in (str(pending / 'cache'), '/foreign/cache'):
+            mountinfo.write_text(original.replace(str(self.owner / 'cache'), source))
+            with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, 'Core image prerequisite'):
+                self.check_staged_pins(files, manifest)
+        mountinfo.write_text(original)
+        (self.owner / 'unsupported-fixture').touch()
+        with self.assertRaisesRegex(RuntimeError, 'Core image prerequisite'):
+            self.check_staged_pins(files, manifest)
+
+    def test_host_staged_derivative_rejects_writable_source_files_and_ancestors(self):
+        files, manifest, pending = self.staged_derivative()
+        runtime = self.owner / 'runtime.sh'
+        # The test's frozen code would leave a marker if the rejected source
+        # were ever executed. Re-review the entire synthetic owner afterward.
+        marker = self.root / 'writable-runtime-sourced'
+        runtime.write_text(runtime.read_text() + '\ntouch ' + shlex.quote(str(marker)) + '\n')
+        manifest['files_sha256']['runtime.sh'] = platform.digest(runtime.read_bytes())
+        (self.owner / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+        self.refresh_owner_checksums()
+        import native_module_history as history
+        record = {'revision': manifest['revision'],
+                  'manifest_sha256': platform.digest((self.owner / 'manifest.json').read_bytes()),
+                  'checksums_sha256': self.checksum}
+        with patch.object(history, 'REVIEWED', (*history.REVIEWED, record)):
+            for path in (self.owner, self.owner.parent, self.owner.parent.parent,
+                         self.owner / 'sites', runtime):
+                original = path.stat().st_mode & 0o7777
+                for mask in (0o020, 0o002):
+                    path.chmod(original | mask)
+                    with self.subTest(path=path.name, mask=oct(mask)), self.assertRaises(RuntimeError):
+                        self.check_staged_pins(files, manifest)
+                    self.assertFalse(marker.exists())
+                    path.chmod(original)
+        self.assertFalse((pending / 'cache').exists())
+
+    def test_host_staged_original_pin_never_sources_a_derivative_owner(self):
+        files, _, pending = self.staged_derivative('return 1')
+        files['image.tsv'] = f'boot|{self.pin_path}|{self.pin_after}\n'
+        self.check_staged_pins(files, None)
+        self.assertFalse((pending / 'cache').exists())
+
+    def test_host_configure_staged_upgrade_uses_reviewed_active_manifest(self):
+        files, _, pending = self.staged_derivative()
+        files['image.json'] = json.dumps(self.context, sort_keys=True, indent=2) + '\n'
+        with patch.object(platform, 'context_files', return_value=files):
+            result = platform.configure(self.guest, {}, self.context,
+                                        '/data/adb/modules_update/hyperos_avd_native_compat', self.pending_checksum)
+        self.assertEqual(result['serial']['status'], 'pending')
+        self.assertEqual((self.root / 'persistent/image.tsv').read_text(), files['image.tsv'])
+        self.assertFalse((pending / 'cache').exists())
 
     def test_host_original_image_pin_does_not_require_derivative_capability(self):
         files = self.image_derivative('return 1')

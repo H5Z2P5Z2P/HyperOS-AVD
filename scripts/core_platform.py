@@ -206,15 +206,87 @@ def migrate_serial(root, config, guard, legacy):
     return {'status': 'pending', 'reason': 'first-boot-identity'}
 
 
-def image_guard(files, directory, checksum):
+def active_derivative_guard(manifest):
+    """Authenticate a frozen active owner without relaxing the install guard."""
+    from apply_native_compat import MODULE, PENDING
+    from native_module_history import checksum_for
+    checksum = checksum_for(manifest)
+    if checksum is None:
+        raise RuntimeError('Unreviewed active Core derivative owner; local state preserved.')
+    names = set(manifest['files_sha256']) - set(manifest.get('install_only_files', []))
+    names.update(('manifest.json', 'SHA256SUMS'))
+    if any(not re.fullmatch(r'[A-Za-z0-9_./-]+', name) or name.startswith('/')
+           or '..' in PurePosixPath(name).parts for name in names):
+        raise RuntimeError('Invalid reviewed active Core control path.')
+    guard = parent_guard(MODULE) + f'''core_active_sealed() {{
+    local core_active_mode
+    core_active_mode=$("$BB" stat -c %a "$1") || return 1
+    case "$core_active_mode" in ''|*[!0-7]*) return 1 ;; esac
+    [ "${{#core_active_mode}}" -le 4 ] || return 1
+    case "$core_active_mode" in *[2367][0-7]|*[2367]) return 1 ;; esac
+}}
+core_active_parent={MODULE}
+while :; do
+    core_active_sealed "$core_active_parent" || exit 1
+    [ "$core_active_parent" != /data/adb ] || break
+    core_active_parent=${{core_active_parent%/*}}
+done
+core_active_links=$("$BB" find {MODULE} -type l -print) || exit 1
+[ -z "$core_active_links" ] || exit 1
+[ -f {MODULE}/SHA256SUMS ] && [ ! -L {MODULE}/SHA256SUMS ] || exit 1
+[ "$("$BB" stat -c %u:%h {MODULE}/SHA256SUMS)" = 0:1 ] || exit 1
+core_active_sealed {MODULE}/SHA256SUMS || exit 1
+[ "$("$BB" sha256sum {MODULE}/SHA256SUMS | "$BB" cut -d ' ' -f 1)" = {checksum} ] || exit 1
+while read -r core_active_sum core_active_name core_active_extra; do
+    [ -z "$core_active_extra" ] || exit 1
+    core_active_file={MODULE}/"$core_active_name"
+    [ -f "$core_active_file" ] && [ ! -L "$core_active_file" ] || exit 1
+    [ "$("$BB" stat -c %u:%h "$core_active_file")" = 0:1 ] || exit 1
+    core_active_sealed "$core_active_file" || exit 1
+    core_active_parent=${{core_active_file%/*}}
+    while [ "$core_active_parent" != {MODULE} ]; do
+        [ -d "$core_active_parent" ] && [ ! -L "$core_active_parent" ] &&
+            [ "$("$BB" stat -c %u "$core_active_parent")" = 0 ] &&
+            core_active_sealed "$core_active_parent" || exit 1
+        core_active_parent=${{core_active_parent%/*}}
+    done
+done < {MODULE}/SHA256SUMS
+(cd {MODULE} && "$BB" sha256sum -c SHA256SUMS >/dev/null) || exit 1
+'''
+    for owner in (MODULE, PENDING):
+        for flag in ('disable', 'remove'):
+            guard += f'[ ! -e {owner}/{flag} ] && [ ! -L {owner}/{flag} ] || exit 1\n'
+    return guard
+
+
+def image_guard(files, directory, checksum, active_manifest=None):
     """Verify image pins, retaining only authenticated early Core derivatives.
 
-    The installed runtime owns the chain and capability rules. Source its
-    verified definitions only when an original boot pin has an owned overlay;
-    host consumers must not duplicate or broaden that catalog.
+    The running owner retains the chain and capability rules. A staged target
+    cannot own its predecessor's cache mounts. Source only that predecessor's
+    separately frozen and authenticated controls, without broadening catalog
+    rules or treating an unactivated stage as the running owner.
     """
-    from apply_native_compat import PENDING
-    commands = [module_guard(directory, checksum), 'core_pin_runtime_loaded=false']
+    from apply_native_compat import MODULE, PENDING
+    if active_manifest is not None and directory != PENDING:
+        raise RuntimeError('A separate derivative owner is only valid for staged Core configuration.')
+    owner_guard = active_derivative_guard(active_manifest) if active_manifest is not None else None
+    source = MODULE if directory == PENDING else directory
+    commands = [module_guard(directory, checksum), f'''core_pin_runtime_loaded=false
+core_pin_load_runtime() {{
+    [ "$core_pin_runtime_loaded" != true ] || return 0
+    {owner_guard if owner_guard is not None else 'core_pin_failure' if directory == PENDING else ':'}
+    MODDIR={shlex.quote(source)}
+    HYPEROS_NATIVE_BB=$BB
+    HYPEROS_NATIVE_PROC=/proc
+    HYPEROS_NATIVE_PACKAGES_XML=/data/system/packages.xml
+    HYPEROS_CORE_STATE={STATE}
+    HYPEROS_CORE_SYS=/sys
+    HYPEROS_CORE_PENDING={PENDING}
+    . "$MODDIR/runtime.sh"
+    . "$MODDIR/platform.sh"
+    core_pin_runtime_loaded=true
+}}''']
     for row in files['image.tsv'].splitlines():
         kind, path, expected = row.split('|')
         quoted = shlex.quote(path)
@@ -225,22 +297,14 @@ core_pin_inode=$("$BB" stat -c %d:%i {quoted}) || core_pin_failure
 core_pin_actual=$("$BB" sha256sum {quoted} | "$BB" cut -d ' ' -f 1)
 if [ "$core_pin_actual" != {expected} ]; then
     [ {shlex.quote(kind)} = boot ] || core_pin_failure
-    if [ "$core_pin_runtime_loaded" != true ]; then
-        MODDIR={shlex.quote(directory)}
-        HYPEROS_NATIVE_BB=$BB
-        HYPEROS_NATIVE_PROC=/proc
-        HYPEROS_NATIVE_PACKAGES_XML=/data/system/packages.xml
-        HYPEROS_CORE_STATE={STATE}
-        HYPEROS_CORE_SYS=/sys
-        HYPEROS_CORE_PENDING={PENDING}
-        . "$MODDIR/runtime.sh"
-        . "$MODDIR/platform.sh"
-        core_pin_runtime_loaded=true
-    fi
+    core_pin_load_runtime || core_pin_failure
     core_reviewed_native_derivative '{path}' {expected} "$core_pin_actual" || core_pin_failure
 fi
 [ -f {quoted} ] && [ ! -L {quoted} ] &&
     [ "$("$BB" stat -c %d:%i {quoted})" = "$core_pin_inode" ] || core_pin_failure''')
+    if owner_guard is not None:
+        commands.append('if [ "$core_pin_runtime_loaded" = true ]; then\n' + owner_guard + '\nfi')
+        commands.append(module_guard(directory, checksum))
     return '\n'.join(commands)
 
 
@@ -248,8 +312,20 @@ def configure(root, config, context, directory, checksum):
     """Publish state only after Core assets and image files are authenticated."""
     files = context_files(context)
     guard = module_guard(directory, checksum)
+    active_manifest = None
+    from apply_native_compat import MODULE, PENDING
+    if directory == PENDING:
+        saved = read_record(root, config, MODULE + '/manifest.json')
+        if saved is not None:
+            try:
+                active_manifest = json.loads(saved)
+            except (ValueError, TypeError) as error:
+                raise RuntimeError('Invalid active Core manifest; local state preserved.') from error
+            # Only the complete host-frozen manifest selects the old owner.
+            # Its full controls and live mount are checked in the same shell.
+            active_derivative_guard(active_manifest)
     # Source pin verification precedes any persistent state or legacy mutation.
-    root(config, image_guard(files, directory, checksum))
+    root(config, image_guard(files, directory, checksum, active_manifest))
     # An OTA may replace valid prior image defaults. Unknown local state is
     # not a migration receipt and must never be overwritten opportunistically.
     previous_json = read_record(root, config, STATE + '/image.json')
