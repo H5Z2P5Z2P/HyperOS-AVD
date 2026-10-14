@@ -431,6 +431,37 @@ class NativeModuleInstallTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'unreviewed-core-controls')
         self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
 
+    def test_final_deployed_core15_controls_authenticate_before_scene_sensor_guard(self):
+        fixture = REPO / 'tests/fixtures/native-compat-v15-final-manifest.json'
+        previous_bytes = fixture.read_bytes()
+        previous = previous_bytes.decode()
+        saved = json.loads(previous)
+        expected = '71fd439241df235482803e155a42bb2486f6786aed89f31737d71d36905eb016'
+        self.assertEqual(hashlib.sha256(previous_bytes).hexdigest(),
+                         'e85fee78faae160dcffd6725e566a006b86642d22da7891c33daa91f1c852d89')
+        self.assertEqual(saved['revision'], 15)
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 15)
+        self.assertEqual(record['package_sha256'],
+                         'bc0330d23683216c504beb38fdb7e81e521c4d7085f13e9e3d1ac37fa231a8fa')
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        self.assertEqual(json.loads(self.current_manifest())['revision'], 16)
+        prop = PROPERTY.rsplit('=', 1)[0] + '=15'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(expected, verification); self.assertIn(expected, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['platform.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
+
     def test_final_frozen_core6_migrates_only_complete_controls_to_policy_revision(self):
         previous = (REPO / 'tests/fixtures/native-compat-v6-final-manifest.json').read_text()
         saved = json.loads(previous)

@@ -1055,7 +1055,7 @@ native_service() {
     native_reconcile late
     while :; do
         sleep "$NATIVE_INTERVAL"
-        if native_blocked; then native_cleanup; core_rear_cleanup; core_policy_cleanup; return 0; fi
+        if native_blocked; then native_cleanup; core_rear_cleanup; core_device_credential_cleanup; core_policy_cleanup; return 0; fi
         token=$(native_package_token)
         [ "$token" != "$previous" ] || continue
         sleep 2

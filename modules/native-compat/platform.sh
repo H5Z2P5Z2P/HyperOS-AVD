@@ -521,7 +521,7 @@ core_early() {
 }
 
 core_late() {
-    core_refresh; core_kernel; core_rear; core_policies
+    core_refresh; core_kernel; core_rear; core_policies; core_device_credential
 }
 
 core_policy_restore_required() {
@@ -572,3 +572,5 @@ core_policy_cleanup() {
         "$BB" sh "$MODDIR/$feature-policy.sh" restore >/dev/null
     done
 }
+
+. "$MODDIR/device-credential.sh"

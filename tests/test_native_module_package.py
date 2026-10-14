@@ -92,7 +92,11 @@ class NativeModulePackageTests(unittest.TestCase):
                 self.assertIn('service.sh', names)
                 self.assertIn('skip_mount', names)
                 self.assertFalse(any(name.startswith('system/') for name in names))
-                self.assertEqual([name for name in names if name.endswith(('.so', '.apk', '.jar'))], ['rear-wake.jar'])
+                self.assertEqual([name for name in names if name.endswith(('.so', '.apk', '.jar'))],
+                                 ['device-credential.jar', 'rear-wake.jar'])
+                from device_credential_runtime import files as credential_files
+                for name, expected in credential_files().items():
+                    self.assertEqual(archive.read(name), expected)
                 for row in archive.read('SHA256SUMS').decode().splitlines():
                     expected, name = row.split('  ', 1)
                     self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), expected)
