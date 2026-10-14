@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 
-from common import sdk_path, sha256
+from common import REPO_ROOT, sdk_path, sha256
 from build_image import erofs
 from erofs_image import build
 from lp_image import pack, unpack
@@ -129,6 +129,32 @@ def copy_release_inputs(source, output):
         ignore = shutil.ignore_patterns('os4-core') if directory == 'tools' else None
         shutil.copytree(source / directory, output / directory,
                         copy_function=clone, ignore=ignore)
+
+
+def prepare_release_kernelsu(output):
+    """Finish only the isolated release with a complete audited offline stack."""
+    import kernelsu_release as release
+    from build_os4_official import prepare_kernelsu, patch_kernelsu_ramdisk
+    output = Path(output)
+    # The standard producer may fetch missing inputs. Release preparation must
+    # instead authenticate the complete local stack before invoking it.
+    for name in release.ASSETS:
+        release.asset(REPO_ROOT, name)
+    directory = output / 'tools' / release.DIRECTORY
+    if directory.exists() or directory.is_symlink():
+        release.available(output)
+        for name in release.ASSETS.keys() - set(release.RUNTIME_ASSETS):
+            path = directory / name
+            if not (path.exists() or path.is_symlink()):
+                continue
+            release.asset(output, name)
+    logs = output / 'logs'
+    if logs.is_symlink() or logs.exists() and not logs.is_dir():
+        raise RuntimeError('Preserving an unknown release KernelSU log directory.')
+    logs.mkdir(exist_ok=True)
+    stack = prepare_kernelsu(REPO_ROOT, output)
+    patch_kernelsu_ramdisk(output, stack)
+    return stack['receipt']
 
 
 def authenticated_properties(data):
@@ -267,6 +293,7 @@ def prepare(source, output, variant='os4-official'):
     work.mkdir()
     if variant == 'os4-pad':
         info = prepare_pad(source, output, info)
+        info['kernelsu_marker_fix'] = prepare_release_kernelsu(output)
         (output / 'local/build.json').write_text(json.dumps(info, indent=2) + '\n')
         print('Prepared isolated Pad release image: ' + str(output), flush=True)
         return
@@ -313,6 +340,7 @@ def prepare(source, output, variant='os4-official'):
                 flutter_engine=flutter_receipt,
                 system_sha256=sha256(output / 'images/system.img'), raw_sha256=sha256(candidate))
     info.pop('preinstalled_backup', None)
+    info['kernelsu_marker_fix'] = prepare_release_kernelsu(output)
     (output / 'local/build.json').write_text(json.dumps(info, indent=2) + '\n')
     print('Prepared isolated release image: ' + str(output), flush=True)
 

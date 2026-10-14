@@ -32,6 +32,7 @@ class ReleasePreparationTests(unittest.TestCase):
         for directory in ('images', 'tools', 'config', 'local', 'avd'):
             (self.source / directory).mkdir(parents=True)
         (self.source / 'images/system.img').write_bytes(b'accepted packed image')
+        (self.source / 'images/ramdisk.img').write_bytes(b'accepted boot image')
         (self.source / 'images/vendor-qemu.img').write_bytes(b'unrelated hardware image')
         (self.source / 'tools/verified-helper').write_bytes(b'accepted helper')
         (self.source / 'config/avd.ini').write_text('hw.ramSize=6144\n')
@@ -60,6 +61,9 @@ class ReleasePreparationTests(unittest.TestCase):
         }
         self.cloned, self.builds, self.packs = [], [], []
         self.boot_receipt = {'schema': 1, 'targets': {'accepted-init': {'after': 'fixture'}}}
+        import kernelsu_release
+        from patch_kernelsu import receipt
+        self.ksu_receipt = receipt(kernelsu_release.ASSETS[kernelsu_release.LKM])
 
     def write_info(self):
         (self.source / 'local/build.json').write_text(json.dumps(self.info))
@@ -129,6 +133,13 @@ class ReleasePreparationTests(unittest.TestCase):
                                                                'u:object_r:system_file:s0')
             return self.boot_receipt
 
+        def kernelsu(output):
+            self.assertEqual(output, self.output)
+            self.assertEqual(len(self.packs), 1)
+            self.assertTrue((output / 'work').is_dir())
+            (output / 'images/ramdisk.img').write_bytes(b'current quiet KernelSU boot image')
+            return self.ksu_receipt
+
         stack.enter_context(patch.object(prepare, 'clone', side_effect=clone))
         stack.enter_context(patch.object(prepare, 'unpack', side_effect=unpack))
         stack.enter_context(patch.object(prepare, 'erofs', side_effect=read))
@@ -150,6 +161,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.profile_mock = stack.enter_context(patch.object(patch_flutter, 'profile',
             return_value=(self.input_engine_pin, {'output': digest(self.latest)})))
         self.patch_mock = stack.enter_context(patch.object(patch_flutter, 'patch', return_value=self.latest))
+        self.ksu_mock = stack.enter_context(patch.object(prepare, 'prepare_release_kernelsu', side_effect=kernelsu))
         return stack
 
     def test_canonical_input_without_work_cache_preserves_source_ota_and_partitions(self):
@@ -192,6 +204,9 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(info['system_sha256'], digest(b'updated accepted packed image'))
         self.assertEqual(info['raw_sha256'], digest(b'updated accepted raw system'))
         self.assertEqual(info['boot_policy'], self.boot_receipt)
+        self.assertEqual(info['kernelsu_marker_fix'], self.ksu_receipt)
+        self.assertEqual((self.output / 'images/ramdisk.img').read_bytes(), b'current quiet KernelSU boot image')
+        self.ksu_mock.assert_called_once_with(self.output)
 
     def test_stale_cache_cannot_replace_the_accepted_system_or_vendor(self):
         (self.source / 'work/base').mkdir(parents=True)
@@ -237,6 +252,7 @@ class ReleasePreparationTests(unittest.TestCase):
                 self.assertFalse(self.output.exists())
         self.assertEqual(self.builds, [])
         self.assertEqual(self.packs, [])
+        self.ksu_mock.assert_not_called()
 
     def test_packed_receipt_mismatch_rejects_before_output_or_build(self):
         self.info['system_sha256'] = digest(b'another accepted image')
@@ -331,6 +347,10 @@ class ReleasePreparationTests(unittest.TestCase):
         self.boot_mock.assert_called_once()
         self.assertIn('system/etc/hyperos-init-capabilities.sh', self.builds[0]['edits'])
         self.assertEqual(json.loads((self.output / 'local/build.json').read_text())['boot_policy'], self.boot_receipt)
+        self.assertEqual(json.loads((self.output / 'local/build.json').read_text())['kernelsu_marker_fix'],
+                         self.ksu_receipt)
+        self.assertEqual((self.output / 'images/ramdisk.img').read_bytes(), b'current quiet KernelSU boot image')
+        self.ksu_mock.assert_called_once_with(self.output)
         self.patch_mock.assert_not_called()
 
     def test_pad_present_packed_hash_or_unknown_profile_refuses_before_copying_output(self):
@@ -350,6 +370,157 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(self.cloned, [])
         self.assertEqual(self.builds, [])
         self.assertEqual(self.packs, [])
+
+    def test_kernelsu_failure_cannot_publish_a_successful_release_receipt(self):
+        original = self.source_files()
+        self.mocked_pipeline()
+        self.ksu_mock.side_effect = RuntimeError('Unverified KernelSU producer output')
+        with self.assertRaisesRegex(RuntimeError, 'KernelSU producer output'):
+            prepare.prepare(self.source, self.output)
+        self.assertEqual(self.source_files(), original)
+        self.assertFalse((self.output / 'local/build.json').exists())
+
+    def test_pad_kernelsu_failure_cannot_publish_a_successful_release_receipt(self):
+        import apply_app_compat
+        self.use_pad_profile()
+        self.entries['/system/build.prop'] = b'ro.adb.secure=0\nro.debuggable=0\nro.product.device=yingtian\n'
+        original = self.source_files()
+        self.mocked_pipeline(boot_kind='pad')
+        self.ksu_mock.side_effect = RuntimeError('Unverified KernelSU producer output')
+        with patch.object(apply_app_compat, 'prepare_prebuilt'), \
+                self.assertRaisesRegex(RuntimeError, 'KernelSU producer output'):
+            prepare.prepare(self.source, self.output, 'os4-pad')
+        self.assertEqual(self.source_files(), original)
+        self.assertFalse((self.output / 'local/build.json').exists())
+
+
+class ReleaseKernelSUPreparationTests(unittest.TestCase):
+    def setUp(self):
+        import kernelsu_release as release
+        from patch_kernelsu import receipt
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo, self.output = self.root / 'repo', self.root / 'output'
+        self.directory = self.repo / 'tools' / release.DIRECTORY
+        self.directory.mkdir(parents=True)
+        self.contents = {name: ('official fixture: ' + name).encode() for name in release.ASSETS}
+        for name, content in self.contents.items():
+            (self.directory / name).write_bytes(content)
+        self.pins = {name: digest(content) for name, content in self.contents.items()}
+        self.receipt = receipt(release.ASSETS[release.LKM])
+        self.stack = {'receipt': self.receipt, 'host': self.directory / 'ksud-aarch64-apple-darwin',
+                      'lkm': self.output / 'work/quiet.ko'}
+        for name in ('tools', 'work', 'images'):
+            (self.output / name).mkdir(parents=True, exist_ok=True)
+        (self.output / 'images/ramdisk.img').write_bytes(b'old boot')
+        def mock(target):
+            self.addCleanup(target.stop)
+            return target.start()
+
+        mock(patch.object(prepare, 'REPO_ROOT', self.repo))
+        mock(patch.object(release, 'ASSETS', self.pins))
+        self.producer = mock(patch('build_os4_official.prepare_kernelsu', return_value=self.stack))
+
+        def patch_boot(output, stack):
+            self.assertEqual(output, self.output)
+            self.assertEqual(stack, self.stack)
+            self.assertTrue((output / 'logs').is_dir())
+            self.producer.assert_called_once_with(self.repo, self.output)
+            (output / 'images/ramdisk.img').write_bytes(b'verified current quiet boot')
+
+        self.boot = mock(patch('build_os4_official.patch_kernelsu_ramdisk', side_effect=patch_boot))
+
+    def test_complete_offline_stack_drives_both_standard_producers(self):
+        before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
+        self.assertEqual(prepare.prepare_release_kernelsu(self.output), self.receipt)
+        self.assertEqual((self.output / 'images/ramdisk.img').read_bytes(), b'verified current quiet boot')
+        self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
+        self.producer.assert_called_once_with(self.repo, self.output)
+        self.boot.assert_called_once_with(self.output, self.stack)
+
+    def test_missing_or_modified_offline_asset_refuses_before_producer(self):
+        import kernelsu_release as release
+        for kind in ('missing', 'modified', 'symlink', 'hardlink'):
+            with self.subTest(kind=kind):
+                path = self.directory / release.MANAGER
+                if kind == 'missing':
+                    path.unlink()
+                elif kind == 'modified':
+                    path.write_bytes(b'unknown')
+                elif kind == 'symlink':
+                    path.unlink()
+                    path.symlink_to(self.directory / release.LKM)
+                else:
+                    os.link(path, self.root / 'aliased-apk')
+                with self.assertRaises((RuntimeError, OSError)):
+                    prepare.prepare_release_kernelsu(self.output)
+                self.producer.assert_not_called()
+                self.boot.assert_not_called()
+                self.assertFalse((self.output / 'logs').exists())
+                if kind == 'hardlink':
+                    (self.root / 'aliased-apk').unlink()
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                path.write_bytes(self.contents[release.MANAGER])
+
+    def test_partial_or_unknown_copied_stack_refuses_before_producer(self):
+        import kernelsu_release as release
+        directory = self.output / 'tools' / release.DIRECTORY
+        directory.mkdir()
+        for name, content in self.contents.items():
+            (directory / name).write_bytes(content)
+        manager = directory / release.MANAGER
+        manager.unlink()
+        with self.assertRaises(OSError):
+            prepare.prepare_release_kernelsu(self.output)
+        manager.write_bytes(self.contents[release.MANAGER])
+        host = directory / 'ksud-aarch64-apple-darwin'
+        host.write_bytes(b'unknown host producer')
+        with self.assertRaisesRegex(RuntimeError, 'official pin'):
+            prepare.prepare_release_kernelsu(self.output)
+        self.assertEqual(host.read_bytes(), b'unknown host producer')
+        self.producer.assert_not_called()
+        self.boot.assert_not_called()
+
+    def test_complete_copied_stack_is_authenticated_before_producers(self):
+        import kernelsu_release as release
+        directory = self.output / 'tools' / release.DIRECTORY
+        directory.mkdir()
+        for name, content in self.contents.items():
+            (directory / name).write_bytes(content)
+        self.assertEqual(prepare.prepare_release_kernelsu(self.output), self.receipt)
+        self.boot.assert_called_once_with(self.output, self.stack)
+
+    def test_valid_consumer_stack_allows_standard_producer_to_add_host_asset(self):
+        import kernelsu_release as release
+        directory = self.output / 'tools' / release.DIRECTORY
+        directory.mkdir()
+        for name in release.RUNTIME_ASSETS:
+            (directory / name).write_bytes(self.contents[name])
+        self.assertFalse((directory / 'ksud-aarch64-apple-darwin').exists())
+        self.assertEqual(prepare.prepare_release_kernelsu(self.output), self.receipt)
+        self.producer.assert_called_once_with(self.repo, self.output)
+        self.boot.assert_called_once_with(self.output, self.stack)
+
+    def test_unknown_existing_logs_leaf_is_preserved_before_producers(self):
+        (self.output / 'logs').write_bytes(b'custom log leaf')
+        with self.assertRaisesRegex(RuntimeError, 'unknown release KernelSU log'):
+            prepare.prepare_release_kernelsu(self.output)
+        self.assertEqual((self.output / 'logs').read_bytes(), b'custom log leaf')
+        self.producer.assert_not_called()
+        self.boot.assert_not_called()
+
+    def test_aliased_logs_directory_is_preserved_before_producers(self):
+        elsewhere = self.root / 'other-logs'
+        elsewhere.mkdir()
+        (self.output / 'logs').symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, 'unknown release KernelSU log'):
+            prepare.prepare_release_kernelsu(self.output)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertTrue((self.output / 'logs').is_symlink())
+        self.producer.assert_not_called()
+        self.boot.assert_not_called()
 
 
 class SharedFlutterPreparationTests(unittest.TestCase):
