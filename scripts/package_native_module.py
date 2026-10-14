@@ -43,7 +43,7 @@ def module_files(value=None, template=None):
     validate_catalog(value)
     template = REPO / 'modules/native-compat' if template is None else Path(template)
     files = {}
-    for name in ('module.prop', 'customize.sh', 'runtime.sh', 'platform.sh', 'device-credential.sh', 'post-fs-data.sh', 'service.sh', 'uninstall.sh'):
+    for name in ('module.prop', 'customize.sh', 'runtime.sh', 'platform.sh', 'device-credential.sh', 'tcm-capability.sh', 'post-fs-data.sh', 'service.sh', 'uninstall.sh'):
         files[name] = (template / name).read_bytes()
     from finddevice_policy import files as finddevice_files
     files.update(finddevice_files(template))
@@ -60,6 +60,8 @@ def module_files(value=None, template=None):
     files.update(rear_wake_files())
     from device_credential_runtime import files as credential_files
     files.update(credential_files())
+    from tcm_capability import files as tcm_files
+    files.update(tcm_files())
     files['skip_mount'] = b''
     files['boot-prerequisites.tsv'] = boot_prerequisites()
     from patch_display_privacy import capability_recipe
@@ -93,7 +95,7 @@ def module_files(value=None, template=None):
                       item['package'], item['library'])) for item in value['targets']]
     files['targets.tsv'] = ('\n'.join(rows) + '\n').encode()
     features = sorted({profile['feature'] for profile in value['profiles']} |
-                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake', 'finddevice', 'vendor-ims', 'device-credential'})
+                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake', 'finddevice', 'vendor-ims', 'device-credential', 'network-tcm'})
     files['features.tsv'] = ('\n'.join(features) + '\n').encode()
     manifest = {'schema': 1, 'id': MODULE_ID, 'revision': REVISION,
                 'catalog_sha256': hashlib.sha256(files['catalog.json']).hexdigest(),

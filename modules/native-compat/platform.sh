@@ -517,7 +517,7 @@ core_rear() {
 }
 
 core_early() {
-    core_identity && core_serial && core_thermal
+    core_identity && core_serial && core_thermal && core_network_tcm
 }
 
 core_late() {
@@ -574,3 +574,4 @@ core_policy_cleanup() {
 }
 
 . "$MODDIR/device-credential.sh"
+. "$MODDIR/tcm-capability.sh"

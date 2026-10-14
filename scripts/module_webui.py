@@ -18,7 +18,7 @@ def files(family):
         body = body.replace(b'/*@CORE_TITLES@*/',
                             ("'rear-input':'背屏触控', 'display-brightness':'显示亮度能力', "
                              "'thermal-monitor':'温度节点适配', 'device-credential':'设备凭据能力', "
-                             "").encode()
+                             "'network-tcm':'网络闲置连接适配', ").encode()
                             if family == 'core' else b'')
         target = 'webui-status.sh' if name == 'status.sh' else 'webroot/' + name
         result[target] = body

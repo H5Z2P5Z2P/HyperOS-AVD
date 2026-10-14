@@ -272,6 +272,8 @@ class DeviceCredentialShellTest(unittest.TestCase):
             (self.module / name).write_bytes(data)
         (self.module / 'device-credential.sh').write_bytes(
             (REPO / 'modules/native-compat/device-credential.sh').read_bytes())
+        (self.module / 'tcm-capability.sh').write_bytes(
+            (REPO / 'modules/native-compat/tcm-capability.sh').read_bytes())
         self.sums()
         self.boot = '12345678-1234-1234-1234-123456789abc'
         (self.proc / 'sys/kernel/random/boot_id').write_text(self.boot + '\n')
