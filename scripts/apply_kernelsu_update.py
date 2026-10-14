@@ -41,7 +41,11 @@ if [ -e /data/adb ] || [ -L /data/adb ]; then
 fi
 {remote} install || refuse
 [ -f /data/adb/ksud ] && [ ! -L /data/adb/ksud ] || refuse
-[ "$(stat -c %u:%g:%a:%h /data/adb/ksud)" = 0:0:755:1 ] || refuse
+# Official releases install the daemon privately (700) or readably (755).
+case "$(stat -c %u:%g:%a:%h /data/adb/ksud)" in
+    0:0:700:1|0:0:755:1) ;;
+    *) refuse ;;
+esac
 [ "$(sha256sum /data/adb/ksud | cut -d ' ' -f 1)" = {digest} ] || refuse
 printf '%s\\n' {shlex.quote(token)}
 exit 0

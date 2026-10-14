@@ -365,7 +365,12 @@ printf called > "$FIXTURE_INSTALL_MARKER"
 mkdir -p "$FIXTURE_ADB"
 chmod 700 "$FIXTURE_ADB"
 cp "$0" "$FIXTURE_ADB/ksud"
-chmod 755 "$FIXTURE_ADB/ksud"
+chmod "${FIXTURE_INSTALLED_MODE:-755}" "$FIXTURE_ADB/ksud"
+if [ "${FIXTURE_INSTALL_CORRUPT:-0}" = 1 ]; then printf unknown > "$FIXTURE_ADB/ksud"; fi
+if [ "${FIXTURE_INSTALL_ALIAS:-0}" = 1 ]; then
+    rm "$FIXTURE_ADB/ksud"
+    ln -s "$0" "$FIXTURE_ADB/ksud"
+fi
 ''')
         self.remote.chmod(0o700)
         self.digest = hashlib.sha256(self.remote.read_bytes()).hexdigest()
@@ -421,6 +426,27 @@ print(fmt)
         self.assertNotEqual(self.run_script().returncode, 0)
         self.assertTrue((self.adb / 'empty-custom-directory').is_dir())
         self.assertFalse(self.marker.exists())
+
+    def test_official_private_mode_700_install_is_confirmed_with_exact_content(self):
+        result = self.run_script(FIXTURE_INSTALLED_MODE='700')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('verified-fresh', result.stdout.splitlines())
+        self.assertEqual((self.adb / 'ksud').stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.adb / 'ksud').read_bytes(), self.remote.read_bytes())
+
+    def test_postinstall_unsafe_mode_unknown_content_or_alias_never_confirms_bootstrap(self):
+        import shutil
+        for values in ({'FIXTURE_INSTALLED_MODE': '777'}, {'FIXTURE_INSTALLED_MODE': '775'},
+                       {'FIXTURE_INSTALLED_MODE': '750'}, {'FIXTURE_INSTALLED_MODE': '644'},
+                       {'FIXTURE_INSTALL_CORRUPT': '1'}, {'FIXTURE_INSTALL_ALIAS': '1'}):
+            with self.subTest(values=values):
+                result = self.run_script(**values)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('verified-fresh', result.stdout.splitlines())
+                self.assertTrue(self.marker.exists())
+                self.assertTrue((self.adb / 'ksud').exists())
+                shutil.rmtree(self.adb)
+                self.marker.unlink()
 
     def test_alias_wrong_permissions_nonroot_and_permissive_refuse_without_install(self):
         elsewhere = self.root / 'elsewhere'
