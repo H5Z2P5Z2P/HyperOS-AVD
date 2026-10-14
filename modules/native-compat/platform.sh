@@ -70,38 +70,49 @@ core_boot_recipe() {
 }
 
 core_reviewed_native_derivative() {
-    # An owned early bind may add one audited capability edit to an immutable
-    # image prerequisite. Authenticate the whole current control set and the
-    # exact source edge; never reinterpret unknown hashes or legacy chains.
-    local path=$1 expected=$2 actual=$3 feature
+    # An owned early bind may add a bounded exact-content producer chain to
+    # an immutable image prerequisite. Check every edge and capability; legacy
+    # aliases and unrelated framework targets cannot establish boot provenance.
+    local path=$1 expected=$2 actual=$3 feature features
     native_hex "$expected" && native_hex "$actual" && [ "$expected" != "$actual" ] || return 1
     native_guard && native_assets || return 1
     core_safe_file "$MODDIR/targets.tsv" && core_safe_file "$MODDIR/profiles.tsv" || return 1
     native_owns_mount 1 "$path" || return 1
-    feature=$("$BB" awk -F '|' -v path="$path" -v expected="$expected" -v actual="$actual" '
+    features=$("$BB" awk -F '|' -v path="$path" -v expected="$expected" -v actual="$actual" '
         function hex(value) {return length(value) == 64 && value !~ /[^0-9a-f]/}
         FNR == NR {
             if ($4 == path) {
                 targets++; parts_count=split(path, parts, "/");
-                reviewed=(($3 == "perf-hardware" && path == "/system_ext/framework/miui-services.jar") ||
-                          ($3 == "rear-input" && path == "/system/framework/services.jar"));
+                reviewed=((($3 == "perf-hardware" || $3 == "thermal-monitor") && path == "/system_ext/framework/miui-services.jar") ||
+                          (($3 == "rear-input" || $3 == "display-brightness") && path == "/system/framework/services.jar"));
                 if (NF != 6 || $1 != "early" || $2 != "system" ||
-                    !reviewed || $5 != "" || $6 != parts[parts_count]) bad=1;
-                feature=$3;
+                    !reviewed || $5 != "" || $6 != parts[parts_count] || scopes[$3]++) bad=1;
+                allowed[$3]=1;
             }
             next
         }
-        $1 == expected || $2 == actual || index("," $3 ",", "," expected ",") {
-            profiles++;
-            if (NF != 5 || !hex($1) || !hex($2) || $1 != expected || $2 != actual ||
-                $3 != "" || $4 != feature || $5 !~ /^[a-z0-9]+(-[a-z0-9]+)*$/) bad=1;
+        allowed[$4] {
+            prefix=($4 == "perf-hardware" ? "uniperf-" : $4 "-");
+            if ($5 != prefix substr($1,1,12)) next;
+            if (NF != 5 || !hex($1) || !hex($2) || $3 != "" || seen[$1]++ || outputs[$2]++) bad=1;
+            edge[$1]=$2; group[$1]=$4;
         }
-        END {if (bad || targets != 1 || profiles != 1) exit 1; print feature}
+        END {
+            if (bad || !targets) exit 1;
+            current=expected;
+            for (depth=0; depth<8 && current != actual; depth++) {
+                if (visited[current]++ || !(current in edge)) exit 1;
+                used[group[current]]=1; current=edge[current];
+            }
+            if (current != actual || depth == 0) exit 1;
+            for (feature in used) print feature;
+        }
         ' "$MODDIR/targets.tsv" "$MODDIR/profiles.tsv") || return 1
     # Content remains the same when the user disables a feature while its
     # inode is loaded. Reboot controls applicability; it cannot revoke the
     # image's independent boot provenance or authorize a new mutation.
-    native_eligible "$feature" && [ "$(native_ns_hash 1 "$path")" = "$actual" ]
+    for feature in $features; do native_eligible "$feature" || return 1; done
+    [ "$(native_ns_hash 1 "$path")" = "$actual" ]
 }
 
 core_context_rows_ready() {
@@ -339,7 +350,7 @@ core_rear_process() {
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ -r "$directory/cmdline" ] && [ -r "$directory/environ" ] && [ -r "$directory/status" ] || return 1
     "$BB" tr '\000' '\n' < "$directory/cmdline" | "$BB" grep -Fxq io.github.hyperosavd.RearDisplayWake || return 1
-    "$BB" awk '$1 == "Uid:" {found=1; for(i=2;i<=5;i++) if($i!=0) exit 1} END {exit !found}' "$directory/status"
+    "$BB" awk '$1 == "Uid:" {found++; if(NF!=5)bad=1; for(i=2;i<=5;i++) if($i!=0)bad=1} END {exit bad || found!=1}' "$directory/status"
 }
 
 core_rear_kind() {

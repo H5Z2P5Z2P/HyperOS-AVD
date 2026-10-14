@@ -67,8 +67,8 @@ class NativePatchCatalogTests(unittest.TestCase):
         self.assertEqual(data, native.dump_catalog())
         self.assertEqual(json.loads(data), self.value)
         self.assertEqual(native.validate_catalog(self.value), self.value)
-        self.assertEqual(len(self.value['profiles']), 28)
-        self.assertEqual(len(self.value['targets']), 21)
+        self.assertEqual(len(self.value['profiles']), 32)
+        self.assertEqual(len(self.value['targets']), 23)
         self.assertEqual(set(row['feature'] for row in self.value['profiles']), native.FEATURES)
         self.assertEqual([row['id'] for row in self.value['profiles']],
                          sorted(row['id'] for row in self.value['profiles']))
@@ -124,7 +124,7 @@ class NativePatchCatalogTests(unittest.TestCase):
 
     def test_system_and_app_targets_are_explicit_and_scoped(self):
         system = {row['feature']: row for row in self.value['targets'] if row['kind'] == 'system'}
-        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'rear-input', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'})
+        self.assertEqual(set(system), {'flutter', 'hwui', 'composer', 'rear-display', 'rear-input', 'display-brightness', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware', 'thermal-monitor'})
         self.assertTrue(all(row['phase'] == 'early' and not row['package'] for row in system.values()))
         self.assertEqual(system['flutter']['path'], '/system_ext/lib64/libhyper_os_flutter.so')
         self.assertEqual(system['hwui']['path'], '/system/lib64/libhwui.so')
@@ -321,6 +321,26 @@ class NativePatchCatalogTests(unittest.TestCase):
                            {'path':'/system_ext/lib64/custom.so','library':'custom.so'},
                            {'path':'/system_ext/framework/UniperfClient.apk','library':'UniperfClient.apk'}):
                 with self.subTest(source=source,change=change):self.reject(lambda value:target(value).update(change))
+
+    def test_framework_chains_keep_exact_producers_and_first_boot_target_order(self):
+        import patch_thermal_capability as thermal
+        import patch_display_brightness as brightness
+        for producer, feature, prior in ((thermal, 'thermal-monitor', 'perf-hardware'),
+                                         (brightness, 'display-brightness', 'rear-input')):
+            sources = producer.catalog_recipes()
+            rows = {row['before']: row for row in self.value['profiles'] if row['feature'] == feature}
+            self.assertEqual(set(rows), {row['before'] for row in sources})
+            for source in sources:
+                self.assertEqual(rows[source['before']]['after'], source['after'])
+                self.assertEqual(rows[source['before']]['sites'], sorted(
+                    [[item['offset'], item['before'], item['after']] for item in source['sites']]))
+            indexes = {row['feature']: index for index, row in enumerate(self.value['targets'])
+                       if row['path'] == producer.PATH}
+            self.assertLess(indexes[prior], indexes[feature])
+            def reverse(value):
+                left, right = indexes[prior], indexes[feature]
+                value['targets'][left], value['targets'][right] = value['targets'][right], value['targets'][left]
+            self.reject(reverse, 'boot order')
 
     def test_actual_performance_inputs_match_the_offline_producers(self):
         import patch_qti_perf as qti

@@ -433,6 +433,9 @@ print(os.environ['CPU_TEST_COUNT'])''',
                         printf '%s\\n' "$FINAL" > "$STATE/$pid"
                         printf '1 0 1:1 %s %s rw,nosuid,nodev - ext4 userdata rw,seclabel\\n' "$PAYLOAD" "$TARGET" > "$PROC/$pid/mountinfo"
                     else
+                        # Reject the target-only remount form that crashes
+                        # BusyBox when the target already has an earlier bind.
+                        [ "$#" = 4 ] && [ "$3" = "$PAYLOAD" ] && [ "$4" = "$TARGET" ] || return 1
                         case ",$2," in *,suid,*) flags=ro,nodev;; *) flags=ro,nosuid,nodev;; esac
                         [ "$pid" != "${NATIVE_TEST_BAD_FLAGS_PID:-}" ] || flags=ro,nosuid,nodev,noexec
                         printf '1 0 1:1 %s %s %s - ext4 userdata rw,seclabel\\n' "$PAYLOAD" "$TARGET" "$flags" > "$PROC/$pid/mountinfo"
@@ -504,14 +507,14 @@ print(os.environ['CPU_TEST_COUNT'])''',
         self.shell(command, overrides=overrides)
         self.assertEqual(self.mount_payload.stat().st_mode & 0o7777, 0o755)
         self.assertEqual(self.target.read_bytes(), self.original)
-        self.assertIn('1:-o remount,bind,ro,suid,nodev,exec ' + target + '\n', self.mount_trace.read_text())
+        self.assertIn('1:-o remount,bind,ro,suid,nodev,exec ' + str(self.mount_payload) + ' ' + target + '\n', self.mount_trace.read_text())
         self.assertIn(' ro,nodev - ext4 ', (self.proc / '1/mountinfo').read_text())
 
     def test_verified_root_shell_composer_preserves_sdk_vendor_ownership(self):
         command, overrides, target = self.mount_fixture()
         self.environment['HYPEROS_NATIVE_TEST_OWNER'] = '0:2000'
         self.shell(command, overrides=overrides)
-        self.assertIn('1:-o remount,bind,ro,suid,nodev,exec ' + target + '\n', self.mount_trace.read_text())
+        self.assertIn('1:-o remount,bind,ro,suid,nodev,exec ' + str(self.mount_payload) + ' ' + target + '\n', self.mount_trace.read_text())
         self.assertEqual(self.mount_payload.stat().st_mode & 0o7777, 0o755)
 
     def test_composer_rejects_other_owner_groups_and_payload_owner_mismatch(self):
@@ -530,8 +533,22 @@ print(os.environ['CPU_TEST_COUNT'])''',
     def test_library_bind_retains_nosuid(self):
         command, overrides, target = self.mount_fixture(executable=False)
         self.shell(command, overrides=overrides)
-        self.assertIn('1:-o remount,bind,ro,nosuid,nodev ' + target + '\n', self.mount_trace.read_text())
+        self.assertIn('1:-o remount,bind,ro,nosuid,nodev ' + str(self.mount_payload) + ' ' + target + '\n', self.mount_trace.read_text())
         self.assertIn(' ro,nosuid,nodev - ext4 ', (self.proc / '1/mountinfo').read_text())
+
+    def test_stacked_framework_bind_remounts_with_explicit_source(self):
+        command, overrides, target = self.mount_fixture(executable=False, pids=('1', '2'))
+        predecessor = self.module / 'cache/predecessor.jar'
+        predecessor.write_bytes(self.original)
+        for pid in ('1', '2'):
+            (self.proc / pid / 'mountinfo').write_text(
+                f'1 0 1:1 {predecessor} {target} ro,nosuid,nodev - ext4 userdata rw,seclabel\n')
+        self.shell(command, overrides=overrides)
+        trace = self.mount_trace.read_text()
+        for pid in ('1', '2'):
+            self.assertIn(f'{pid}:-o remount,bind,ro,nosuid,nodev {self.mount_payload} {target}\n', trace)
+            self.assertEqual((self.root / 'mount-state' / pid).read_text().strip(), digest(self.after))
+        self.assertNotIn('rollback', trace)
 
     def test_composer_transition_exception_rejects_untrusted_metadata(self):
         command, overrides, target = self.mount_fixture()
@@ -1593,6 +1610,60 @@ sleep() {
         self.target.unlink();self.shell('native_reconcile early',overrides=overrides)
         self.assertEqual(trace.read_text(),'');self.assertFalse(self.target.exists())
         self.assertIn('|skipped|unsupported-missing-native\n',(self.module/'state/status.tsv').read_text())
+
+    def test_thermal_monitor_requires_actual_missing_node_and_complete_vendor_proof(self):
+        import patch_thermal_capability as thermal
+        vendor, _, _ = self.privacy_capability_fixture()
+        recipe = 'schema|1\nabsent-node|' + thermal.NODE + '\n'
+        (self.module / 'thermal-monitor-capability.tsv').write_text(recipe)
+        self.checksums()
+        node = self.root / 'board-temperature'
+        self.environment['HYPEROS_NATIVE_TEST_FILES'] = json.dumps({thermal.NODE: str(node)})
+        self.shell('native_eligible thermal-monitor')
+        node.write_text('35000\n')
+        self.assertNotEqual(self.shell('native_eligible thermal-monitor', check=False).returncode, 0)
+        node.unlink(); node.symlink_to(self.root / 'missing-node')
+        self.assertNotEqual(self.shell('native_eligible thermal-monitor', check=False).returncode, 0)
+        node.unlink()
+        (vendor / 'manifest.xml').write_text('unknown vendor declarations')
+        self.assertNotEqual(self.shell('native_eligible thermal-monitor', check=False).returncode, 0)
+
+    def test_brightness_capability_has_its_own_exact_composer_allowlist(self):
+        import patch_display_brightness as brightness
+        import patch_composer as alpha
+        _, _, composer = self.privacy_capability_fixture()
+        recipe = brightness.capability_recipe().decode().replace(alpha.NATIVE, str(composer))
+        recipe = recipe.replace(alpha.BEFORE, digest(composer.read_bytes()))
+        target = self.module / 'display-brightness-capability.tsv'
+        target.write_text(recipe)
+        self.checksums()
+        self.shell('native_privacy_eligible && native_brightness_eligible')
+        original = composer.read_bytes()
+        composer.write_bytes(b'future HWC with different brightness support')
+        self.assertNotEqual(self.shell('native_brightness_eligible', check=False).returncode, 0)
+        composer.write_bytes(original)
+        for changed in (recipe + 'schema|1\n', recipe + recipe.splitlines(True)[1]):
+            target.write_text(changed)
+            self.assertNotEqual(self.shell('native_brightness_eligible', check=False).returncode, 0)
+        target.write_text(recipe)
+        alias = target.with_suffix('.alias'); target.rename(alias); target.symlink_to(alias)
+        self.assertNotEqual(self.shell('native_brightness_eligible', check=False).returncode, 0)
+
+    def test_superseded_framework_output_requires_each_chain_feature_capability(self):
+        first, middle, final = 'a' * 64, 'b' * 64, 'c' * 64
+        path = '/system_ext/framework/miui-services.jar'
+        (self.module / 'profiles.tsv').write_text(
+            '|'.join((first, middle, '', 'perf-hardware', 'uniperf-test')) + '\n' +
+            '|'.join((middle, final, '', 'thermal-monitor', 'thermal-monitor-test')) + '\n')
+        (self.module / 'targets.tsv').write_text(
+            'early|system|perf-hardware|' + path + '||miui-services.jar\n' +
+            'early|system|thermal-monitor|' + path + '||miui-services.jar\n')
+        command = 'native_superseded_output perf-hardware ' + final + ' ' + path
+        self.shell(command, overrides='native_eligible() { return 0; }')
+        self.assertNotEqual(self.shell(command, overrides=
+            'native_eligible() { [ "$1" = perf-hardware ]; }', check=False).returncode, 0)
+        self.assertNotEqual(self.shell(command.replace(path, '/system/framework/services.jar'),
+            overrides='native_eligible() { return 0; }', check=False).returncode, 0)
 
     def metadata_capability_fixture(self):
         import patch_display_metadata as metadata

@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 13
+REVISION = 15
 
 
 def boot_prerequisites():
@@ -64,6 +64,10 @@ def module_files(value=None, template=None):
     files['display-privacy-capability.tsv'] = capability_recipe()
     from patch_display_metadata import capability_recipe as metadata_capability_recipe
     files['display-metadata-capability.tsv'] = metadata_capability_recipe()
+    from patch_thermal_capability import NODE
+    files['thermal-monitor-capability.tsv'] = ('schema|1\nabsent-node|' + NODE + '\n').encode()
+    from patch_display_brightness import capability_recipe as brightness_capability_recipe
+    files['display-brightness-capability.tsv'] = brightness_capability_recipe()
     from patch_xqos import ABSENT_NODES
     files['xqos-capability.tsv'] = ('schema|1\nexpected-drivers|' + str(len(ABSENT_NODES)) + '\n' +
                                     ''.join('driver|' + node + '\n' for node in ABSENT_NODES)).encode()

@@ -383,6 +383,54 @@ class NativeModuleInstallTests(unittest.TestCase):
         self.assertEqual(result['reason'],'unreviewed-core-controls')
         self.assertFalse(any('module install' in command for command in commands));adb.assert_not_called()
 
+    def test_final_frozen_core13_controls_authenticate_before_hardware_capability_changes(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v13-final-manifest.json').read_text()
+        saved = json.loads(previous)
+        expected = 'dc5017041281acfb0b4d5df0fdcabdda17803789c818658fa18b7b7b1b2d52c7'
+        self.assertEqual(saved['revision'], 13)
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 13)
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=13'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(expected, verification); self.assertIn(expected, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['platform.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
+
+    def test_final_deployed_core14_controls_authenticate_before_stacked_bind_fix(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v14-final-manifest.json').read_text()
+        saved = json.loads(previous)
+        expected = 'f49c3f709991edb809dece1997e0693bae5385b4031ab3fe64679b7da9f0888e'
+        self.assertEqual(saved['revision'], 14)
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 14)
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=14'
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed']); self.assertTrue(result['reboot_required'])
+        verification = next(command for command in commands if 'sha256sum -c SHA256SUMS' in command)
+        stage = next(command for command in commands if 'module install' in command)
+        self.assertIn(expected, verification); self.assertIn(expected, stage)
+        self.assertLess(commands.index(verification), commands.index(stage))
+        self.assertEqual(adb.call_count, 1)
+        saved['files_sha256']['platform.sh'] = 'a' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('module install' in command for command in commands)); adb.assert_not_called()
+
     def test_final_frozen_core6_migrates_only_complete_controls_to_policy_revision(self):
         previous = (REPO / 'tests/fixtures/native-compat-v6-final-manifest.json').read_text()
         saved = json.loads(previous)

@@ -72,6 +72,16 @@ native_enabled() {
 
 native_eligible() {
     NATIVE_ELIGIBILITY_REASON=device-capability-unavailable
+    if [ "$1" = display-brightness ]; then
+        NATIVE_ELIGIBILITY_REASON=display-brightness-capability-unconfirmed
+        # The reviewed HWC getDisplayCapabilities has no BRIGHTNESS support.
+        # This rule only restores the known OEM rear branch's capability gate.
+        native_privacy_eligible && native_brightness_eligible && native_eligible rear-input; return $?
+    fi
+    if [ "$1" = thermal-monitor ]; then
+        NATIVE_ELIGIBILITY_REASON=board-temperature-capability-unconfirmed
+        native_privacy_eligible && native_thermal_absent; return $?
+    fi
     if [ "$1" = rear-input ]; then
         # The fixed DEX gate targets logical rear ID 1. Require its exact
         # retained image contract before zygote; a generic external panel or
@@ -114,6 +124,41 @@ native_eligible() {
              if ($i <= 0 || $(i+1) <= 0 || $(i+2) <= 0 || $(i+3) <= 0 || seen[$i+0]++) exit 1;
              if ($i == secondary) found=1;
          } exit !found}'
+}
+
+native_thermal_absent() {
+    local rows node
+    [ -f "$MODDIR/thermal-monitor-capability.tsv" ] && [ ! -L "$MODDIR/thermal-monitor-capability.tsv" ] || return 1
+    rows=$("$BB" awk -F '|' '
+        NR == 1 {if ($0 != "schema|1") exit 1; next}
+        NR == 2 {if (NF != 2 || $1 != "absent-node" ||
+            $2 !~ /^\/sys\/class\/thermal\/[a-zA-Z0-9_]+\/[a-zA-Z0-9_]+$/) exit 1; node=$2; next}
+        {exit 1} END {if (NR != 2 || node == "") exit 1; print node}
+        ' "$MODDIR/thermal-monitor-capability.tsv") || return 1
+    node=$rows
+    native_ns 1 "$BB" test ! -e "$node" && native_ns 1 "$BB" test ! -L "$node"
+}
+
+native_brightness_eligible() {
+    local pins path checksum extra current= seen='|' count=0 match=0 schema=0
+    [ -f "$MODDIR/display-brightness-capability.tsv" ] && [ ! -L "$MODDIR/display-brightness-capability.tsv" ] || return 1
+    pins=$(cat "$MODDIR/display-brightness-capability.tsv") || return 1
+    [ "$(printf '%s\n' "$pins" | "$BB" head -n 1)" = 'schema|1' ] || return 1
+    while IFS='|' read -r kind path checksum extra; do
+        if [ "$kind" = schema ]; then
+            [ "$path" = 1 ] && [ -z "$checksum$extra" ] && [ "$schema" = 0 ] || return 1
+            schema=1; continue
+        fi
+        [ "$kind" = composer ] && [ -z "$extra" ] && native_hex "$checksum" &&
+            [ "$path" = /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu ] || return 1
+        case "$seen" in *"|$checksum|"*) return 1 ;; esac
+        seen="$seen$checksum|"; count=$((count + 1))
+        [ -n "$current" ] || current=$(native_ns_hash 1 "$path")
+        [ "$current" != "$checksum" ] || match=1
+    done <<EOF
+$pins
+EOF
+    [ "$schema" = 1 ] && [ "$count" -gt 0 ] && [ "$match" = 1 ]
 }
 
 native_xqos_absent() {
@@ -346,10 +391,12 @@ native_superseded_output() {
     # An image may already contain composer alpha plus the later rear-display
     # patch. Follow catalog edges for this exact target instead of regressing
     # a verified terminal result to an intermediate composer-only payload.
-    local rear=0
-    native_eligible rear-display && rear=1
-    "$BB" awk -F '|' -v feature="$1" -v checksum="$2" -v target="$3" -v rear="$rear" \
-        'FNR == NR {if ($2 == "system" && $4 == target && ($3 != "rear-display" || rear)) allowed[$3]=1; next}
+    local allowed='|' feature
+    for feature in $("$BB" awk -F '|' -v target="$3" '$2 == "system" && $4 == target {print $3}' "$MODDIR/targets.tsv"); do
+        if native_eligible "$feature"; then allowed="$allowed$feature|"; fi
+    done
+    "$BB" awk -F '|' -v feature="$1" -v checksum="$2" -v target="$3" -v eligible="$allowed" \
+        'FNR == NR {if ($2 == "system" && $4 == target && index(eligible,"|" $3 "|")) allowed[$3]=1; next}
          allowed[$4] {n++; input[n]=$1; output[n]=$2; legacy[n]=$3; group[n]=$4;
              if ($4 == feature) reachable[$2]=1}
          END {for (depth=0; depth<8; depth++) {
@@ -523,7 +570,9 @@ native_mount() {
             native_mount_rollback "$target" "$created"; return 1
         fi
         created="$pid $created"
-        if ! native_ns "$pid" "$BB" mount -o "$options" "$target" ||
+        # Supply both paths: BusyBox's target-only lookup can crash when an
+        # audited framework target already has a preceding module bind.
+        if ! native_ns "$pid" "$BB" mount -o "$options" "$payload" "$target" ||
                 [ "$(native_ns_hash "$pid" "$target")" != "$final" ] ||
                 ! native_mount_flags "$pid" "$target" "$options"; then
             native_mount_rollback "$target" "$created"; return 1

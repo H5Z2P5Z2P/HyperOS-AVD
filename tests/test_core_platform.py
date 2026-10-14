@@ -363,7 +363,7 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
                 'core_safe_file() { return 0; }\nnative_ns_hash() { echo ' + 'f' * 64 + '; }', check=False)
             self.assertNotEqual(result.returncode, 0, 'Actual namespace content must also match.')
 
-    def boot_native_derivative_fixture(self, rear=False):
+    def boot_native_derivative_fixture(self, rear=False, thermal=False, brightness=False):
         import patch_uniperf as uniperf
         from patch_boot_services import image_receipt
         source=REPO/'work/feedback-investigation-20261013/phone-uniperf-loaded-caller/miui-services.jar'
@@ -392,6 +392,16 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
             # oracle models the reviewed byte identity; producer tests audit
             # the proprietary JAR independently when that input is available.
             self.boot_after=b'Public namespace fixture for an audited immutable derivative.'
+        if thermal:
+            import patch_thermal_capability as monitor
+            if source.is_file():
+                self.boot_after = monitor.patch_bytes(self.boot_after)
+            derivative = monitor.RECIPES[derivative]['after']
+        if brightness:
+            import patch_display_brightness as display
+            if source.is_file():
+                self.boot_after = display.patch_bytes(self.boot_after)
+            derivative = display.AFTER
         # Authenticate real generated controls; path mapping substitutes only
         # the namespace's immutable image files, never catalog/hash semantics.
         for name,body in package_native_module.module_files().items():
@@ -410,8 +420,25 @@ getprop() { case "$1" in ro.product.model) echo 'Future Xiaomi';; ro.build.finge
         overrides+='native_ns_hash() { case "$2" in\n'+path+') observed=$(native_hash '+actual+'); if [ "$observed" = '+fixture_hash+' ]; then echo '+derivative+'; else echo "$observed"; fi;;\n'
         overrides+=''.join(shlex.quote(item)+') echo '+checksum+';;\n' for item,checksum in pins.items() if item!=self.boot_path)
         overrides+='*) return 1;;\nesac; }\n'
-        overrides+='native_eligible() { [ "$1" = '+feature+' ]; }\n'
+        overrides+='native_eligible() { [ "$1" = '+feature+' ]'+(' || [ "$1" = thermal-monitor ]' if thermal else '')+(' || [ "$1" = display-brightness ]' if brightness else '')+'; }\n'
         return overrides
+
+    def test_owned_performance_and_thermal_chain_keeps_boot_provenance(self):
+        overrides = self.boot_native_derivative_fixture(thermal=True)
+        self.run_platform('core_context_ready boot', overrides)
+        self.assertEqual((self.root / 'persistent/image.tsv').read_text(), self.boot_rows)
+        (self.module / 'features.disabled').write_text('perf-hardware\nthermal-monitor\n')
+        self.run_platform('core_context_ready boot', overrides)
+        # A present physical node must reject the terminal derived identity.
+        self.assertNotEqual(self.run_platform('core_context_ready boot', overrides +
+            'native_eligible() { [ "$1" = perf-hardware ]; }\n', check=False)[0].returncode, 0)
+
+    def test_owned_rear_input_and_brightness_chain_keeps_boot_provenance(self):
+        overrides = self.boot_native_derivative_fixture(rear=True, brightness=True)
+        self.run_platform('core_context_ready boot', overrides)
+        self.assertEqual((self.root / 'persistent/image.tsv').read_text(), self.boot_rows)
+        self.assertNotEqual(self.run_platform('core_context_ready boot', overrides +
+            'native_eligible() { [ "$1" = rear-input ]; }\n', check=False)[0].returncode, 0)
 
     def test_exact_owned_native_derivative_keeps_independent_boot_provenance_when_feature_off(self):
         overrides=self.boot_native_derivative_fixture()
@@ -612,6 +639,16 @@ native_ns_hash() {
     esac
 }
 '''
+
+    def test_rear_process_requires_one_complete_root_uid_record(self):
+        self.rear_process(123)
+        status = self.proc / '123/status'
+        for value in ('Uid:\t1000\t1000\t1000\t1000\n', 'Uid:\t0\t0\t0\t1000\n',
+                      'Uid:\t0\t0\n', 'Uid:\t0\t0\t0\t0\n' * 2, 'Name:\tforeign\n'):
+            status.write_text(value)
+            self.assertNotEqual(self.run_platform('core_rear_process 123', check=False)[0].returncode, 0)
+        status.write_text('Uid:\t0\t0\t0\t0\n')
+        self.run_platform('core_rear_process 123')
 
     def test_rear_disable_stops_only_the_exact_adopted_process_lifetime(self):
         child = subprocess.Popen(['sleep', '30'])

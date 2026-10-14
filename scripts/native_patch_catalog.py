@@ -13,7 +13,7 @@ import re
 
 
 FEATURES = frozenset(('flutter', 'hwui', 'assistant', 'lockscreen-video',
-                      'navigation', 'composer', 'rear-display', 'rear-input', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware'))
+                      'navigation', 'composer', 'rear-display', 'rear-input', 'display-brightness', 'display-privacy', 'display-metadata', 'wifi-capabilities', 'xqos', 'vendor-ims', 'perf-hardware', 'thermal-monitor'))
 APP_PACKAGES = frozenset(('com.miui.home', 'com.miui.weather2',
                           'com.miui.voiceassist', 'com.miui.aod'))
 SLUG = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
@@ -88,13 +88,23 @@ def validate_catalog(value):
         ranges.sort()
         if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
             raise RuntimeError('Overlapping native patch sites.')
-    # The composer alpha output is the audited rear timing input. No other
-    # cross-profile hash aliases are allowed, including legacy-input aliases.
+    # Only explicit producer chains may reuse a canonical output as input.
+    # Legacy aliases never authorize an additional edit.
     for checksum in output_owners.keys() & input_owners.keys():
         left, right = output_owners[checksum], input_owners[checksum]
-        if ((left['feature'], right['feature']) != ('composer', 'rear-display')
+        if ((left['feature'], right['feature']) not in (
+                ('composer', 'rear-display'), ('perf-hardware', 'perf-hardware'),
+                ('perf-hardware', 'thermal-monitor'), ('thermal-monitor', 'thermal-monitor'),
+                ('rear-input', 'display-brightness'))
                 or checksum != right['before']):
             raise RuntimeError('Ambiguous native patch hash chain.')
+    for start in input_owners:
+        seen, checksum = set(), start
+        while checksum in input_owners:
+            if checksum in seen or len(seen) >= 8:
+                raise RuntimeError('Cyclic or excessive native patch hash chain.')
+            seen.add(checksum)
+            checksum = input_owners[checksum]['after']
     seen_targets, target_features = set(), set()
     system_targets = {}
     for row in value['targets']:
@@ -126,6 +136,16 @@ def validate_catalog(value):
             if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
                     or row['library'] != PurePosixPath(PATH).name or package != ''):
                 raise RuntimeError('Unsafe rear input policy target.')
+        if row['feature'] == 'thermal-monitor':
+            from patch_thermal_capability import PATH
+            if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(PATH).name or package != ''):
+                raise RuntimeError('Unsafe board-temperature framework target.')
+        if row['feature'] == 'display-brightness':
+            from patch_display_brightness import PATH
+            if (row['kind'] != 'system' or path != PATH or row['phase'] != 'early'
+                    or row['library'] != PurePosixPath(PATH).name or package != ''):
+                raise RuntimeError('Unsafe display-brightness framework target.')
         if row['feature'] == 'display-metadata':
             from patch_display_metadata import RECIPES
             if (row['kind'] != 'system' or path not in {value['path'] for value in RECIPES.values()}
@@ -160,6 +180,12 @@ def validate_catalog(value):
         if not (system_targets.get(left['feature'], set())
                 & system_targets.get(right['feature'], set())):
             raise RuntimeError('Native patch chain has no shared target and boot phase.')
+        if left['feature'] != right['feature']:
+            for path, phase in (system_targets[left['feature']] & system_targets[right['feature']]):
+                order = {row['feature']: index for index, row in enumerate(value['targets'])
+                         if row['kind'] == 'system' and row['path'] == path and row['phase'] == phase}
+                if order[left['feature']] >= order[right['feature']]:
+                    raise RuntimeError('Native patch chain target is out of boot order.')
     return value
 
 
@@ -182,6 +208,8 @@ def catalog():
     import patch_uniperf as uniperf
     import patch_bufferqueue_perf as bufferqueue
     import patch_display_metadata as metadata
+    import patch_thermal_capability as thermal
+    import patch_display_brightness as brightness
 
     profiles = []
     for before, row in flutter.PROFILES.items():
@@ -228,12 +256,18 @@ def catalog():
         profiles.append(_profile('display-metadata-' + recipe['before'][:12], 'display-metadata',
                                  recipe['before'], recipe['after'],
                                  [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
+    for producer, feature in ((thermal, 'thermal-monitor'), (brightness, 'display-brightness')):
+        for recipe in producer.catalog_recipes():
+            profiles.append(_profile(feature + '-' + recipe['before'][:12], feature,
+                                     recipe['before'], recipe['after'],
+                                     [(site['offset'], site['before'], site['after']) for site in recipe['sites']]))
     targets = [
         _target('flutter', 'early', flutter_targets.SYSTEM_LIB),
         _target('hwui', 'early', hwui.NATIVE),
         _target('composer', 'early', composer.NATIVE),
         _target('rear-display', 'early', rear.NATIVE),
         _target('rear-input', 'early', rear_input.PATH),
+        _target('display-brightness', 'early', brightness.PATH),
         _target('display-privacy', 'early', privacy.NATIVE),
         *[_target('display-metadata', 'early', path) for path in sorted({value['path'] for value in metadata.RECIPES.values()})],
         _target('wifi-capabilities', 'early', wifi.PATH),
@@ -243,6 +277,7 @@ def catalog():
         _target('perf-hardware', 'early', uniperf.PATH),
         _target('perf-hardware', 'early', uniperf.MIUI_SERVICES),
         _target('perf-hardware', 'early', bufferqueue.NATIVE),
+        _target('thermal-monitor', 'early', thermal.PATH),
         *[_target('flutter', 'late', package=package,
                   library=PurePosixPath(flutter_targets.SYSTEM_LIB).name)
           for package in flutter_targets.PACKAGES],
@@ -252,9 +287,25 @@ def catalog():
         _target('navigation', 'late', package='com.miui.home', library='libapp.so'),
         _target('navigation', 'late', package='com.miui.home', library='libapp_launcher.so'),
     ]
+    # Order cross-feature producers before consumers at the first early hook;
+    # late reconciliation must not repair a framework that zygote already read.
+    by_output = {row['after']: row['feature'] for row in profiles}
+    dependencies = {row['feature']: set() for row in profiles}
+    for row in profiles:
+        source = by_output.get(row['before'])
+        if source is not None and source != row['feature']:
+            dependencies[row['feature']].add(source)
+    ranks = {}
+    while len(ranks) < len(dependencies):
+        ready = {feature: 1 + max((ranks[item] for item in required), default=-1)
+                 for feature, required in dependencies.items()
+                 if feature not in ranks and required <= ranks.keys()}
+        if not ready:
+            raise RuntimeError('Cyclic native patch feature dependencies.')
+        ranks.update(ready)
     value = {'schema': 1, 'profiles': sorted(profiles, key=lambda row: row['id']),
-             'targets': sorted(targets, key=lambda row: tuple(row[key] for key in
-                                                            ('feature', 'kind', 'package', 'library', 'path')))}
+             'targets': sorted(targets, key=lambda row: (ranks[row['feature']], *(row[key] for key in
+                                                            ('feature', 'kind', 'package', 'library', 'path'))))}
     return validate_catalog(value)
 
 

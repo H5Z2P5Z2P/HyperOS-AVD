@@ -119,7 +119,7 @@ class QtiPerfPatchTests(unittest.TestCase):
         self.assertEqual(source[0x18000:0x1a018], output[0x18000:0x1a018])
 
     def test_canonical_offline_catalog_binds_capability_and_reproduces_exact_derivative(self):
-        self.assertEqual(len(qti.catalog_recipes()), 1)
+        self.assertEqual(len(qti.catalog_recipes()), 2)
         receipt = qti.catalog_recipes()[0]
         self.assertEqual(receipt['path'], qti.NATIVE)
         self.assertEqual(receipt['requires'], 'ranchu-without-qti-perf-hal')
