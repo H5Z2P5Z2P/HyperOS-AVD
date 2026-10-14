@@ -23,25 +23,25 @@ chmod +x Install.command
 ./Install.command
 ```
 
-**手机 OS4 r4 需要 Installer 1.2.1 或以上；r3 需要 1.2.0 或以上；Pad OS4 需要 1.1.0 或以上。** 安装器使用独立的 `installer-v*` 正式版本，镜像含 Pre-release，均可在菜单中发现。
+**Phone r6 与 Pad r3 需要 Installer 1.2.3 或以上。** format 3 的最低安装器版本固定为 `verified-bundle-runtime-v1` 协议基线；后续镜像沿用该协议时不需要逐镜像升级安装器。历史 Phone r4 需要 1.2.1 或以上、Phone r3 需要 1.2.0 或以上，历史 Pad 镜像需要 1.1.0 或以上。安装器和镜像使用独立版本线；安装器为正式 Latest，Phone / Pad 镜像为普通正式 Release。
 
-**证书错误：** 源码安装器已修复 Python CA 环境导致的 `CERTIFICATE_VERIFY_FAILED`：仅在证书校验失败时，改用 macOS 系统 HTTPS 校验，保留证书、域名、文件大小与 SHA 校验；显式 CA 配置仍受尊重。已发布的 Installer 1.2.1 尚不包含此修复。
+**证书错误：** Installer 1.2.2 起，Python CA 环境导致的 `CERTIFICATE_VERIFY_FAILED` 会在证书校验失败时回退至 macOS 系统 HTTPS 校验，同时保留证书、域名、文件大小与 SHA 校验；显式 CA 配置仍受尊重。
 
 ```text
 +------------------------------------------------------------------+
-| H Y P E R O S - A V D   /   INSTALLER 1.2.0                        |
+| H Y P E R O S - A V D   /   INSTALLER 1.2.3                      |
 +------------------------------------------------------------------+
-| [1] Install a new AVD       [2] Upgrade / keep data                |
-| [3] Start an instance       [4] RAM / storage / CPU                |
-| [5] Browse images / updates [6] Recover / rollback                 |
-| [7] Installer updates      [0] Exit                               |
+| [1] Install a new AVD       [2] Upgrade / keep data              |
+| [3] Start an instance       [4] RAM / storage / CPU              |
+| [5] Browse images / updates [6] Recover / rollback               |
+| [7] Installer updates      [0] Exit                              |
 +------------------------------------------------------------------+
 ```
 
 | 镜像 | 默认 RAM / CPU / 存储 | 数据系列 |
 | --- | --- | --- |
-| 手机 OS4 | 6 GiB / 4 核 / 32 GiB | `hongkong`，r1 / r2 / r3 可直接保数据升 r4 |
-| Pad OS4 | 4 GiB / 4 核 / 32 GiB | `yingtian`，与手机独立 |
+| 手机 OS4 | 6 GiB / 4 核 / 32 GiB | `hongkong`，同系列向前升级至 r6 |
+| Pad OS4 | 4 GiB / 4 核 / 32 GiB | `yingtian`，同系列向前升级至 r3，与手机独立 |
 | OS3 | 2.5 GiB / 2 核 / 32 GiB | `fuxi`，与 OS4 独立 |
 
 资源可自定义，存储不允许缩小。Installer 1.2.0 会检查实际 ext4 容量，修复配置显示 32 GiB、系统 `/data` 仍只有原容量的问题；手机负一屏完整背景模糊建议 8 GiB。名称支持字母、数字、点、下划线和连字符。每个实例独立保存镜像、数据和端口，兼容修复使用实例配置与固件校验，不依赖出厂 AVD 名称。
@@ -50,13 +50,33 @@ chmod +x Install.command
 
 手机小米相机桥接可选开启，Pad 自动初始化自身桥接；相机仍属实验功能。r3 会自动建立独立背屏窗口，支持原版右边缘向左返回、双击息屏与唤醒。
 
-## r1 / r2 / r3 → r4 保数据升级
+首次启动会安装 Core / Apps；若提示重启，请正常重启一次以完成激活。
+
+以下步骤说明安装器支持的升级路径；最终附件上的保数据升级验收单独记录在[Phone r6 / Pad r3 验证报告](releases/os4-r6-pad-r3-validation.md)。
+
+## Phone r5 → r6 保数据升级
+
+1. **关闭目标 AVD**，然后打开 Installer 1.2.3 或更新版本。
+2. 选择“升级” → 已注册的 `hongkong` 手机 OS4 实例 → `v0.2.5-a17-hyperos4-hongkong-r6`。
+3. 安装器先检查 format 3 manifest、最低版本、固件身份和模块兼容性，再保存完整 userdata、QCOW2、加密密钥及实例配置并切换；任何检查失败时都停止操作，不绕过保护继续升级。
+4. 完成后从安装器或原实例目录的 `Start.command` 启动，确认原应用、个人数据、稳定身份、硬件配置和功能选择。
+
+Phone r6 的 format 3 协议最低版本为 Installer 1.2.3；使用同一协议的后续镜像仍可由 Installer 1.2.3 安装，不要求每次镜像修订都升级安装器。
+
+## Pad r2 → r3 保数据升级
+
+1. **关闭目标 Pad AVD**，然后打开 Installer 1.2.3 或更新版本。
+2. 选择“升级” → 已注册的 `yingtian` Pad OS4 实例 → `pad-v0.1.2-a17-hyperos4-yingtian-r3`。
+3. 安装器校验同一 Pad 数据系列、format 3 协议和完整备份后才切换；检查失败时保留原实例并停止。
+4. 完成后从安装器或原实例目录的 `Start.command` 启动。Phone 与 Pad 不可互相覆盖升级，也不支持保数据降级。
+
+## Phone r1 / r2 / r3 → r4 保数据升级
 
 关闭目标 AVD，使用 **Installer 1.2.1** 选择“升级” → 原手机 OS4 实例 → `v0.2.3-a17-hyperos4-hongkong-r4`。自动备份用户分区、QCOW2 与加密密钥，校验固件与项目模块兼容性后切换到 OS4.0.18.0 修复镜像，保留名称、硬件配置、应用与设置；失败可从备份恢复。已有 r4 可重装，保数据降级不支持。
 
 r4 修复已写入系统分区，新装或恢复出厂后也会保留。此前项目自带的 boot-service 测试模块与 r4 使用相同修复字节；本次升级不会删除用户模块。Installer 1.2.0 不识别 r4，请先更新安装器。r1 / r2 / r3 均可直接升级至 r4。
 
-## r2 → r3 保数据升级
+## 历史 Phone r2 → r3 保数据升级
 
 1. **关闭目标 AVD**，其他 AVD 可继续运行；打开 Installer 1.2.0。
 2. 选择 `2 升级` → 已注册的 r2 实例 → `v0.2.2-a17-hyperos4-hongkong-r3`。保留实例名称、端口与存储容量。
@@ -75,7 +95,7 @@ r4 修复已写入系统分区，新装或恢复出厂后也会保留。此前�
 
 旧版若虚拟盘已是 32 GiB，但 `/data` 只有约 6 GiB，在该菜单仍填 **32 GiB**。安装器先保存完整备份，再临时启动同一实例，检查解密后的 `/data` 超级块；必要时在线扩容并复核容量、UUID 与文件探针。随后关闭维护实例、记录容量证明，正常冷启动。r3 启动器也能自动执行这项旧盘检查。若提示 ADB 未授权，先在目标实例授权再重试。
 
-源码安装器也支持已启用元数据加密的实例继续扩容（如 6 → 32 GiB）：核验完整离线备份后，扩展磁盘容器并保留原有字节与密钥，再在该实例内扩展解密后的 ext4；容量以实际超级块验证为准。已发布的 Installer 1.2.1 尚不包含这条新增路径。32 GiB 虚拟盘在系统内通常显示约 31 GiB，格式化开销会减少可用空间。在线检查失败时备份仍保留；恢复必须先关闭目标实例。
+Installer 1.2.2 起支持已启用元数据加密的实例继续扩容（如 6 → 32 GiB）：核验完整离线备份后，扩展磁盘容器并保留原有字节与密钥，再在该实例内扩展解密后的 ext4；容量以实际超级块验证为准。32 GiB 虚拟盘在系统内通常显示约 31 GiB，格式化开销会减少可用空间。在线检查失败时备份仍保留；恢复必须先关闭目标实例。
 
 ## 恢复
 
@@ -86,14 +106,14 @@ r4 修复已写入系统分区，新装或恢复出厂后也会保留。此前�
 ## CLI / 离线安装
 
 ```sh
-# A new phone instance, after r4 is published.
+# Create a new Phone r6 instance.
 python3 scripts/manage.py install --variant os4-official \
   --root "$HOME/HyperOS-AVD/instances/My_OS4" --name My_OS4 \
-  --release v0.2.3-a17-hyperos4-hongkong-r4 --ram 6 --storage 32 --cores 4 --start
+  --release v0.2.5-a17-hyperos4-hongkong-r6 --ram 6 --storage 32 --cores 4 --start
 
 # Offline install or upgrade: keep the existing root, name and port.
 python3 scripts/manage.py install --root /path/to/instance \
-  --name My_OS4 --bundle /path/to/r4/manifest.json \
+  --name My_OS4 --bundle /path/to/r6/manifest.json \
   --ram 6 --storage 32 --cores 4
 
 python3 scripts/manage.py releases --variant os4-official
@@ -104,7 +124,8 @@ python3 scripts/manage.py start --root /path/to/instance
 
 # Pad defaults to 4 GiB RAM / 32 GiB storage / 4 cores.
 python3 scripts/manage.py install --variant os4-pad \
-  --root "$HOME/HyperOS-AVD/instances/My_Pad" --name My_Pad --release latest --start
+  --root "$HOME/HyperOS-AVD/instances/My_Pad" --name My_Pad \
+  --release pad-v0.1.2-a17-hyperos4-yingtian-r3 --start
 ```
 
 离线安装需将同一 Release 的全部分卷与 `manifest.json` 放在同一目录，保持文件名不变；`SHA256SUMS` 用于额外核验。下载支持断点续传与 SHA-256 校验，失败保留缓存；API 限流或网络中断时可稍后重试，或使用 `--bundle`。
