@@ -10,9 +10,9 @@
 
 Phone 与 Pad 是独立的 firmware / userdata family。Phone 使用小米 18 Pro（hongkong）官方 **OS4.0.24.0.XFRCNXM / Android 17**；Pad 使用 Xiaomi Pad 9 Pro Max（yingtian）官方 **OS4.0.15.0.XBMCNXM / Android 17**。两端共享 **Core 18 / Apps 7** 通用模块内容，平台上下文仍按机型和硬件能力绑定。
 
-## Format 3 冻结运行包
+## Format 3 运行包协议
 
-Phone 和 Pad 镜像使用 format 3，并通过 `verified-bundle-runtime-v1` 校验与运行。协议最低安装器版本集中定义为 **1.2.3**；该值由协议版本确定，不随每个镜像修订递增。同一协议下继续发布镜像时，不需为单个镜像版本重新提升 Installer 最低版本。用户消费包离线工作，不依赖 NDK、原始 OTA 或生产者缓存。
+Phone 和 Pad 镜像均使用 format 3 运行包格式，并通过 `verified-bundle-runtime-v1` 协议验证与执行。该协议将最低安装器版本基线统一定义为 **1.2.3**；后续镜像只要保持同一协议，用户端均可直接使用 Installer 1.2.3 进行安装或升级，无需每次发布新镜像都单独提高安装器最低版本。发布的运行包完全支持离线使用，用户端无需配置 NDK、原始 OTA 或外部编译缓存。
 
 安装器源码、`install.sh` bootstrap 元数据和压缩包版本保持一致。Installer 1.2.3 的 `install.sh` 应与包内文件逐字节一致；Phone / Pad `manifest.json` 则分别记录对应固件身份、userdata family、运行包协议和 `minimum_installer=1.2.3`。
 
@@ -60,9 +60,9 @@ Installer 打包前核对 `scripts/manage.py`、bootstrap 与 `installer.json` �
 (cd releases/pad-v0.1.2-a17-hyperos4-yingtian-r3 && shasum -a 256 -c SHA256SUMS)
 ```
 
-核对分卷、解包文件、冻结运行源码、WebUI、安装器收据、权限和 SHA-256；核对空白 userdata、安全 ADB、原机配置与可启动基线。模块不能替代恢复出厂后的首次系统扫描、Java / SELinux / kernel 或宿主适配验收。
+打包完成后，应核对分卷、文件清单、WebUI、安装器收据及 SHA-256 校验和，确保包含空白 userdata、安全 ADB 授权与正确的原机配置。
 
-发行正文应与[Phone r6 / Pad r3 验证报告](releases/os4-r6-pad-r3-validation.md)保持一致，并分别陈述附件完整性、实际来宾启动、模块加载和迁移验收。短时日志窗口、旧运行实例的 DEX 映射或模块资产校验，均不能代替最终附件的独立新装证据。保留 PowerInsight 对虚拟 CPU 功耗模型及部分功耗 / 温度节点的采样失败、厂商能力探测及 SELinux 拒绝诊断；不放宽 SELinux。历史宿主 warm-reboot 图形卡顿、MoltenVK mutex 崩溃及 Pad 来宾关机后宿主未自行退出的问题继续作为未闭环事项；相机完整拍照、HDR、录像算法及长期稳定性不由有限采样证明。
+发布说明内容需与 [双端验证报告](releases/os4-r6-pad-r3-validation.md) 保持一致，客观呈现真实测试范围与已知问题（如相机高级夜景/录像算法待完善、部分虚拟功耗节点告警等），不作未经实测的过度承诺。
 
 ## 发布顺序
 

@@ -1785,7 +1785,7 @@ native_ns() {
 
     def ims_jar_fixture(self):
         import patch_xiaomi_ims as ims
-        from test_xiaomi_ims_patch import actual_input
+        from test_hardware_patches import actual_input
         original=actual_input()
         if original is None:self.skipTest('Private audited IMS JAR unavailable; no download attempted.')
         self.target=self.root/'xiaomi-opt-ims.jar';self.target.write_bytes(original);self.target.chmod(0o644)

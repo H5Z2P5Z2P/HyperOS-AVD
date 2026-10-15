@@ -107,7 +107,7 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
 
     def test_future_installer_version_does_not_raise_protocol_baseline(self):
         import package_release
-        from test_pad_release import build_info
+        from test_os4_pad import build_info
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); (root / 'local').mkdir()
             (root / 'local/build.json').write_text(json.dumps(build_info()))

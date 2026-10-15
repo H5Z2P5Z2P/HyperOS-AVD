@@ -66,9 +66,9 @@ Core 状态为 `/data/adb/modules/hyperos_avd_native_compat/state/status.tsv`，
 
 恢复出厂会清除 `/data/adb`。可启动镜像、首次扫描、Java/SELinux/内核等必要基线必须留在镜像；userdata 模块不能保证重置后的第一次启动。启动器在基线可用后恢复两个模块，需要时完成正常重启。镜像内 KSU 自举的恢复出厂路径未完成验证前，不写成已实现能力。
 
-## 构建与维护
+## 构建与维护指南
 
-最终用户只消费已核验的预构建包，安装和启动不需要 NDK、编译器或外部 donor 工作区。发布者用显式本地 cache roots 收集完整规则集合；所有输入、编译源和输出均需收据校验，目录顺序不会改变结果。任意缺少已审计载荷的构建应失败，不能按当前设备悄悄删减规则。
+普通用户直接使用发布的预编译包即可，日常安装和启动无需安装 NDK、编译器或下载额外开发依赖。开发者构建通用模块时，使用明确的本地缓存目录收集全量规则集合；所有输入、源码与产物均进行哈希校验，保证构建结果确定且一致。缺失必要适配载荷时会直接报错中断，不会在不同设备间隐式删减规则。
 
 ```sh
 python3 scripts/package_native_module.py --output /path/to/native-compat.zip
@@ -107,8 +107,8 @@ for workspace in cache_roots:
 - Phone 的 Weather、OEM Camera、Parrot 三个旧模块以及 Pad 的 Weather、Camera 旧模块已认证迁移；两端只有 Core、Apps 两个项目模块，无 pending 或旧 worker，Phone 原有的 LSPosed / Zygisk 保留。
 - root、SELinux Enforcing、HWUI `skiavk`、主屏 active/render 60 Hz 正常；Phone 背屏与 Pad 270° 方向保持。机型、稳定序列号、Android ID、全部包版本、七项抽查设置及 Apps 功能选择保持原样。
 - 两版天气分别使用各自原先的同一已签名 APK 保数据重装，PM 路径确实改变；guest 模块自行重新发现、核验和绑定。旧进程结束后重新打开，温度、背景、预报正常，私有 patched ELF 的内容和实际 loaded backing inode 均吻合；Phone 既有定位授权弹窗未代答。
-- 两版 OEM 相机的虚拟场景预览正常，实际 provider/HWL 的已加载 inode 与预期输出吻合；Pad 私有 YUV JNI 同样实载。Phone 预览未加载该 JNI，不能据此宣称其拍照或完整录像算法已验收。
-- Phone Parrot 的虚拟预览正常，首次配置弹窗未代答；预览路径未加载可选 allocator bridge，其映射核验不作为 HDR/录像算法验收。
+- 手机和平板端官方相机的虚拟场景画面预览均正常工作，平板端加载了私有 YUV JNI 桥接，手机端预览使用原生流模式；高级夜景与高质量录像算法仍有待进一步完善。
+- 手机端移植的谷歌相机（Parrot）虚拟场景预览正常，可按需选装；HDR 与录像高级功能暂未适配。
 - Core / Apps WebUI 在两版均已实际打开并刷新，读取 guest 状态；未安装 Parrot 的 Pad 明确显示未匹配。生命周期标记优先于旧状态，日志不参与结构化状态解析。
 - 完整回归在 Core 4 / Apps 2 阶段共 **884 项，其中 56 项可选跳过，828 项执行通过**；最后的 Apps 3 文件名边界与宿主版本迁移修正分别通过完整 18 项定向回归。相关启动、上下文和 Phone/Pad 交付集成检查共 73 项，其中一项可选跳过，执行项通过。
 - 实际 release runtime 的 106 个文件及 Core / Apps 资产复制到改名、含空格的独立工作区，在空 PATH、无 SDK/NDK/编译器、禁止网络和原工作区读取的消费环境下均通过认证；Apps 1 / 2 的严格历史认证资料随包完整交付。

@@ -1,8 +1,9 @@
-"""Check image import integrity and isolation with small synthetic release files."""
-import hashlib
+"""Consolidated unit tests for installer subsystem: runtime installation & release packaging."""
 import copy
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -10,19 +11,29 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+REPO = Path(__file__).resolve().parents[1]
+ROOT = REPO
+sys.path.insert(0, str(REPO / 'scripts'))
+
 import common
-import setup
+import package_installer
 import package_release
 import phone_profile
+import setup
 
+
+
+# --- tests/test_installer.py ---
+
+'Check image import integrity and isolation with small synthetic release files.'
 
 class InstallerTests(unittest.TestCase):
+
     def instance_profile(self, root, source, name='Custom_instance', port=5580):
         (root / 'local').mkdir(parents=True)
-        (root / 'local/build.json').write_text(json.dumps({
-            'source': source, 'android_api': 36 if source == 'os3' else 37}))
+        (root / 'local/build.json').write_text(json.dumps({'source': source, 'android_api': 36 if source == 'os3' else 37}))
         (root / 'local/runtime.json').write_text(json.dumps({'name': name, 'port': port}))
 
     def fixture(self, root, member='images/system.img'):
@@ -32,61 +43,38 @@ class InstallerTests(unittest.TestCase):
             info = tarfile.TarInfo(member)
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
-        manifest = {'project': 'HyperOS-AVD', 'format': 1, 'version': 'vtest',
-                    'platform': 'macos-arm64', 'parts': [{'name': asset.name,
-                    'size': asset.stat().st_size, 'sha256': common.sha256(asset)}],
-                    'files': {member: {'size': len(payload), 'sha256': hashlib.sha256(payload).hexdigest()}}}
+        manifest = {'project': 'HyperOS-AVD', 'format': 1, 'version': 'vtest', 'platform': 'macos-arm64', 'parts': [{'name': asset.name, 'size': asset.stat().st_size, 'sha256': common.sha256(asset)}], 'files': {member: {'size': len(payload), 'sha256': hashlib.sha256(payload).hexdigest()}}}
         path = root / 'manifest.json'
         path.write_text(json.dumps(manifest))
-        return path, asset
+        return (path, asset)
 
     def os4_fixture(self, root, template=None):
-        entries = {'images/system.img': b'official test firmware',
-                   'config/avd.ini': template or b'target=android-37.0\nhw.cpu.arch=arm64\n'}
+        entries = {'images/system.img': b'official test firmware', 'config/avd.ini': template or b'target=android-37.0\nhw.cpu.arch=arm64\n'}
         asset = root / 'os4.part001'
         with tarfile.open(asset, 'w:gz') as archive:
             for name, payload in entries.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(payload)
                 archive.addfile(info, io.BytesIO(payload))
-        build = {'source': common.OS4_SOURCE, 'hyperos': '4.0.17.0.XFRCNXM',
-                 'android_api': 37, 'adb_authentication': True}
-        manifest = {'project': 'HyperOS-AVD', 'format': 2, 'version': 'vtest-os4',
-                    'platform': 'macos-arm64', 'variant': 'os4-official',
-                    'hyperos': build['hyperos'], 'android_api': 37, 'build': build,
-                    'parts': [{'name': asset.name, 'size': asset.stat().st_size,
-                               'sha256': common.sha256(asset)}],
-                    'files': {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-                              for name, data in entries.items()}}
+        build = {'source': common.OS4_SOURCE, 'hyperos': '4.0.17.0.XFRCNXM', 'android_api': 37, 'adb_authentication': True}
+        manifest = {'project': 'HyperOS-AVD', 'format': 2, 'version': 'vtest-os4', 'platform': 'macos-arm64', 'variant': 'os4-official', 'hyperos': build['hyperos'], 'android_api': 37, 'build': build, 'parts': [{'name': asset.name, 'size': asset.stat().st_size, 'sha256': common.sha256(asset)}], 'files': {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()} for name, data in entries.items()}}
         path = root / 'manifest.json'
         path.write_text(json.dumps(manifest))
-        return path, manifest
+        return (path, manifest)
 
     def pad_fixture(self, root, template=None):
-        path, manifest = self.os4_fixture(root, template or
-            b'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=4096\nhw.cpu.ncore=4\ndisk.dataPartition.size=32G\n')
-        manifest.update(format=3, variant='os4-pad', version='pad-v0.1.0-a17-hyperos4-yingtian-r1',
-                        source=setup.PAD_SOURCE, source_device='yingtian', hyperos=setup.PAD_HYPEROS)
-        manifest['build'].update(source=setup.PAD_SOURCE, device='yingtian',
-                                 hyperos=setup.PAD_HYPEROS)
-        manifest['compatibility'] = {'userdata_family': setup.PAD_FAMILY,
-                                     'minimum_installer': '1.1.0', 'runtime_in_bundle': True}
+        path, manifest = self.os4_fixture(root, template or b'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=4096\nhw.cpu.ncore=4\ndisk.dataPartition.size=32G\n')
+        manifest.update(format=3, variant='os4-pad', version='pad-v0.1.0-a17-hyperos4-yingtian-r1', source=setup.PAD_SOURCE, source_device='yingtian', hyperos=setup.PAD_HYPEROS)
+        manifest['build'].update(source=setup.PAD_SOURCE, device='yingtian', hyperos=setup.PAD_HYPEROS)
+        manifest['compatibility'] = {'userdata_family': setup.PAD_FAMILY, 'minimum_installer': '1.1.0', 'runtime_in_bundle': True}
         path.write_text(json.dumps(manifest))
-        return path, manifest
+        return (path, manifest)
 
     def test_pad_manifest_requires_exact_source_schema_device_and_userdata_family(self):
         with tempfile.TemporaryDirectory() as d:
             path, manifest = self.pad_fixture(Path(d))
             self.assertEqual(setup.read_manifest(str(path))[0], manifest)
-            mutations = [(('format',), 2), (('variant',), 'os4-official'),
-                         (('version',), 'v0.3.0-a17-hyperos4-yingtian-r1'),
-                         (('source',), common.OS4_SOURCE), (('source_device',), 'hongkong'),
-                         (('hyperos',), 'OS4.0.16.0.XBMCNXM'), (('android_api',), 36),
-                         (('build', 'source'), common.OS4_SOURCE), (('build', 'device'), 'hongkong'),
-                         (('build', 'android_api'), 36), (('build', 'adb_authentication'), False),
-                         (('compatibility', 'userdata_family'), 'os4-hongkong-api37-ranchu-4k'),
-                         (('compatibility', 'minimum_installer'), '1.0.0'),
-                         (('compatibility', 'runtime_in_bundle'), False)]
+            mutations = [(('format',), 2), (('variant',), 'os4-official'), (('version',), 'v0.3.0-a17-hyperos4-yingtian-r1'), (('source',), common.OS4_SOURCE), (('source_device',), 'hongkong'), (('hyperos',), 'OS4.0.16.0.XBMCNXM'), (('android_api',), 36), (('build', 'source'), common.OS4_SOURCE), (('build', 'device'), 'hongkong'), (('build', 'android_api'), 36), (('build', 'adb_authentication'), False), (('compatibility', 'userdata_family'), 'os4-hongkong-api37-ranchu-4k'), (('compatibility', 'minimum_installer'), '1.0.0'), (('compatibility', 'runtime_in_bundle'), False)]
             for keys, value in mutations:
                 invalid = copy.deepcopy(manifest)
                 field = invalid
@@ -121,14 +109,12 @@ class InstallerTests(unittest.TestCase):
                 setup.install_bundle(str(path))
             download.assert_not_called()
             self.assertEqual((root / 'images/system.img').read_bytes(), b'official test firmware')
-            self.assertEqual(json.loads((root / 'local/runtime.json').read_text())
-                             ['hardware']['hw.ramSize'], '6144')
+            self.assertEqual(json.loads((root / 'local/runtime.json').read_text())['hardware']['hw.ramSize'], '6144')
 
     def test_pad_invalid_archive_ram_rejected_before_firmware_promotion(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            path, _ = self.pad_fixture(root,
-                b'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=65537\n')
+            path, _ = self.pad_fixture(root, b'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=65537\n')
             image = root / 'images/system.img'
             image.parent.mkdir()
             image.write_bytes(b'original tablet image')
@@ -142,17 +128,14 @@ class InstallerTests(unittest.TestCase):
             repo = Path(d).resolve()
             self.instance_profile(repo, 'os3', name='Kept_OS3', port=5586)
             original = (repo / 'local/runtime.json').read_bytes()
-            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), \
-                    patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
-                self.assertEqual(setup.select_release({'variant': 'os4-pad'}),
-                                 ('HyperOS_4_Pad9ProMax_API_37', 5582))
+            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
+                self.assertEqual(setup.select_release({'variant': 'os4-pad'}), ('HyperOS_4_Pad9ProMax_API_37', 5582))
                 root = repo / 'work/os4-pad'
                 self.assertEqual(setup.ROOT, root)
                 self.assertFalse(root.exists())
                 self.instance_profile(root, setup.PAD_SOURCE, name='My_Tablet', port=5584)
                 self.assertEqual(setup.select_release({'variant': 'os4-pad'}), ('My_Tablet', 5584))
-                self.assertEqual(setup.select_release({'variant': 'os4-pad'}, name='New_Label'),
-                                 ('New_Label', 5584))
+                self.assertEqual(setup.select_release({'variant': 'os4-pad'}, name='New_Label'), ('New_Label', 5584))
                 with patch.dict('os.environ', {'HYPEROS_AVD_WORKSPACE': str(root)}):
                     with self.assertRaisesRegex(RuntimeError, 'does not match'):
                         setup.select_release({'variant': 'os4-official'})
@@ -162,17 +145,14 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'local').mkdir()
-            (root / 'local/installed-release.json').write_text(json.dumps({
-                'project': 'HyperOS-AVD', 'variant': 'os4-pad'}))
+            (root / 'local/installed-release.json').write_text(json.dumps({'project': 'HyperOS-AVD', 'variant': 'os4-pad'}))
             self.assertEqual(setup.workspace_profile(root), setup.PAD_SOURCE)
 
     def test_os4_import_installs_boot_profile_and_preserves_userdata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path, manifest = self.os4_fixture(root)
-            # Direct reimport preserves data only for the same verified OTA.
-            manifest['build']['archive_sha256'] = phone_profile.profile(
-                manifest['hyperos'])['archive_sha256']
+            manifest['build']['archive_sha256'] = phone_profile.profile(manifest['hyperos'])['archive_sha256']
             path.write_text(json.dumps(manifest))
             (root / 'local').mkdir()
             (root / 'local/build.json').write_text(json.dumps(manifest['build']))
@@ -199,8 +179,7 @@ class InstallerTests(unittest.TestCase):
     def test_os4_selects_separate_root_and_supports_owned_custom_instances(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
-            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), \
-                    patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
+            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
                 self.assertEqual(setup.select_release({'variant': 'os4-official'}), (common.OS4_NAME, 5574))
                 self.assertEqual(setup.ROOT, repo / 'work/os4-official')
                 self.assertEqual(setup.select_release({'variant': 'os4-official'}, name='Custom_temp', port=5580), ('Custom_temp', 5580))
@@ -218,8 +197,7 @@ class InstallerTests(unittest.TestCase):
                     root = repo / str(index)
                     self.instance_profile(root, source)
                     before = (root / 'local/runtime.json').read_bytes()
-                    with patch.object(setup, 'ROOT', root), patch.object(setup, 'REPO_ROOT', repo), \
-                            patch.object(common, 'ROOT', root):
+                    with patch.object(setup, 'ROOT', root), patch.object(setup, 'REPO_ROOT', repo), patch.object(common, 'ROOT', root):
                         self.assertEqual(setup.select_release(None), ('Custom_instance', 5580))
                         self.assertEqual(setup.select_release(None, name='Explicit'), ('Explicit', 5580))
                         self.assertEqual(setup.select_release(None, port=5584), ('Custom_instance', 5584))
@@ -230,8 +208,7 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             (root / 'local').mkdir()
-            (root / 'local/installed-release.json').write_text(json.dumps({
-                'project': 'HyperOS-AVD', 'format': 1}))
+            (root / 'local/installed-release.json').write_text(json.dumps({'project': 'HyperOS-AVD', 'format': 1}))
             (root / 'local/runtime.json').write_text(json.dumps({'name': 'My_OS3', 'port': 5586}))
             with patch.object(setup, 'ROOT', root), patch.object(common, 'ROOT', root):
                 self.assertEqual(setup.select_release(None), ('My_OS3', 5586))
@@ -241,10 +218,8 @@ class InstallerTests(unittest.TestCase):
             repo = Path(temporary).resolve()
             self.instance_profile(repo, 'os3', name='My_OS3', port=5586)
             before = (repo / 'local/runtime.json').read_bytes()
-            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), \
-                    patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
-                self.assertEqual(setup.select_release({'variant': 'os4-official'}),
-                                 (common.OS4_NAME, common.OS4_PORT))
+            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), patch.object(common, 'ROOT', repo), patch.dict('os.environ', {}, clear=True):
+                self.assertEqual(setup.select_release({'variant': 'os4-official'}), (common.OS4_NAME, common.OS4_PORT))
                 self.assertEqual(setup.ROOT, repo / 'work/os4-official')
             self.assertEqual((repo / 'local/runtime.json').read_bytes(), before)
             self.assertFalse((repo / 'work/os4-official').exists())
@@ -255,9 +230,7 @@ class InstallerTests(unittest.TestCase):
             root = repo / 'old-os3'
             self.instance_profile(root, 'os3', name='My_OS3', port=5586)
             before = (root / 'local/runtime.json').read_bytes()
-            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), \
-                    patch.object(common, 'ROOT', repo), \
-                    patch.dict('os.environ', {'HYPEROS_AVD_WORKSPACE': str(root)}, clear=True):
+            with patch.object(setup, 'ROOT', repo), patch.object(setup, 'REPO_ROOT', repo), patch.object(common, 'ROOT', repo), patch.dict('os.environ', {'HYPEROS_AVD_WORKSPACE': str(root)}, clear=True):
                 for overrides in ({}, {'name': 'Explicit', 'port': 5584}):
                     with self.assertRaisesRegex(RuntimeError, 'does not match'):
                         setup.select_release({'variant': 'os4-official'}, **overrides)
@@ -277,11 +250,7 @@ class InstallerTests(unittest.TestCase):
     def test_launcher_instruction_follows_source_and_workspace_not_name(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
-            cases = ((repo, 'os3', common.OS4_NAME, 'Start-HyperOS.command'),
-                     (repo / 'work/os4-official', common.OS4_SOURCE, 'My_phone',
-                      'Start-HyperOS4-Official.command'),
-                     (repo / 'work/os4-pad', 'official-yingtian-ota', 'My_pad',
-                      'Start-HyperOS4-Pad.command'))
+            cases = ((repo, 'os3', common.OS4_NAME, 'Start-HyperOS.command'), (repo / 'work/os4-official', common.OS4_SOURCE, 'My_phone', 'Start-HyperOS4-Official.command'), (repo / 'work/os4-pad', 'official-yingtian-ota', 'My_pad', 'Start-HyperOS4-Pad.command'))
             with patch.object(setup, 'REPO_ROOT', repo):
                 for root, source, name, launcher in cases:
                     self.instance_profile(root, source, name)
@@ -318,9 +287,7 @@ class InstallerTests(unittest.TestCase):
             root = Path(temporary).resolve()
             self.instance_profile(root, common.OS4_SOURCE)
             with patch.object(setup, 'ROOT', root):
-                for saved, message in (({'name': '../escape', 'port': 5580}, 'ASCII'),
-                                       ({'name': 'Custom', 'port': 5581}, 'even emulator'),
-                                       ({'name': 'Custom', 'port': True}, 'even emulator')):
+                for saved, message in (({'name': '../escape', 'port': 5580}, 'ASCII'), ({'name': 'Custom', 'port': 5581}, 'even emulator'), ({'name': 'Custom', 'port': True}, 'even emulator')):
                     (root / 'local/runtime.json').write_text(json.dumps(saved))
                     with self.assertRaisesRegex(RuntimeError, message):
                         setup.select_build_instance(common.OS4_SOURCE, 'Fresh', 5582)
@@ -342,7 +309,7 @@ class InstallerTests(unittest.TestCase):
             writer.write(b'0123456')
             writer.close_part()
             self.assertEqual([item['size'] for item in writer.parts], [3, 3, 1])
-            self.assertEqual(b''.join((root / item['name']).read_bytes() for item in writer.parts), b'0123456')
+            self.assertEqual(b''.join(((root / item['name']).read_bytes() for item in writer.parts)), b'0123456')
             for item in writer.parts:
                 self.assertEqual(common.sha256(root / item['name']), item['sha256'])
 
@@ -425,7 +392,8 @@ class InstallerTests(unittest.TestCase):
             data.write_bytes(b'personal tablet data')
             config = data.parent / 'config.ini'
             config.write_text('original configuration\n')
-            registry = root / 'registry';registry.mkdir()
+            registry = root / 'registry'
+            registry.mkdir()
             registration = registry / 'My_pad.ini'
             registration.write_text('path=' + str(data.parent) + '\ntarget=android-37.0\n')
             with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=registry):
@@ -440,10 +408,8 @@ class InstallerTests(unittest.TestCase):
             root = Path(temporary)
             self.instance_profile(root, 'official-yingtian-ota', name='My_pad', port=5582)
             (root / 'config').mkdir()
-            (root / 'config/avd.ini').write_text(
-                'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=8192\n')
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'):
+            (root / 'config/avd.ini').write_text('target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=8192\n')
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'):
                 setup.configure(root / 'sdk', 'My_pad', 5582)
             self.assertIn('hw.ramSize=8192\n', (root / 'avd/My_pad.avd/config.ini').read_text())
             state = json.loads((root / 'local/runtime.json').read_text())
@@ -458,10 +424,7 @@ class InstallerTests(unittest.TestCase):
             config = root / 'avd/My_pad.avd/config.ini'
             config.parent.mkdir(parents=True)
             config.write_text('disk.ramdisk.path=/user/custom.img\n')
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Custom content')), \
-                    patch('ksu_ramdisk.prepare_runtime') as prepare:
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Custom content')), patch('ksu_ramdisk.prepare_runtime') as prepare:
                 setup.configure(root / 'sdk', 'My_pad', 5582)
             self.assertIn('disk.ramdisk.path=/user/custom.img\n', config.read_text())
             prepare.assert_not_called()
@@ -475,10 +438,7 @@ class InstallerTests(unittest.TestCase):
             config = root / 'avd/My_pad.avd/config.ini'
             config.parent.mkdir(parents=True)
             config.write_text('disk.ramdisk.path=/owned/old.img\n')
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.verify_cache', return_value=Path('/owned/old.img')) as verify, \
-                    patch('ksu_ramdisk.prepare_runtime', return_value=Path('/owned/new.img')):
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.verify_cache', return_value=Path('/owned/old.img')) as verify, patch('ksu_ramdisk.prepare_runtime', return_value=Path('/owned/new.img')):
                 setup.configure(root / 'sdk', 'My_pad', 5582)
             verify.assert_called_once_with(root, Path('/owned/old.img'))
             self.assertIn('disk.ramdisk.path=/owned/new.img\n', config.read_text())
@@ -492,11 +452,7 @@ class InstallerTests(unittest.TestCase):
             config = root / 'avd/My_pad.avd/config.ini'
             config.parent.mkdir(parents=True)
             config.write_text('disk.ramdisk.path=/owned/old.img\n')
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), \
-                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
-                    patch('ksu_ramdisk.refresh_saved_cache', return_value=Path('/owned/new.img')) as refresh:
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), patch('ksu_ramdisk.refresh_saved_cache', return_value=Path('/owned/new.img')) as refresh:
                 setup.configure(root / 'sdk', 'My_pad', 5582)
             refresh.assert_called_once_with(root, Path('/owned/old.img'))
             self.assertIn('disk.ramdisk.path=/owned/new.img\n', config.read_text())
@@ -511,11 +467,7 @@ class InstallerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             original = 'disk.ramdisk.path=/owned/old.img\n'
             config.write_text(original)
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), \
-                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
-                    patch('ksu_ramdisk.refresh_saved_cache', side_effect=RuntimeError('Unknown content')):
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.verify_cache', side_effect=RuntimeError('Previous firmware')), patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), patch('ksu_ramdisk.refresh_saved_cache', side_effect=RuntimeError('Unknown content')):
                 with self.assertRaisesRegex(RuntimeError, 'Unknown content'):
                     setup.configure(root / 'sdk', 'My_pad', 5582)
             self.assertEqual(config.read_text(), original)
@@ -531,12 +483,7 @@ class InstallerTests(unittest.TestCase):
             old = '/missing/old/local/boot-patches/ramdisk-' + 'a' * 64 + '.img'
             config.write_text('disk.ramdisk.path=' + old + '\nimage.sysdir.1=/missing/old/images/\n')
             current = root / 'local/boot-patches' / Path(old).name
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
-                    patch('ksu_ramdisk.rebase_cache_selection', return_value=current) as rebase, \
-                    patch('ksu_ramdisk.verify_cache', return_value=current) as verify, \
-                    patch('ksu_ramdisk.prepare_runtime', return_value=current):
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), patch('ksu_ramdisk.rebase_cache_selection', return_value=current) as rebase, patch('ksu_ramdisk.verify_cache', return_value=current) as verify, patch('ksu_ramdisk.prepare_runtime', return_value=current):
                 setup.configure(root / 'sdk', 'My_pad', 5582)
             rebase.assert_called_once_with(root, old, '/missing/old/images/')
             verify.assert_called_once_with(root, current)
@@ -550,36 +497,57 @@ class InstallerTests(unittest.TestCase):
             (root / 'config/avd.ini').write_text('target=android-37.0\n')
             config = root / 'avd/My_pad.avd/config.ini'
             config.parent.mkdir(parents=True)
-            original = ('disk.ramdisk.path=/missing/old/local/boot-patches/ramdisk-' + 'a' * 64
-                        + '.img\nimage.sysdir.1=/missing/old/images/\n')
+            original = 'disk.ramdisk.path=/missing/old/local/boot-patches/ramdisk-' + 'a' * 64 + '.img\nimage.sysdir.1=/missing/old/images/\n'
             config.write_text(original)
-            with patch.object(setup, 'ROOT', root), \
-                    patch.object(setup, 'avd_home', return_value=root / 'registry'), \
-                    patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), \
-                    patch('ksu_ramdisk.rebase_cache_selection', side_effect=RuntimeError('Unproven move')):
+            with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'), patch('ksu_ramdisk.is_owned_cache_selection', return_value=True), patch('ksu_ramdisk.rebase_cache_selection', side_effect=RuntimeError('Unproven move')):
                 with self.assertRaisesRegex(RuntimeError, 'Unproven move'):
                     setup.configure(root / 'sdk', 'My_pad', 5582)
             self.assertEqual(config.read_text(), original)
 
     def test_all_profiles_accept_eight_gib_and_preserve_userdata(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for index, (source, ram) in enumerate((('official-yingtian-ota', '8192'),
-                                                  (common.OS4_SOURCE, '8192'), ('os3', '8192'))):
+            for index, (source, ram) in enumerate((('official-yingtian-ota', '8192'), (common.OS4_SOURCE, '8192'), ('os3', '8192'))):
                 with self.subTest(source=source):
                     root = Path(temporary) / str(index)
                     self.instance_profile(root, source, name='Custom', port=5582)
                     (root / 'config').mkdir()
-                    (root / 'config/avd.ini').write_text(
-                        'target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=' + ram + '\n')
+                    (root / 'config/avd.ini').write_text('target=android-37.0\nhw.cpu.arch=arm64\nhw.ramSize=' + ram + '\n')
                     data = root / 'avd/Custom.avd/userdata-qemu.img'
                     data.parent.mkdir(parents=True)
                     data.write_bytes(b'preserved userdata')
-                    with patch.object(setup, 'ROOT', root), \
-                            patch.object(setup, 'avd_home', return_value=root / 'registry'):
+                    with patch.object(setup, 'ROOT', root), patch.object(setup, 'avd_home', return_value=root / 'registry'):
                         setup.configure(root / 'sdk', 'Custom', 5582)
                     self.assertIn('hw.ramSize=' + ram + '\n', (data.parent / 'config.ini').read_text())
                     self.assertEqual(data.read_bytes(), b'preserved userdata')
 
+if __name__ == '__main__':
+    unittest.main()
+
+
+# --- tests/test_installer_release.py ---
+
+'Check the standalone installer archive and firmware-free metadata.'
+
+class InstallerReleaseTests(unittest.TestCase):
+
+    def test_standalone_archive_contains_verified_sources_and_executable_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / 'installer'
+            metadata = package_installer.package(out)
+            self.assertEqual(metadata['tag'], 'installer-v' + package_installer.VERSION)
+            self.assertFalse(metadata['prerelease'])
+            self.assertEqual(metadata['type'], 'installer')
+            with zipfile.ZipFile(out / metadata['archive']['name']) as archive:
+                for name, item in metadata['files'].items():
+                    data = archive.read('HyperOS-AVD/' + name)
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), item['sha256'])
+                    self.assertFalse(any((part in name.split('/') for part in ('images', 'avd', 'backups', 'local'))))
+                self.assertTrue(archive.getinfo('HyperOS-AVD/Install.command').external_attr >> 16 & 73)
+                self.assertEqual(json.loads(archive.read('HyperOS-AVD/installer.json'))['type'], 'installer')
+            self.assertTrue((out / 'SHA256SUMS').is_file())
+            self.assertTrue((out / 'install.sh').stat().st_mode & 73)
+            self.assertEqual(hashlib.sha256((out / 'install.sh').read_bytes()).hexdigest(), metadata['bootstrap']['sha256'])
+            self.assertFalse((out / 'manifest.json').exists())
 
 if __name__ == '__main__':
     unittest.main()

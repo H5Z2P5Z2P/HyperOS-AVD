@@ -18,7 +18,7 @@ curl -fsSL https://github.com/NEORUAA/HyperOS-AVD/releases/latest/download/insta
 
 已加密磁盘暂不支持继续增大虚拟容量（如 32 → 64 GiB）；修复原有 32 GiB 容量不受此限制。新建实例可直接选择更大容量。
 
-升级前须关闭目标 AVD。r3 自动迁移仅开放 r2 来源；旧 revision 1 实验相机桥接需先在 r2 升至 revision 2。没有发布清单的早期源码实例不支持自动迁移；不支持手机 / Pad / OS3 互迁或保数据降级。
+升级前须关闭目标 AVD。r3 自动迁移仅开放 r2 来源；旧版 revision 1 实验性相机桥接需先在 r2 中升至 revision 2。没有发布清单的早期源码实例不支持自动迁移；同时不支持跨手机 / 平板 / OS3 相互迁移，也不支持保留用户数据的降级操作。
 
 附件为安装器 ZIP、`install.sh`、`installer.json` 与 `SHA256SUMS`，不含系统镜像或个人用户数据。
 

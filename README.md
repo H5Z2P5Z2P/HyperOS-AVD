@@ -14,11 +14,11 @@
 | 默认资源 | 2 核 / 2.5 GiB | 4 核 / 6 GiB RAM / 32 GiB 存储（负一屏完整模糊建议 8 GiB RAM） | 4 核 / 4 GiB RAM / 32 GiB 存储 |
 | 发布说明 | [兼容范围](docs/compatibility.md) | [r5](docs/releases/os4-r5.md) · [v0.2.5 / r6](docs/releases/os4-r6.md) | [r2](docs/releases/os4-pad-r2.md) · [v0.1.2 / r3](docs/releases/os4-pad-r3.md) |
 
-Pad 使用独立的 `pad-v*` 版本线；手机与 OS3 的版本号继续沿用 `v*`。各版本独立保存镜像与用户数据，可同时安装。已发布镜像在 [GitHub Releases](https://github.com/NEORUAA/HyperOS-AVD/releases) 分卷提供，勿混用不同 Release 的文件；具体版本要求见对应发布说明。
+Pad 采用独立的 `pad-v*` 版本号，手机与 OS3 沿用 `v*` 版本号。各版本镜像与用户数据完全独立，支持多实例共存。发布镜像均在 [GitHub Releases](https://github.com/NEORUAA/HyperOS-AVD/releases) 提供分卷下载，请不要混用不同 Release 的分卷文件。
 
-Phone r6 与 Pad r3 共用 **Core 18 / Apps 7** 两个自适应 KernelSU 模块和离线状态页；规则按内容、ABI 与硬件能力匹配，保留用户选择和未知内容。format 3 冻结运行包使用 `verified-bundle-runtime-v1` 协议，最低要求为 [Installer 1.2.3](docs/releases/installer-v1.2.3.md)。该最低版本绑定稳定协议；沿用此协议的后续镜像无需逐版提高安装器版本。RAM、CPU 与存储均可调整，Pad 默认 4 GiB RAM 不构成上限。
+Phone r6 与 Pad r3 均搭载 **Core 18 / Apps 7** 自适应 KernelSU 模块与离线状态页。运行包采用 format 3 协议，只需使用 [Installer 1.2.3](docs/releases/installer-v1.2.3.md) 或更高版本即可安装（后续镜像只要协议保持兼容，无需重复升级安装器）。虚拟机的 CPU、内存与存储空间均可自由调整（平板默认的 4 GiB 内存仅为推荐起步配置，并非上限）。
 
-发行附件校验与运行验证范围见[Phone r6 / Pad r3 验证报告](docs/releases/os4-r6-pad-r3-validation.md)。
+完整的发布附件校验与运行验证记录请参考 [Phone r6 / Pad r3 验证报告](docs/releases/os4-r6-pad-r3-validation.md)。
 
 ## Pad OS4 截图
 
@@ -69,19 +69,20 @@ Phone r6 与 Pad r3 共用 **Core 18 / Apps 7** 两个自适应 KernelSU 模块�
 
 ## 安装与升级
 
-需要 **Apple Silicon Mac、Python 3、Android Studio SDK 的 Emulator / Platform-Tools**。建议预留 60 GiB 加用户数据备份空间，无需 NDK 或手机 OTA；新建 / 扩容用户分区需 `brew install e2fsprogs`。
+### 前置要求
+- **系统与硬件**：Apple Silicon Mac（M 系列芯片）、Python 3
+- **开发工具**：Android Studio SDK 的 Emulator 与 Platform-Tools
+- **磁盘工具**：新建或扩容用户分区需执行 `brew install e2fsprogs`
+- **磁盘空间**：建议预留 60 GiB 以上可用空间（用于解压镜像与数据备份）。直接使用预构建镜像时，无需安装 NDK 或下载手机官方 OTA。
 
-在终端运行，选择中文 / English 和安装目录即可自动拉取正式安装器：
+### 一键安装
+在 macOS 终端中运行以下命令，按提示选择语言及安装目录，即可自动拉取并启动安装器：
 
 ```sh
 curl -fsSL https://github.com/NEORUAA/HyperOS-AVD/releases/latest/download/install.sh | bash
 ```
 
-ASCII 菜单自动下载并校验 OS3 / 手机 OS4 / Pad OS4 镜像，可自定义 **AVD 名称、RAM、存储和 CPU**，支持备份后升级与恢复。默认存储 32 GiB；Phone r6 与 Pad r3 需 **Installer 1.2.3 或以上**；历史版本要求见安装指南。也可下载 [Installer ZIP](https://github.com/NEORUAA/HyperOS-AVD/releases) 后双击 **`Install.command`**。
-
-Installer 1.2.2 加入 macOS 系统 HTTPS 证书校验回退和完整备份后的加密用户分区继续扩容；Installer 1.2.3 在此基础上支持当前 format 3 运行包协议。
-
-安装器与镜像独立发版：安装器使用 `installer-v*` 正式 Release 并占用 GitHub Latest；Phone / Pad 镜像使用各自的普通正式 Release，发布时加 `--latest=false`，让 Latest 下载入口继续指向安装器。也可直接从源码运行：
+也可前往 [Releases](https://github.com/NEORUAA/HyperOS-AVD/releases) 下载 `Installer ZIP`，解压后双击 **`Install.command`**；或克隆仓库直接运行：
 
 ```sh
 git clone https://github.com/NEORUAA/HyperOS-AVD.git
@@ -90,18 +91,26 @@ chmod +x Install.command
 ./Install.command
 ```
 
-**Phone r5 → r6：关闭目标 AVD → 使用 Installer 1.2.3 或更新版本选择“升级” → 选择同一 `hongkong` 手机实例与 r6。Pad r2 → r3 使用同一流程，但选择 `yingtian` Pad 实例和 Pad r3。** 安装器先备份 userdata、QCOW2、加密密钥和配置，再检查固件与模块兼容性；失败可恢复。Phone 与 Pad 不能互相覆盖升级，保数据降级不支持。历史 r1 / r2 / r3 → r4 路径见[安装指南](docs/installing.md)。
+安装器提供了交互式终端菜单，支持自动下载并校验 OS3、手机 OS4 与平板 OS4 镜像，支持自定义 **AVD 名称、内存大小、存储空间及 CPU 核心数**，并支持实例管理、硬件配置修改、备份升级与一键回滚。
 
-[安装 / 升级 / 恢复指南](docs/installing.md) · [发布流程](docs/releasing.md)
+### 升级现有实例
+- **Phone r5 → r6**：先关闭当前手机 AVD，运行 Installer 1.2.3 或更高版本，选择“升级”并选中当前 `hongkong` 实例与 r6 镜像。
+- **Pad r2 → r3**：流程同上，选择对应的 `yingtian` 平板实例与 r3 镜像。
+- **安全保障**：升级前安装器会自动对完整用户数据（userdata）、磁盘覆盖层（QCOW2）、加密密钥及配置进行快照备份，验证兼容性后再行切换，发生异常可随时恢复。
+- **注意**：手机和平板属于不同设备系列，不支持互相覆盖升级；同时不支持保留用户数据的降级操作。历史版本的升级说明请查阅 [安装与升级指南](docs/installing.md)。
 
-## 兼容范围
+[安装 / 升级 / 恢复指南](docs/installing.md) · [版本发布流程](docs/releasing.md)
 
-**手机 OS4：** 保留全局 HWUI Vulkan、Flutter 玻璃、天气 / 相册、完整引导、60 Hz、Mac 色彩和声音适配，以及原版妙享背屏、独立窗口、双击息屏 / 唤醒和边缘返回；新用户默认常亮与 AOD。
+## 兼容性与已知限制
 
-**Pad OS4：** 保留平板布局与原厂 `yingtian.xml` 配置，使用平板独立的显示与 Vulkan 参数；默认 4 GiB RAM 可调整，原机不支持的 AOD 不启用。
+- **手机 OS4**：完整保留原厂开机引导、官方系统应用（天气、相册等）、全局 HWUI Vulkan 与 Flutter 玻璃模糊效果；已适配 60 Hz 刷新率、macOS 色彩与音频输出；支持小米 18 Pro 独特的副屏（妙享背屏）独立窗口、双击息屏/唤醒与侧滑手势，默认启用全天候息屏（AOD）与常亮支持。
+- **平板 OS4**：保留原版横屏平板桌面布局与原厂设备特性，独立调校了显示与 Vulkan 渲染参数。内存推荐 4 GiB 起步且支持自由调大；原机硬件不支持的 AOD 功能保持关闭。
+- **已知限制**：
+  - 相机目前仅支持虚拟场景基础预览与普通拍照，高级夜景、人像、变焦算法及高质量录像尚未完整适配；
+  - 蓝牙、小米云服务、Google 登录以及 Play 完整性认证（Play Integrity）暂未完成兼容；
+  - 全局 SELinux 严格保持 Enforcing 状态，KernelSU root 运行域依官方规则保持 permissive；
+  - 更多技术细节与测试边界请参考 [双端验证报告](docs/releases/os4-r6-pad-r3-validation.md)。
 
-**限制：** 相机完整算法、蓝牙、小米云服务、Google 登录与 Play Integrity 未完整验证；部分 APK、虚拟硬件日志、FindDevice 策略和宿主关机 / 重启仍有限制，见[双端验证报告](docs/releases/os4-r6-pad-r3-validation.md)。SELinux 保持 Enforcing，KernelSU root 域仍为 permissive。
-
-[OS3 说明](docs/compatibility.md) · [手机 OS4 适配](docs/hyperos4.md) · [Pad OS4 适配](docs/hyperos4-pad.md) · [补丁与验证边界](docs/os4-patches.md)
+[OS3 兼容性说明](docs/compatibility.md) · [手机 OS4 适配文档](docs/hyperos4.md) · [平板 OS4 适配文档](docs/hyperos4-pad.md) · [补丁架构与维护](docs/os4-patches.md)
 
 致谢：小米、MysticGSI、[Android Emulator / AOSP](https://developer.android.com/studio/run/emulator-commandline)、[KernelSU](https://github.com/tiann/KernelSU)。镜像保留 SDK 的 `NOTICE.txt`，第三方组件归各自权利人所有。

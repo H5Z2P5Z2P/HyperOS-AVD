@@ -292,7 +292,7 @@ class NativePatchCatalogTests(unittest.TestCase):
 
     def test_actual_vendor_ims_jar_sites_match_producer_and_preserve_all_other_bytes(self):
         import patch_xiaomi_ims as ims
-        from test_xiaomi_ims_patch import actual_input
+        from test_hardware_patches import actual_input
         original=actual_input()
         if original is None:self.skipTest('Private audited IMS JAR unavailable; no download attempted.')
         row=next(row for row in self.value['profiles'] if row['feature']=='vendor-ims')

@@ -14,7 +14,7 @@ Tag：`v0.2.3-a17-hyperos4-hongkong-r4`，**Pre-release**。继续使用小米 1
 
 需要 **Apple Silicon Mac、Python 3、Android Emulator / Platform-Tools、e2fsprogs**，无需 NDK 或手机 OTA。默认 **6 GiB RAM / 4 核 / 32 GiB**，资源可调整。
 
-使用 **Installer 1.2.1 或以上**。已有 r3：关闭目标 AVD →“升级”→ 原实例 → r4。安装器先备份完整 userdata、QCOW2 与加密密钥，再保数据切换；失败可恢复。r1 / r2 也可直接升级至 r4。手机、Pad、OS3 不能互相覆盖，保数据降级不支持。
+使用 **Installer 1.2.1 或以上版本**。已有旧版本实例时：关闭目标 AVD →“升级”→ 选择原实例 → r4。安装器会自动备份用户数据（userdata）、QCOW2 覆盖层及加密密钥后再执行切换，发生异常可随时恢复。r1 / r2 均可直接平滑升级至 r4。注意：手机、平板与 OS3 分属不同产品线，无法互相跨设备覆盖升级；同时不支持保留用户数据的降级操作。
 
 上传同目录全部镜像分卷、`manifest.json` 与 `SHA256SUMS`，保留文件名；先发布 Installer 1.2.1，再发布本镜像。
 
