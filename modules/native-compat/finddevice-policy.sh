@@ -44,7 +44,7 @@ state_inventory_safe() {
 result() { printf '%s|%s\n' "$1" "$2"; }
 guard() {
     [ "$(id -u)" = 0 ] && [ -x "$BB" ] && [ "$(getprop ro.boot.hardware)" = ranchu ] || return 1
-    case "$(getprop ro.mi.os.version.incremental)" in OS4.*|4.*) ;; *) return 1 ;; esac
+    [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] || return 1
     safe_dir "$STATE" && safe_dir "${WRAPPER%/*}" && state_inventory_safe
 }
 snapshot() {

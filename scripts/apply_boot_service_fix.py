@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage reversible, source-pinned boot fixes on an owned hongkong OS4.0.18 AVD."""
+"""Authenticate legacy boot fixes; new installations use the shared Core module."""
 import argparse
 import hashlib
 import json
@@ -7,15 +7,16 @@ from pathlib import Path
 import shlex
 import uuid
 
-from module_lifecycle import (preserved as lifecycle_preserved, mutation_guard,
+from module_lifecycle import (preserved as lifecycle_preserved,
                               guarded_hook, refresh_hooks)
-from common import ROOT, adb, runtime, sha256
+from common import adb, runtime, sha256
 from apply_flutter_fix import official, root
 from patch_boot_services import TARGETS, AFTER, PROBE_SHA256
-from phone_profile import profile_from_build
 
 MODULE = '/data/adb/modules/hyperos_avd_boot_services'
 PENDING = '/data/adb/modules_update/hyperos_avd_boot_services'
+# Frozen legacy module payload. New image/Core helpers are generated from the
+# complete content recipes in image_kernel_services, never this version gate.
 PERF_SCRIPT = Path(__file__).resolve().parent.parent / 'config/check_kernel_services.sh'
 PACKAGES = {'qualcomm': 'com.qualcomm.location', 'registration': 'com.xiaomi.registration'}
 LEGACY_KERNEL_SCRIPT_SHA256 = '4db262478ab0e60d5acd7351275f9b2dbf44f56177afcfaf90077f422956c044'
@@ -273,17 +274,18 @@ def migrate_lifecycle_hooks(config):
 
 
 def install(config, payload):
+    """Authenticate/migrate an existing legacy owner; Core owns new fixes."""
     official(config)
     lifecycle = lifecycle_preserved(root, config, MODULE)
     if lifecycle:
         return lifecycle
-    if profile_from_build()['hyperos'] != '4.0.18.0.XFRCNXM':
-        raise RuntimeError('Boot service fixes require the pinned 4.0.18 phone firmware.')
-    payload = Path(payload)
     saved = root(config, f'if [ -d {MODULE} ]; then cat {MODULE}/manifest.json; fi')
     previous = json.loads(saved) if saved else None
-    if previous and previous != receipt():
+    if previous is None:
+        raise RuntimeError('New standalone boot service modules are retired. Use the shared Core module for boot service compatibility.')
+    if previous != receipt():
         raise RuntimeError('An unrelated boot service module exists.')
+    payload = Path(payload)
     for name, (path, before, _) in TARGETS.items():
         suffix = '.apk' if name in ('qualcomm', 'registration') else '.jar'
         if sha256(payload / (name + suffix)) != AFTER[name]:
@@ -308,50 +310,18 @@ def install(config, payload):
             f'[ -e {MODULE}/remove ] || [ -L {MODULE}/remove ]; then echo yes; fi'):
         print('Boot service module is disabled; preserving this choice.')
         return
-    if previous == receipt():
-        result = migrate_kernel_helper(config)
-        result['uninstall_hook'] = migrate_uninstall_hook(config)
-        result['lifecycle_hooks'] = migrate_lifecycle_hooks(config)
-        print('Verified boot service helper migrated.' if result.get('migrated')
-              else 'Verified boot service module is already staged; lifecycle is preserved.')
-        return result
-    if root(config, f'if [ -e {PENDING} ] || [ -L {PENDING} ]; then echo yes; fi'):
-        print('Boot service update is pending; preserving KernelSU staging.')
-        return {'installed': False, 'pending': True, 'deferred': True}
-    stage = '/data/local/tmp/hyperos-avd-boot-services-stage'
-    if root(config, f'if [ -e {stage} ]; then echo yes; fi'):
-        raise RuntimeError('A boot service staging directory already exists.')
-    folder = ROOT / 'work/boot-service-module'
-    folder.mkdir(parents=True, exist_ok=True)
-    script, targets = boot_script()
-    files = {'manifest.json': json.dumps(receipt(), indent=2) + '\n',
-             'module.prop': MODULE_PROPERTIES,
-             'post-fs-data.sh': script, 'service.sh': script, 'targets.conf': targets,
-             'skip_mount': '', 'uninstall.sh': UNINSTALL_SCRIPT,
-             'check-kernel-services.sh': PERF_SCRIPT.read_text()}
-    root(config, 'set -e\n' + mutation_guard(MODULE) + f'mkdir -p {stage}/payload; chmod 777 {stage} {stage}/payload')
-    for name, content in files.items():
-        path = folder / name
-        path.write_text(content)
-        adb(config, 'push', str(path), stage + '/' + name, check=True, capture_output=True)
-    for name in TARGETS:
-        suffix = '.apk' if name in ('qualcomm', 'registration') else '.jar'
-        adb(config, 'push', str(payload / (name + suffix)), stage + '/payload/' + name,
-            check=True, capture_output=True)
-    adb(config, 'push', str(payload / 'kernel-probe'), stage + '/kernel-probe', check=True, capture_output=True)
-    root(config, f'chown -R 0:0 {stage}; chmod 755 {stage} {stage}/payload; '
-         f'chmod 644 {stage}/*.json {stage}/module.prop {stage}/targets.conf {stage}/skip_mount {stage}/payload/*; '
-         f'chmod 755 {stage}/*.sh {stage}/kernel-probe; '
-         f'chcon -R u:object_r:system_file:s0 {stage}/payload')
-    root(config, f'[ ! -e {MODULE} ] && [ ! -L {MODULE} ] && '
-         f'[ ! -e {PENDING} ] && [ ! -L {PENDING} ] || exit 1\nmv {stage} {MODULE}')
-    print('Boot service module staged. Cold-boot to load framework fixes.')
+    result = migrate_kernel_helper(config)
+    result['uninstall_hook'] = migrate_uninstall_hook(config)
+    result['lifecycle_hooks'] = migrate_lifecycle_hooks(config)
+    print('Verified boot service helper migrated.' if result.get('migrated')
+          else 'Verified boot service module is already staged; lifecycle is preserved.')
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument('--payload', type=Path)
+    action.add_argument('--payload', type=Path, help='Verify and migrate an existing legacy module; new fixes use Core')
     action.add_argument('--migrate-kernel-helper', action='store_true')
     args = parser.parse_args()
     if args.migrate_kernel_helper:

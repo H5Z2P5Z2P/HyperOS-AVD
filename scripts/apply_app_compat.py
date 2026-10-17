@@ -174,9 +174,9 @@ def set_features(config, choices, catalog=None):
 
 def install_prebuilt(config, workspace=None, enabled_features=None, legacy=None, catalog=None, migration=None):
     catalog = recipes() if catalog is None else catalog
-    values = root(config, 'getprop ro.boot.hardware; getprop ro.mi.os.version.incremental').splitlines()
-    if len(values) != 2 or values[0] != 'ranchu' or not values[1].startswith(('OS4.', '4.')):
-        raise RuntimeError('Universal application compatibility requires an ARM64 ranchu OS4 guest.')
+    values = root(config, 'getprop ro.boot.hardware; getprop ro.product.cpu.abi').splitlines()
+    if values != ['ranchu', 'arm64-v8a']:
+        raise RuntimeError('Universal application compatibility requires an ARM64 ranchu guest.')
     active_path, pending_path = '/data/adb/modules/' + MODULE_ID, '/data/adb/modules_update/' + MODULE_ID
     reviewed_previous = previous_manifests()
     revisions = {str(REVISION), *(str(item['revision']) for item in reviewed_previous)}

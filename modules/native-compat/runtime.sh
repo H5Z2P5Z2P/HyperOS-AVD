@@ -17,7 +17,7 @@ native_blocked() {
 
 native_guard() {
     [ "$(id -u)" = 0 ] && [ "$(getprop ro.boot.hardware)" = ranchu ] || return 1
-    case "$(getprop ro.mi.os.version.incremental)" in OS4.*|4.*) ;; *) return 1 ;; esac
+    [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] || return 1
     [ -x "$BB" ] && [ -d "$MODDIR" ] && [ ! -L "$MODDIR" ]
 }
 

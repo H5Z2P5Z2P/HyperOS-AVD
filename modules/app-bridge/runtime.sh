@@ -58,7 +58,7 @@ bridge_state_file() {
 }
 bridge_guard() {
     [ "$(id -u)" = 0 ] && [ "$(getprop ro.boot.hardware)" = ranchu ] || return 1
-    case "$(getprop ro.mi.os.version.incremental)" in OS4.*|4.*) ;; *) return 1 ;; esac
+    [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] || return 1
     ! bridge_blocked || return 1
     [ "${BRIDGE_CATALOG:-0}" != 1 ] || [ -z "${BRIDGE_FEATURE:-}" ] ||
         catalog_choice "$BRIDGE_FEATURE" "$BRIDGE_DEFAULT"

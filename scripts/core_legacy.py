@@ -2,6 +2,7 @@
 import json
 import re
 import shlex
+import uuid
 
 from core_platform import STATE, digest, parent_guard, read_record
 
@@ -302,8 +303,8 @@ def migrate_global_hooks(root, config, guard, serial):
     import os4_pad
     import os4_defaults
     from phone_profile import ARCHIVES, profile
-    refreshed = {digest(os4_defaults.REFRESH_WRAPPER)}
-    refreshed.update(digest(os4_defaults.refresh_wrapper(profile(version))) for version in ARCHIVES)
+    refreshed = {digest(os4_defaults.REFRESH_WRAPPER), digest(os4_defaults.refresh_wrapper())}
+    refreshed.update(digest(os4_defaults.legacy_refresh_wrapper(profile(version))) for version in ARCHIVES)
     refreshed.add(digest(os4_pad.refresh_script(os4_defaults.REFRESH_WRAPPER)))
     candidates = [(os4_defaults.REFRESH_SERVICE, ['refresh'], refreshed),
                   (os4_pad.THERMAL_EARLY, ['thermal', 'identity', 'hwui'],
@@ -329,15 +330,25 @@ def migrate_global_hooks(root, config, guard, serial):
             checksum = digest(data)
             if checksum not in hashes:
                 item['reason'] = 'unreviewed-global-hook'; continue
-            archive = STATE + '/retired/' + path.rsplit('/', 1)[1] + '-' + checksum[:16]
-            root(config, 'set -e\n' + guard + parent_guard(archive.rsplit('/', 1)[0]) + f'''
+            name = path.rsplit('/', 1)[1]
+            # A former installer may recreate the same reviewed hook. Reserve
+            # a new private directory atomically, preserving every old inode.
+            slot = STATE + '/retired/' + name + '-' + checksum[:16] + '-' + uuid.uuid4().hex
+            archive = slot + '/' + name
+            source_guard = f'''
 [ -f {path} ] && [ ! -L {path} ] || exit 1
 [ "$("$BB" stat -c %u {path})" = 0 ] && [ "$("$BB" stat -c %h {path})" = 1 ] || exit 1
 [ "$("$BB" sha256sum {path} | "$BB" cut -d ' ' -f 1)" = {checksum} ] || exit 1
-[ ! -e {archive} ] && [ ! -L {archive} ] || exit 1
+'''
+            root(config, 'set -e\n' + guard + parent_guard(STATE + '/retired') + source_guard + f'''
 mkdir -p {STATE}/retired
 chmod 700 {STATE}/retired
+mkdir -m 700 {slot}
+trap 'rmdir {slot} 2>/dev/null || :' EXIT HUP INT TERM
+''' + guard + source_guard + f'''
+[ ! -e {archive} ] && [ ! -L {archive} ] || exit 1
 mv {path} {archive}
+trap - EXIT HUP INT TERM
 ''')
             item.update(status='retired', archive=archive)
         except RuntimeError:

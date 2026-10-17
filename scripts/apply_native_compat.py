@@ -17,9 +17,9 @@ PENDING = '/data/adb/modules_update/' + MODULE_ID
 
 
 def guest_supported(config):
-    values = root(config, 'getprop ro.boot.hardware; getprop ro.mi.os.version.incremental').splitlines()
-    if len(values) != 2 or values[0] != 'ranchu' or not values[1].startswith(('OS4.', '4.')):
-        raise RuntimeError('Native compatibility module requires a ranchu OS4 guest.')
+    values = root(config, 'getprop ro.boot.hardware; getprop ro.product.cpu.abi').splitlines()
+    if values != ['ranchu', 'arm64-v8a']:
+        raise RuntimeError('Native compatibility module requires an ARM64 ranchu guest.')
 
 
 def _module(config, directory):

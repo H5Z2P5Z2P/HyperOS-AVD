@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 18
+REVISION = 19
 
 
 def boot_prerequisites():
@@ -64,6 +64,8 @@ def module_files(value=None, template=None):
     files.update(tcm_files())
     files['skip_mount'] = b''
     files['boot-prerequisites.tsv'] = boot_prerequisites()
+    from os4_defaults import display_capability_script
+    files['display-defaults.sh'] = display_capability_script()
     from patch_display_privacy import capability_recipe
     files['display-privacy-capability.tsv'] = capability_recipe()
     from patch_display_metadata import capability_recipe as metadata_capability_recipe

@@ -84,8 +84,8 @@ def verify_properties(lines, expected):
 
 def verify_image(root, metadata):
     from build_image import erofs
-    from os4_defaults import COMPONENT_XML, LOG_SCRIPT, LOG_TAGS, GRADIENT_BLUR_INIT, REFRESH_INIT, REFRESH_SCRIPT
-    from os4_pad import refresh_script
+    from os4_defaults import COMPONENT_XML, LOG_SCRIPT, LOG_TAGS, GRADIENT_BLUR_INIT, REFRESH_INIT
+    from os4_pad import current_refresh_script
     from patch_weather import PAD_APK, PAD_APK_SHA256, PAD_LIBRARIES
     from patch_assistant import profile as manifest
     from patch_composer import MANIFEST as COMPOSER
@@ -119,7 +119,7 @@ def verify_image(root, metadata):
     init = read('/system_ext/etc/init/init.hyperos_avd.rc')
     if b'start console' in init or GRADIENT_BLUR_INIT not in init or REFRESH_INIT not in init:
         raise RuntimeError('Pad boot services differ.')
-    if read('/product/etc/init/lock_fps.sh') != refresh_script(REFRESH_SCRIPT):
+    if read('/product/etc/init/lock_fps.sh') != current_refresh_script():
         raise RuntimeError('Pad refresh-rate script differs.')
     defaults, assistant = info['avd_defaults'], manifest(SOURCE)
     expected = {

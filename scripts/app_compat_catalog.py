@@ -9,7 +9,7 @@ from common import REPO_ROOT, sha256
 from app_bridge_module import EMPTY, _hex, _path, _word
 
 MODULE_ID = 'hyperos_avd_app_compat'
-REVISION = 7
+REVISION = 8
 TEMPLATE = REPO_ROOT / 'modules/app-bridge'
 SCRIPTS = ('customize.sh', 'runtime.sh', 'catalog.sh', 'post-fs-data.sh', 'service.sh', 'uninstall.sh')
 # Reviewed immutable snapshots, keyed by their canonical JSON SHA-256. Add a
@@ -17,7 +17,7 @@ SCRIPTS = ('customize.sh', 'runtime.sh', 'catalog.sh', 'post-fs-data.sh', 'servi
 # manifests can never extend this authorization list.
 PREVIOUS_MANIFESTS = {}
 HISTORY = REPO_ROOT / 'scripts/app_compat_history.json'
-HISTORY_SHA256 = '6c7596f135c06a41920db9297617b2bda7aceae6c8ab76c28334996b7742b7cf'
+HISTORY_SHA256 = '42f5e64dcee31a04513951e2b1e79675d095a8e31314f241b5099726b25ecbea'
 
 
 def canonical(value):

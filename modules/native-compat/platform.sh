@@ -269,15 +269,19 @@ core_thermal() {
 }
 
 core_refresh_capable() {
-    [ "$(getprop ro.boot.qemu.vsync)" = 60 ] || return 1
-    dumpsys SurfaceFlinger | "$BB" awk '
-        /activeMode/ && /id=0([, }]|$)/ && /vsyncRate=60\.00 Hz/ {found=1}
-        END {exit !found}'
+    local helper="$MODDIR/display-defaults.sh" expected
+    native_guard && native_assets && core_safe_file "$helper" || return 1
+    expected=$("$BB" awk '$2 == "display-defaults.sh" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1;
+        checksum=$1} END {if (found != 1) exit 1; print checksum}' "$MODDIR/SHA256SUMS") || return 1
+    [ "$(native_hash "$helper")" = "$expected" ] || return 1
+    . "$helper"
+    display_refresh_capable
 }
 
 core_refresh() {
     core_permitted refresh || return 0
-    if ! core_refresh_capable; then native_status refresh display skipped unsupported-active-mode; return 0; fi
+    if ! core_refresh_capable; then native_status refresh display skipped unverified-display-content-abi-or-mode; return 0; fi
     if dumpsys SurfaceFlinger | "$BB" grep -Fq 'renderRate=60.00 Hz'; then
         native_status refresh display ready compositor-60hz; return 0
     fi

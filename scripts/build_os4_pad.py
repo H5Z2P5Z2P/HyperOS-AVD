@@ -160,7 +160,7 @@ def main():
     from init_userdata import create
     from lp_image import pack, unpack
     from os4_pad import (FINDDEVICE_SHA256, NAME, PORT, PROFILE, SOURCE,
-                         model_config, properties, refresh_script, template)
+                         model_config, properties, current_refresh_script, template)
     from patch_gnss import patch as patch_gnss
     from patch_composer import build_vendor as composer_vendor
     from patch_camera_scene import build_vendor as scene_vendor
@@ -280,7 +280,7 @@ def main():
     init = erofs(ROOT / 'work/base/system_ext.img', '/etc/init/init.system_ext.rc')
     init += b'\n' + erofs(ROOT / 'work/base/system_ext.img', '/etc/init/init.system_ext.radio.rc')
     from os4_defaults import (COMPONENT_XML, GRADIENT_BLUR_INIT, REFRESH_INIT,
-                              REFRESH_SCRIPT, disable_debug_console)
+                              disable_debug_console)
     finddevice = erofs(partitions / 'product.img', '/priv-app/MIUIFindDeviceCN/MIUIFindDeviceCN.apk')
     if hashlib.sha256(finddevice).hexdigest() != FINDDEVICE_SHA256:
         raise RuntimeError('Unexpected tablet FindDevice APK.')
@@ -292,7 +292,7 @@ def main():
     init += b'    setprop persist.sys.background_blur_supported true\n'
     init += b'\non property:ro.persistent_properties.ready=true\n    setprop persist.sys.background_blur_supported true\n'
     put('system_ext/etc/init/init.hyperos_avd.rc', init + GRADIENT_BLUR_INIT + REFRESH_INIT)
-    put('product/etc/init/lock_fps.sh', refresh_script(REFRESH_SCRIPT), 0o755)
+    put('product/etc/init/lock_fps.sh', current_refresh_script(), 0o755)
     default_edits, default_manifest = settings_replacements(sdk_path(), ROOT / 'work/defaults-overlay')
     edits.update(default_edits)
     ksu = prepare_kernelsu(repo, ROOT)

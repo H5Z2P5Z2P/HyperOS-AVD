@@ -17,6 +17,11 @@ def digest(data):
 
 def context_files(context):
     """Validate paths and immutable pins before reading or changing a guest."""
+    from rear_display_config import SOURCE_SHA256, SOURCE_IDS, PHYSICAL_IDS
+    rear_sources = {'/' + path: checksum for path, checksum in SOURCE_SHA256.items()}
+    rear_aliases = {f'/product/etc/displayconfig/display_id_{physical}.xml':
+                    SOURCE_SHA256[f'product/etc/displayconfig/display_id_{original}.xml']
+                    for original, physical in zip(SOURCE_IDS, PHYSICAL_IDS)}
     if (not isinstance(context, dict) or context.get('schema') != 1
             or not {'schema', 'identity_sources'} <= context.keys()
             or set(context) - {'schema', 'identity_sources', 'rear', 'boot_services'}):
@@ -40,7 +45,8 @@ def context_files(context):
         if kind == 'rear' and not (path in {'/system_ext/framework/rear-display-wake.jar',
                 '/system_ext/bin/rear-display-wake', '/product/etc/hyperos-avd-rear-display.json'}
                 or path == '/product/overlay/HyperOSAVDRearDisplay/RearDisplay.apk'
-                or re.fullmatch(r'/product/etc/displayconfig/display_id_[0-9]+\.xml', path)):
+                or path in rear_sources
+                or path in rear_aliases):
             raise RuntimeError('Unreviewed Core rear prerequisite path.')
         seen.add(path); rows.append((kind, path, checksum))
 
@@ -59,13 +65,21 @@ def context_files(context):
             append('rear', item)
         from apply_rear_display_fix import EXPECTED_WAKE_MANIFEST
         pins = {item['path']: item['sha256'] for item in rear['files']}
+        # Existing delivered contexts predate original-resource pins. Preserve
+        # those records, but accept a new resource set only when it is complete.
+        source_pins = {path: checksum for path, checksum in pins.items() if path in rear_sources}
+        if source_pins and source_pins != rear_sources:
+            raise RuntimeError('Unreviewed Core rear resource prerequisites.')
         for path, checksum in ((EXPECTED_WAKE_MANIFEST['jar_path'], EXPECTED_WAKE_MANIFEST['jar_sha256']),
                                (EXPECTED_WAKE_MANIFEST['script_path'], EXPECTED_WAKE_MANIFEST['script_sha256'])):
             if pins.get(path) != checksum:
                 raise RuntimeError('Unknown Core rear wake native helper.')
-        if ('/product/etc/hyperos-avd-rear-display.json' not in pins
-                or not any(path.startswith('/product/overlay/') for path in pins)
-                or not any(path.startswith('/product/etc/displayconfig/') for path in pins)):
+        required = {'/product/etc/hyperos-avd-rear-display.json',
+                    '/product/overlay/HyperOSAVDRearDisplay/RearDisplay.apk',
+                    EXPECTED_WAKE_MANIFEST['jar_path'], EXPECTED_WAKE_MANIFEST['script_path'],
+                    *rear_aliases}
+        if (set(pins) not in (required, required | set(rear_sources))
+                or any(pins.get(path) != checksum for path, checksum in rear_aliases.items())):
             raise RuntimeError('Incomplete Core physical rear display prerequisites.')
         files['rear.record'] = '1|1|1|local:4619827551948147201\n'
     boot = context.get('boot_services')

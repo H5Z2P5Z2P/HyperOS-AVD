@@ -118,7 +118,7 @@ class NativeModuleRuntimeTests(unittest.TestCase):
         self.bb.chmod(0o755)
         for name, body in {'pidof': 'exit 1', 'id': 'echo 0',
                            'getprop': 'case "$1" in ro.boot.hardware) echo ranchu;; '
-                           'ro.mi.os.version.incremental) echo OS4.9.999.0.TEST;; '
+                           'ro.product.cpu.abi) echo arm64-v8a;; '
                            'sys.boot_completed) echo 1;; esac'}.items():
             file = self.bin / name
             file.write_text('#!/bin/sh\n' + body + '\n')
@@ -224,7 +224,8 @@ class NativeModuleRuntimeTests(unittest.TestCase):
         (self.cpu / 'possible').write_text(possible)
         self.cpu_properties = self.root / 'cpu-properties.json'
         self.cpu_properties.write_text(json.dumps({
-            'ro.boot.hardware': 'ranchu', 'ro.mi.os.version.name': 'OS4.0',
+            'ro.boot.hardware': 'ranchu', 'ro.product.cpu.abi': 'arm64-v8a',
+            'ro.mi.os.version.name': 'OS4.0',
             'ro.mi.os.version.incremental': 'OS4.99.TEST', 'sys.boot_completed': boot,
             'dalvik.vm.default-dex2oat-cpu-set': '0,1,2,3,4,5,6,7',
             'dalvik.vm.dex2oat-threads': '2', 'dalvik.vm.background-dex2oat-threads': '99'}))
@@ -743,14 +744,19 @@ sleep() {
         self.assertIn('SKIPMOUNT=true', (MODULE / 'customize.sh').read_text())
         self.assertIn('id=hyperos_avd_native_compat\n', (MODULE / 'module.prop').read_text())
 
-    def test_os4_hardware_guard_has_no_avd_or_exact_firmware_gate(self):
+    def test_hardware_guard_uses_abi_without_a_firmware_gate(self):
         self.shell('native_guard')
-        self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; *) echo 4.1.999;; esac; }; native_guard')
+        for firmware in ('OS3.1', 'OS4.999.TEST', 'OS5.0.TEST', ''):
+            with self.subTest(firmware=firmware):
+                self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; '
+                           'ro.product.cpu.abi) echo arm64-v8a;; '
+                           'ro.mi.os.version.incremental) printf "%s\\n" ' + shlex.quote(firmware) + ';; esac; }; native_guard')
         self.shell('getprop() { echo Pixel; }; ! native_guard')
-        self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; *) echo OS3.1;; esac; }; ! native_guard')
+        self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; '
+                   'ro.product.cpu.abi) echo x86_64;; esac; }; ! native_guard')
         runtime = (MODULE / 'runtime.sh').read_text()
         self.assertNotIn('ro.boot.qemu.avd_name', runtime)
-        self.assertNotIn('OS4.0.', runtime)
+        self.assertNotIn('ro.mi.os.version.incremental', runtime)
 
     def test_customizer_preserves_known_core_feature_choices(self):
         registry = self.root / 'modules'

@@ -7,7 +7,7 @@ import re
 import subprocess
 import xml.etree.ElementTree as ET
 
-# Frozen legacy module identity; current image/runtime selection uses profiles.
+# Frozen legacy module identity, retained only for historical module records.
 VERSION = '4.0.18.0.XFRCNXM'
 ARCHIVE_SHA256 = 'b022c3fcfeb52ac014e971ea48dd07f8b35a0fb3fbdec74798da22375f7933e4'
 SOURCE_IDS = (4630947121878579347, 4630947121878579348)
@@ -105,25 +105,51 @@ def boot_init(profile):
 
 def runtime_options(build):
     """Enable the original physical rear panel only for a verified baked build."""
-    marker = build.get('rear_display')
-    if marker is None:
+    if not isinstance(build, dict):
+        raise RuntimeError('Unverified physical rear-display build metadata.')
+    if all(build.get(key) is None for key in ('rear_display', 'rear_display_wake_fix',
+                                            'rear_display_composer_fix', 'goldfish_sync_fix')):
         return []
-    from phone_profile import profile_from_build
+    from apply_rear_display_fix import validate_build
+    validate_build(build)
+    return ['-append-userspace-opt', BOOT_PROPERTY]
+
+
+def runtime_marker(build):
+    """Match the complete resource/native contract independently of OTA labels."""
     from patch_rear_display import MANIFEST
     from patch_goldfish_sync import MANIFEST as SYNC_MANIFEST
-    selected = validate_profile(profile_from_build(build))
-    expected = {'schema': 1, 'hyperos': selected['hyperos'],
-                'archive_sha256': selected['archive_sha256'],
-                'source_sha256': SOURCE_SHA256, 'mapping_sha256': MAPPING_SHA256,
-                'overlay': OVERLAY, 'overlay_priority': PRIORITY}
-    if (not isinstance(marker, dict) or any(json.dumps(marker.get(key), sort_keys=True) !=
-                                           json.dumps(value, sort_keys=True)
-                                           for key, value in expected.items()) or
-            any(json.dumps(build.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
-                for key, value in (('rear_display_composer_fix', MANIFEST),
-                                   ('goldfish_sync_fix', SYNC_MANIFEST)))):
+    if not isinstance(build, dict):
         raise RuntimeError('Unverified physical rear-display build metadata.')
-    return ['-append-userspace-opt', BOOT_PROPERTY]
+    marker = build.get('rear_display')
+    version, archive = build.get('hyperos'), build.get('archive_sha256')
+    overlay = marker.get('overlay_sha256') if isinstance(marker, dict) else None
+    if (not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', version)
+            or not isinstance(archive, str) or not re.fullmatch('[0-9a-f]{64}', archive)
+            or not isinstance(overlay, str) or not re.fullmatch('[0-9a-f]{64}', overlay)):
+        raise RuntimeError('Invalid rear-display provenance or resource hash.')
+    displays = []
+    for original, physical, geometry in zip(SOURCE_IDS, PHYSICAL_IDS,
+                                            ((1120, 2436, 480), (912, 596, 450))):
+        source = f'product/etc/displayconfig/display_id_{original}.xml'
+        displays.append({'source_physical_id': original, 'physical_id': physical,
+                         'unique_id': 'local:' + str(physical),
+                         'config': f'/product/etc/displayconfig/display_id_{physical}.xml',
+                         'config_sha256': SOURCE_SHA256[source],
+                         'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
+    expected = {'schema': 1, 'hyperos': version, 'archive_sha256': archive,
+                'source_sha256': dict(SOURCE_SHA256), 'mapping_sha256': MAPPING_SHA256,
+                'overlay': OVERLAY, 'overlay_path': '/' + OVERLAY_PATH,
+                'overlay_sha256': overlay, 'overlay_priority': PRIORITY,
+                'source_overlay_priority': 1000, 'requires_runtime_resource_verification': True,
+                'overridden_resources': ['config_displayUniqueIdArray'], 'displays': displays,
+                'rear_safe_inset_left': 296, 'rear_corner_radius': 106}
+    if (json.dumps(marker, sort_keys=True) != json.dumps(expected, sort_keys=True)
+            or any(json.dumps(build.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
+                   for key, value in (('rear_display_composer_fix', MANIFEST),
+                                      ('goldfish_sync_fix', SYNC_MANIFEST)))):
+        raise RuntimeError('Unverified physical rear-display build metadata.')
+    return expected
 
 
 def validate_sources(sources):

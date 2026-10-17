@@ -3,10 +3,7 @@ SKIPMOUNT=true
 BB=/data/adb/ksu/bin/busybox
 [ "$ARCH" = arm64 ] || abort 'This module requires ARM64 Android.'
 [ "$(getprop ro.boot.hardware)" = ranchu ] || abort 'This module requires ranchu emulator hardware.'
-case "$(getprop ro.mi.os.version.incremental)" in
-    OS4.*|4.*) ;;
-    *) abort 'This module requires a HyperOS 4 base system.' ;;
-esac
+[ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] || abort 'This module requires the ARM64 Android ABI.'
 [ -x "$BB" ] || abort 'KernelSU BusyBox is unavailable.'
 [ -f "$MODPATH/SHA256SUMS" ] || abort 'Module asset checksums are missing.'
 (cd "$MODPATH" && "$BB" sha256sum -c SHA256SUMS >/dev/null 2>&1) || abort 'Module asset verification failed.'

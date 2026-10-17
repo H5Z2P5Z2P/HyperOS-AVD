@@ -789,18 +789,19 @@ class PhoneRuntimeUpgradeTests(unittest.TestCase):
         self.assertIn(b'ro.hardware=ranchu\n', result)
         self.assertEqual(defaults.production_properties(result, self.profile()), result)
 
-    def test_versioned_defaults_keep_legacy_pad_anchors_and_once_only_stamps(self):
+    def test_current_defaults_use_capabilities_and_keep_legacy_stamps(self):
         legacy = (defaults.AOD_SCRIPT, defaults.REFRESH_SCRIPT, defaults.REFRESH_WRAPPER)
         aod, refresh = defaults.phone_scripts(self.profile())
         wrapper = defaults.refresh_wrapper(self.profile())
         for script in (aod, refresh, wrapper):
-            self.assertIn(b'OS4.0.18.0.XFRCNXM', script)
-            self.assertNotIn(b'OS4.0.17.0.XFRCNXM', script)
+            self.assertNotIn(b'ro.mi.os.version.incremental', script)
+            self.assertIn(defaults.display_capability_script(), script)
         for stamp in (defaults.AOD_STAMP, defaults.COLOR_STAMP):
             self.assertIn(stamp.encode(), aod)
         self.assertEqual(legacy, (defaults.AOD_SCRIPT, defaults.REFRESH_SCRIPT, defaults.REFRESH_WRAPPER))
-        self.assertEqual(defaults.phone_scripts(), legacy[:2])
-        self.assertEqual(defaults.refresh_wrapper(), legacy[2])
+        self.assertEqual(defaults.legacy_phone_scripts(), legacy[:2])
+        self.assertEqual(defaults.legacy_refresh_wrapper(), legacy[2])
+        self.assertIn(b'OS4.0.18.0.XFRCNXM', defaults.legacy_refresh_wrapper(self.profile()))
         self.assertEqual(defaults.display_template('hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=440\n', self.profile()), 'hw.lcd.width=1120\nhw.lcd.height=2436\nhw.lcd.density=480\n')
 
     def test_navigation_mismatched_firmware_exits_before_identity_writes(self):

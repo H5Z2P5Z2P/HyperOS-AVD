@@ -57,6 +57,7 @@ LOG_TAGS = tuple(LOG_SCRIPT.split(b'tags=(\n', 1)[1].split(b'\n)', 1)[0].decode(
 if not LOG_TAGS or len(set(LOG_TAGS)) != len(LOG_TAGS) or any(
         not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', tag) for tag in LOG_TAGS):
     raise RuntimeError('Invalid HyperOS log tag list.')
+# Frozen published payloads are retained only for exact legacy retirement.
 REFRESH_SCRIPT = (CONFIG / 'lock_fps.sh').read_bytes()
 REFRESH_INIT = b'\n' + (CONFIG / 'lock_refresh_rate.rc').read_bytes()
 REFRESH_SERVICE = '/data/adb/service.d/hyperos-avd-lock-fps.sh'
@@ -261,8 +262,8 @@ def display_template(data, profile=None):
     return '\n'.join(lines) + '\n'
 
 
-def phone_scripts(profile=None):
-    """Version only the verified firmware guard, keeping legacy Pad anchors."""
+def legacy_phone_scripts(profile=None):
+    """Reproduce published version guards for exact historical authentication."""
     if profile is None:
         return AOD_SCRIPT, REFRESH_SCRIPT
     old = b'OS4.0.17.0.XFRCNXM'
@@ -272,10 +273,72 @@ def phone_scripts(profile=None):
     return AOD_SCRIPT.replace(old, new), REFRESH_SCRIPT.replace(old, new)
 
 
-def refresh_wrapper(profile=None):
-    _, script = phone_scripts(profile)
+def legacy_refresh_wrapper(profile=None):
+    _, script = legacy_phone_scripts(profile)
     header = REFRESH_WRAPPER[:REFRESH_WRAPPER.index(REFRESH_SCRIPT.removeprefix(b'#!/system/bin/sh\n'))]
     return header + script.removeprefix(b'#!/system/bin/sh\n')
+
+
+def display_capability_script():
+    """Share audited display content and live hardware checks with Core."""
+    from patch_display_metadata import RECIPES
+    from patch_lockscreen_video import APK, APK_SHA256 as aod_sha
+    # The debug transaction was reviewed in the complete ARM64 SF input. The
+    # metadata producer's derivative only changes its unrelated Dolby branch.
+    sf = {'fef17e489200a456fcff3cc32fc3e8f6b692526fe72afbdd30d313286c809559'}
+    before = '8fdf4dfa2a53a8cc7dcf298be651b38cebe39cf8d5af7d94a6a689b766e2928c'
+    sf.add(before)
+    sf.add(RECIPES[before]['after'])
+    return ('''# Generated display capability checks; shared by images and Core.
+display_defaults_guard() {
+    [ "$(id -u)" = 0 ] &&
+        [ "$(getprop ro.boot.hardware)" = ranchu ] &&
+        [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] &&
+        [ "$(uname -m)" = aarch64 ]
+}
+display_file_sha() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 1
+    sha256sum "$1" 2>/dev/null | cut -d ' ' -f 1
+}
+display_refresh_capable() {
+    display_defaults_guard && [ "$(getprop ro.boot.qemu.vsync)" = 60 ] || return 1
+    case "$(display_file_sha /system_ext/lib64/libsurfaceflinger.so)" in
+        ''' + '|'.join(sorted(sf)) + ''') ;;
+        *) return 1 ;;
+    esac
+    dumpsys SurfaceFlinger | awk '
+        /(^|[[:space:]])activeMode[[:space:]]*=[[:space:]]*[{]/ {found++; if ($0 !~ /id=0([, }]|$)/ || $0 !~ /vsyncRate=60\\.00 Hz/) bad=1}
+        END {exit !found || bad}'
+}
+display_aod_capable() {
+    display_defaults_guard &&
+        [ "$(display_file_sha /product/etc/device_features/emu64a.xml)" = ''' + MODEL_SHA256 + ''' ] &&
+        [ "$(display_file_sha ''' + APK + ''')" = ''' + aod_sha + ''' ]
+}
+''').encode()
+
+
+def phone_scripts(profile=None):
+    """Choose current defaults by content, ARM64 ABI and display capability."""
+    library = display_capability_script()
+    aod_body = AOD_SCRIPT.split(b'set -e\n', 1)[1]
+    aod = b'#!/system/bin/sh\n' + library + b'display_aod_capable || exit 0\nset -e\n' + aod_body
+    refresh = b'#!/system/bin/sh\n' + library + b'''display_refresh_capable || exit 0
+set -e
+settings --user 0 put system is_smart_fps 0
+settings --user 0 put system min_refresh_rate 60
+settings --user 0 put system peak_refresh_rate 60
+reply=$(service call SurfaceFlinger 1035 i32 0)
+[ "$reply" = 'Result: Parcel(NULL)' ] || exit 1
+log -t HyperOSAVDRefresh 'Physical and compositor render rates locked to 60 Hz.'
+'''
+    return aod, refresh
+
+
+def refresh_wrapper(profile=None):
+    """Wait for boot, then apply the same current image capability checks."""
+    header = REFRESH_WRAPPER[:REFRESH_WRAPPER.index(REFRESH_SCRIPT.removeprefix(b'#!/system/bin/sh\n'))]
+    return header + phone_scripts()[1].removeprefix(b'#!/system/bin/sh\n')
 
 
 def image_replacements(sdk, folder, profile=None):
@@ -392,29 +455,12 @@ def apply_refresh_runtime(config):
     from apply_flutter_fix import official, root
     from common import ROOT, adb, sha256
     official(config, sources=('official-hongkong-ota', 'official-yingtian-ota'))
-    build = ROOT / 'local/build.json'
-    tablet = build.is_file() and json.loads(build.read_text()).get('source') == 'official-yingtian-ota'
-    version = 'OS4.0.17.0.XFRCNXM'
-    if tablet:
-        from os4_pad import PROFILE
-        version = PROFILE['hyperos']
-    else:
-        from phone_profile import profile_from_build
-        phone_profile = profile_from_build()
-        version = phone_profile['incremental']
-    expected = {'ro.boot.hardware': 'ranchu', 'ro.boot.qemu.avd_name': config['name'],
-                'ro.mi.os.version.incremental': version,
-                'ro.boot.qemu.vsync': '60'}
-    for key, value in expected.items():
-        if root(config, 'getprop ' + key) != value:
-            raise RuntimeError('Unsupported display for refresh override: ' + key)
+    if root(config, display_capability_script().decode() + '\ndisplay_refresh_capable && echo ready') != 'ready':
+        raise RuntimeError('Unsupported display content, ARM64 ABI or active mode for refresh override.')
     folder = ROOT / 'work/refresh-fix'
     folder.mkdir(parents=True, exist_ok=True)
     script = folder / 'service.sh'
-    payload = REFRESH_WRAPPER if tablet else refresh_wrapper(phone_profile)
-    if tablet:
-        from os4_pad import refresh_script
-        payload = refresh_script(payload)
+    payload = refresh_wrapper()
     script.write_bytes(payload)
     checksum = sha256(script)
     marker = ROOT / 'local/refresh-fix.json'
@@ -424,6 +470,10 @@ def apply_refresh_runtime(config):
     # The previous release's verified service is safe to migrate even when an
     # upgrade did not carry the host-side local receipt into its new runtime.
     owned = {checksum, hashlib.sha256(REFRESH_WRAPPER).hexdigest()}
+    from phone_profile import ARCHIVES, profile
+    from os4_pad import refresh_script as legacy_pad_refresh
+    owned.update(hashlib.sha256(legacy_refresh_wrapper(profile(version))).hexdigest() for version in ARCHIVES)
+    owned.add(hashlib.sha256(legacy_pad_refresh(REFRESH_WRAPPER)).hexdigest())
     if old.get('target') == REFRESH_SERVICE:
         owned.add(old['sha256'])
     if current and current not in owned:
@@ -670,7 +720,7 @@ def apply_runtime(config, managed=False):
     adb(config, 'emu', 'power', 'ac', 'on', check=True, capture_output=True, timeout=15)
     # Seed once for both existing and fresh userdata. Later user choices survive
     # cold boots; show style 2 means always, 1 means scheduled, 0 means temporary.
-    root(config, f'if [ ! -e {AOD_STAMP} ]; then\n'
+    root(config, display_capability_script().decode() + f'\nif display_aod_capable && [ ! -e {AOD_STAMP} ]; then\n'
          '    settings put secure doze_always_on 1\n'
          '    settings put secure aod_show_style 2\n'
          '    settings put secure aod_mode_user_set 1\n'

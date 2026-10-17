@@ -401,51 +401,48 @@ class PhoneVulkanNativeTests(unittest.TestCase):
 
 class PhoneVulkanRuntimeTests(unittest.TestCase):
 
-    def test_registered_new_firmware_reuses_the_authenticated_hwui_recipe(self):
+    def test_hwui_content_and_renderer_select_workarounds_without_firmware_labels(self):
         expected = vulkan_features(build_info())
         current = build_info('4.0.24.0.XFRCNXM')
         self.assertEqual(vulkan_features(current), expected)
-        self.assertEqual(vulkan_features({**current, 'name': 'Any_Renamed_AVD', 'port': 5660, 'avd_path': '/custom/phone.avd'}), expected)
-        with self.assertRaisesRegex(RuntimeError, 'OTA archive identity disagree'):
-            vulkan_features({**current, 'archive_sha256': build_info()['archive_sha256']})
+        for labels in ({'name': 'Any_Renamed_AVD', 'port': 5660, 'avd_path': '/custom/phone.avd'},
+                       {'source': 'custom', 'hyperos': '5.9.99.0.FUTURE', 'archive_sha256': 'a' * 64},
+                       {'source': 'official-yingtian-ota', 'hyperos': None, 'archive_sha256': None}):
+            self.assertEqual(vulkan_features({**current, **labels}), expected)
         for key, value in (('before', '0' * 64), ('after', '0' * 64), ('profile', 'unknown')):
             with self.subTest(key=key):
                 self.assertEqual(vulkan_features({**current, 'hwui': {**current['hwui'], key: value}}), [])
-        selected = profile(current['hyperos'])
-        selected['pins']['hwui'] = '0' * 64
-        with patch('phone_profile.profile_from_build', return_value=selected):
-            self.assertEqual(vulkan_features(current), [])
-
-    def test_submission_workaround_requires_verified_r3_marker_and_keeps_pad(self):
-        expected = ['-feature', 'VulkanBatchedDescriptorSetUpdate,-GLAsyncSwap,-VulkanQueueSubmitWithCommands']
-        current = build_info()
-        self.assertEqual(vulkan_features(current), expected)
-        self.assertEqual(vulkan_features({'source': 'official-yingtian-ota'}), ['-feature', 'VulkanBatchedDescriptorSetUpdate'])
-        for value in ({}, {'source': 'gsi', 'hyperos': '3.0.2.0.WMCCNXM'}, {'source': 'official-hongkong-ota'}, {**current, 'source': 'gsi'}, {**current, 'hyperos': '3.0.2.0.WMCCNXM'}, {**current, 'hyperos': '4.0.17.0.XFRCNXM'}, {**current, 'hyperos': '4.0.19.0.XFRCNXM'}, {**current, 'hwui_renderer': 'skiagl'}, {**current, 'hwui': None}, {**current, 'hwui': {'after': PHONE_AFTER}}, {**current, 'hwui': {**current['hwui'], 'before': 'unverified'}}, {**current, 'hwui': {**current['hwui'], 'after': 'unverified'}}, {**current, 'hwui': {**current['hwui'], 'profile': 'unverified'}}):
+        for value in ({}, {'source': 'official-yingtian-ota'}, {**current, 'hwui_renderer': None},
+                      {**current, 'hwui_renderer': 'skiagl'}, {**current, 'hwui': None},
+                      {**current, 'hwui': {'after': PHONE_AFTER}}):
             with self.subTest(value=value):
                 self.assertEqual(vulkan_features(value), [])
-        for digest in (None, 'unknown'):
-            with self.subTest(digest=digest), self.assertRaisesRegex(RuntimeError, 'OTA archive identity disagree'):
-                vulkan_features({**current, 'archive_sha256': digest})
 
-    def test_workarounds_follow_image_identity_after_avd_rename(self):
+    def test_submission_workaround_requires_the_complete_physical_rear_contract(self):
         current = build_info()
-        for name in ('HyperOS_4_Official_API_37', 'Any_Renamed_Phone_AVD', 'HyperOS_3_API_36'):
-            with self.subTest(name=name):
-                self.assertEqual(vulkan_features({**current, 'name': name}), ['-feature', 'VulkanBatchedDescriptorSetUpdate,-GLAsyncSwap,-VulkanQueueSubmitWithCommands'])
-                self.assertEqual(vulkan_features({**current, 'name': name, 'hyperos': '4.0.17.0.XFRCNXM'}), [])
+        for value in (current, {**current, 'hwui': {'before': BEFORE, 'after': AFTER}}):
+            with patch('rear_display_config.runtime_options', return_value=['-verified-rear-panel']) as rear:
+                flags = vulkan_features(value)[1].split(',')
+            rear.assert_called_once_with(value)
+            self.assertEqual(flags.count('-VulkanQueueSubmitWithCommands'), 1)
+            self.assertIn('-GLAsyncSwap', flags)
+            self.assertNotIn('VulkanQueueSubmitWithCommands', flags)
+        self.assertEqual(vulkan_features(current), ['-feature', 'VulkanBatchedDescriptorSetUpdate'])
+        with self.assertRaisesRegex(RuntimeError, 'rear-display'):
+            vulkan_features({**current, 'rear_display': {'schema': 1}})
 
-    def test_queue_disable_remains_phone_only_and_tracks_the_image_not_runtime_name(self):
-        current = build_info()
-        renamed = {**current, 'name': 'Any_Pad_Name', 'port': 5600, 'avd_path': '/custom/renamed.avd'}
-        phone = vulkan_features(renamed)
-        flags = phone[1].split(',')
-        self.assertEqual(flags.count('-VulkanQueueSubmitWithCommands'), 1)
-        self.assertIn('-GLAsyncSwap', flags)
-        self.assertNotIn('VulkanQueueSubmitWithCommands', flags)
-        self.assertEqual(vulkan_features({**renamed, 'source': 'official-yingtian-ota'}), ['-feature', 'VulkanBatchedDescriptorSetUpdate'])
-        self.assertEqual(vulkan_features({**renamed, 'source': 'unknown-ota'}), [])
-        self.assertEqual(vulkan_features({**renamed, 'hwui_renderer': 'skiagl'}), [])
+    def test_delivered_pad_receipt_is_the_only_missing_renderer_compatibility_case(self):
+        receipt = {'before': BEFORE, 'after': AFTER}
+        for source in ('custom', 'official-hongkong-ota', 'official-yingtian-ota'):
+            for renderer in (None, 'skiavk', 'skiagl'):
+                value = {'source': source, 'hwui': receipt}
+                if renderer is not None:
+                    value['hwui_renderer'] = renderer
+                expected = [] if renderer == 'skiagl' else ['-feature', 'VulkanBatchedDescriptorSetUpdate']
+                with self.subTest(source=source, renderer=renderer):
+                    self.assertEqual(vulkan_features(value), expected)
+        self.assertEqual(vulkan_features({'hwui': {**receipt, 'extra': True}}), [])
+        self.assertEqual(vulkan_features({'hwui': receipt, 'hwui_renderer': None}), [])
 
     def test_gradient_override_accepts_patched_r3_but_rejects_it_for_legacy_r2(self):
         config = {'name': 'Any_Renamed_Phone_AVD', 'port': 5584}

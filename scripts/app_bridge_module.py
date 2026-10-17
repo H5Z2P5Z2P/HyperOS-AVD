@@ -236,9 +236,9 @@ def install(config, *, module_id, name, description, package, profiles, payloads
     """Stage immutable payloads; KernelSU activates them on the next normal boot."""
     if not _word(module_id):
         raise RuntimeError('Invalid private bridge module identity.')
-    values = root(config, 'getprop ro.boot.hardware; getprop ro.mi.os.version.incremental').splitlines()
-    if len(values) != 2 or values[0] != 'ranchu' or not values[1].startswith(('OS4.', '4.')):
-        raise RuntimeError('Private bridge requires a ranchu OS4 guest.')
+    values = root(config, 'getprop ro.boot.hardware; getprop ro.product.cpu.abi').splitlines()
+    if values != ['ranchu', 'arm64-v8a']:
+        raise RuntimeError('Private bridge requires an ARM64 ranchu guest.')
     active_path, pending_path = '/data/adb/modules/' + module_id, '/data/adb/modules_update/' + module_id
     active, pending = (_inspect(config, directory, module_id) for directory in (active_path, pending_path))
     for module in (active, pending):

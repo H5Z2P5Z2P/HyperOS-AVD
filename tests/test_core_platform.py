@@ -172,6 +172,8 @@ class CorePlatformShellTests(unittest.TestCase):
     def setUp(self):
         fixture.NativeModuleRuntimeTests.setUp(self)
         (self.module / 'boot-prerequisites.tsv').write_bytes(package_native_module.boot_prerequisites())
+        from os4_defaults import display_capability_script
+        (self.module / 'display-defaults.sh').write_bytes(display_capability_script())
         from rear_display_wake_runtime import files as rear_files
         for name, body in rear_files().items():
             (self.module / name).write_bytes(body)
@@ -299,8 +301,13 @@ class CorePlatformShellTests(unittest.TestCase):
         self.assertIn('unverified-image-defaults', (self.module / 'state/status.tsv').read_text())
 
     def test_refresh_requires_actual_primary_mode_and_keeps_settings_choices(self):
-        overrides = '''getprop() { case "$1" in ro.boot.qemu.vsync) echo 60;; *) echo 1;; esac; }
-dumpsys() { printf 'activeMode={id=0, hwcId=0, resolution=2272x3408, vsyncRate=60.00 Hz} '; if [ -f "$CORE_STATE/refreshed" ]; then echo 'renderRate=60.00 Hz'; else echo 'renderRate=20.00 Hz'; fi; }
+        helper = self.module / 'display-defaults.sh'
+        helper.write_bytes(helper.read_bytes() + b'''display_file_sha() { echo fef17e489200a456fcff3cc32fc3e8f6b692526fe72afbdd30d313286c809559; }
+''')
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        overrides = '''getprop() { case "$1" in ro.boot.qemu.vsync) echo 60;; ro.boot.hardware) echo ranchu;; ro.product.cpu.abi) echo arm64-v8a;; *) echo 1;; esac; }
+uname() { echo aarch64; }
+dumpsys() { printf 'activeMode={id=0, hwcId=0, resolution=2272x3408, vsyncRate=60.00 Hz} '; if [ -f "$CORE_STATE/refreshed" ]; then echo 'renderRate=60.00 Hz'; else echo 'renderRate=20.00 Hz'; fi; echo 'activeModeId=0'; }
 service() { echo "$*" >> "$CORE_STATE/refresh-calls"; touch "$CORE_STATE/refreshed"; echo 'Result: Parcel(NULL)'; }
 settings() { echo unexpected-settings-write >&2; return 1; }
 '''
@@ -308,7 +315,14 @@ settings() { echo unexpected-settings-write >&2; return 1; }
         self.assertIn('compositor-60hz', (self.module / 'state/status.tsv').read_text())
         self.assertEqual((self.root / 'persistent/refresh-calls').read_text().splitlines(), ['call SurfaceFlinger 1035 i32 0'])
         self.run_platform('core_refresh', overrides.replace('id=0,', 'id=1,'))
-        self.assertIn('unsupported-active-mode', (self.module / 'state/status.tsv').read_text())
+        self.assertIn('unverified-display-content-abi-or-mode', (self.module / 'state/status.tsv').read_text())
+        self.run_platform('core_refresh', overrides.replace("echo 'activeModeId=0';", "echo 'activeModeId=0'; echo '  activeMode = {id=0, vsyncRate=90.00 Hz}';"))
+        self.assertIn('unverified-display-content-abi-or-mode', (self.module / 'state/status.tsv').read_text())
+        helper.write_bytes(helper.read_bytes().replace(b'echo fef17e489200a456fcff3cc32fc3e8f6b692526fe72afbdd30d313286c809559', b'echo unknown'))
+        fixture.NativeModuleRuntimeTests.checksums(self)
+        self.run_platform('core_refresh', overrides)
+        self.assertIn('unverified-display-content-abi-or-mode', (self.module / 'state/status.tsv').read_text())
+        self.assertEqual((self.root / 'persistent/refresh-calls').read_text().splitlines(), ['call SurfaceFlinger 1035 i32 0'])
 
     def test_rear_helper_does_not_start_for_tablet_or_unverified_resources(self):
         _, effects = self.run_platform('core_rear')
@@ -1275,10 +1289,28 @@ class CoreMigrationShellTests(CorePlatformShellTests):
     def test_global_refresh_is_archived_only_after_exact_owner_and_pin_verification(self):
         from os4_defaults import REFRESH_WRAPPER
         path = self.root / 'data/service.d/hyperos-avd-lock-fps.sh'; path.parent.mkdir(); path.write_bytes(REFRESH_WRAPPER)
+        first_inode = path.stat().st_ino
         result = platform.configure(self.guest, {}, self.context, '/data/adb/modules/hyperos_avd_native_compat', self.checksum)
         self.assertFalse(path.exists())
         self.assertEqual(result['global_hooks'][0]['status'], 'retired')
-        self.assertTrue(next((self.root / 'persistent/retired').glob('hyperos-avd-lock-fps.sh-*')).is_file())
+        first = Path(result['global_hooks'][0]['archive'].replace(platform.STATE, str(self.root / 'persistent')))
+        self.assertEqual(first.stat().st_ino, first_inode)
+        # Keep an older flat archive, then recreate exactly the reviewed hook.
+        old = first.parent.parent / ('hyperos-avd-lock-fps.sh-' + platform.digest(REFRESH_WRAPPER)[:16])
+        old.write_bytes(REFRESH_WRAPPER)
+        old_inode = old.stat().st_ino
+        path.write_bytes(REFRESH_WRAPPER)
+        second_inode = path.stat().st_ino
+        result = platform.configure(self.guest, {}, self.context, '/data/adb/modules/hyperos_avd_native_compat', self.checksum)
+        self.assertFalse(path.exists())
+        self.assertEqual(result['global_hooks'][0]['status'], 'retired')
+        second = Path(result['global_hooks'][0]['archive'].replace(platform.STATE, str(self.root / 'persistent')))
+        self.assertNotEqual(first, second)
+        self.assertEqual((first.stat().st_ino, old.stat().st_ino, second.stat().st_ino),
+                         (first_inode, old_inode, second_inode))
+        self.assertEqual(first.read_bytes(), REFRESH_WRAPPER)
+        self.assertEqual(old.read_bytes(), REFRESH_WRAPPER)
+        self.assertEqual(second.read_bytes(), REFRESH_WRAPPER)
 
     def test_unknown_platform_state_is_preserved_and_exact_partial_publication_recovers(self):
         directory = self.navigation()

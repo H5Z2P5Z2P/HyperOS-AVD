@@ -227,14 +227,14 @@ PROPERTY = f'id={install.MODULE_ID}\nauthor=HyperOS-AVD\nversionCode={install.RE
 
 class NativeModuleInstallTests(unittest.TestCase):
 
-    def run_install(self, active=None, pending=None, firmware='OS4.99.999.0.TEST', verify=None):
+    def run_install(self, active=None, pending=None, abi='arm64-v8a', verify=None):
         commands = []
         modules = {install.MODULE: active, install.PENDING: pending}
 
         def guest(config, command):
             commands.append(command)
             if command.startswith('getprop'):
-                return 'ranchu\n' + firmware
+                return 'ranchu\n' + abi
             directory = install.PENDING if install.PENDING in command else install.MODULE
             state = modules[directory]
             if command.startswith('if ') and "printf 'present" in command:
@@ -322,15 +322,35 @@ class NativeModuleInstallTests(unittest.TestCase):
                 with self.subTest(directory=directory, value=value), self.assertRaisesRegex(RuntimeError, 'Refused'):
                     self.run_install(**{directory: {'manifest': value}})
 
-    def test_other_os_family_is_not_modified(self):
-        with self.assertRaisesRegex(RuntimeError, 'ranchu OS4'):
-            self.run_install(firmware='OS3.0.2.0.WMCCNXM')
+    def test_other_abi_is_not_modified(self):
+        with self.assertRaisesRegex(RuntimeError, 'ARM64 ranchu'):
+            self.run_install(abi='x86_64')
+
+    def test_guest_compatibility_does_not_query_firmware_identity(self):
+        with patch.object(install, 'root', return_value='ranchu\narm64-v8a') as guest:
+            install.guest_supported({})
+        self.assertEqual(guest.call_args.args[1],
+                         'getprop ro.boot.hardware; getprop ro.product.cpu.abi')
 
     def test_script_updates_change_the_manifest_identity(self):
         original = json.loads(self.current_manifest())
         self.assertIn('runtime.sh', original['files_sha256'])
         self.assertIn('customize.sh', original['files_sha256'])
         self.assertEqual(original['revision'], install.REVISION)
+
+    def test_core18_controls_remain_authenticated_after_abi_guard_update(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v18-final-manifest.json').read_text()
+        saved = json.loads(previous)
+        expected = '1d7856b5b812ccf309f8d20e1393f4c1d6455a82117a6fb18651f55f3aa73514'
+        self.assertEqual(history.checksum_for(saved), expected)
+        record = next(row for row in history.REVIEWED if row['revision'] == 18)
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=18'
+        result, commands, _ = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed'])
+        self.assertTrue(any(expected in command for command in commands))
 
     def previous_manifest(self):
         return (REPO / 'tests/fixtures/native-compat-v2-manifest.json').read_text()

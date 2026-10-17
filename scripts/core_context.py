@@ -25,9 +25,10 @@ def context_from_image(build, read):
         return {'path': path, 'sha256': checksum}
     identity = [pin(path) for path in ('/system/build.prop', '/product/etc/build.prop')]
     result = {'schema': 1, 'identity_sources': identity, 'rear': None, 'boot_services': None}
-    if build.get('rear_display_wake_fix') is not None:
+    if any(build.get(key) is not None for key in ('rear_display', 'rear_display_wake_fix',
+                                                 'rear_display_composer_fix', 'goldfish_sync_fix')):
         from apply_rear_display_fix import EXPECTED_WAKE_MANIFEST, validate_build
-        from rear_display_config import MARKER_PATH
+        from rear_display_config import MARKER_PATH, SOURCE_SHA256
         marker = validate_build(build)
         wake = build['rear_display_wake_fix']
         if wake != EXPECTED_WAKE_MANIFEST:
@@ -38,6 +39,7 @@ def context_from_image(build, read):
                  pin(wake['script_path'], wake['script_sha256']),
                  pin(marker['overlay_path'], marker['overlay_sha256'])]
         files += [pin(row['config'], row['config_sha256']) for row in marker['displays']]
+        files += [pin('/' + path, checksum) for path, checksum in SOURCE_SHA256.items()]
         result['rear'] = {'files': files, 'display_id': wake['display_id'],
                           'group_id': wake['display_group_id'],
                           'unique_id': wake['display_unique_id'],

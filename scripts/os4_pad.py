@@ -227,11 +227,17 @@ def model_config():
 
 
 def refresh_script(data):
-    """Retain the physical-mode guard while selecting only this OTA version."""
+    """Reproduce the published tablet hook for exact legacy authentication."""
     old = b'OS4.0.17.0.XFRCNXM'
     if data.count(old) != 1:
         raise RuntimeError('Unexpected refresh script version guard.')
     return data.replace(old, PROFILE['hyperos'].encode())
+
+
+def current_refresh_script():
+    """Use the same audited content and display checks as Phone and Core."""
+    from os4_defaults import phone_scripts
+    return phone_scripts()[1]
 
 
 def align_window(config):

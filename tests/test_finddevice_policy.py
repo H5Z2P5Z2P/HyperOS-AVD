@@ -52,7 +52,7 @@ p=pathlib.Path(os.environ['FD_METADATA']);m=json.loads(p.read_text());a=sys.argv
 '''
         commands = {
             'id': 'print(0)',
-            'getprop': "print({'ro.boot.hardware':m['hardware'],'ro.mi.os.version.incremental':'OS4.99.TEST','sys.boot_completed':'1'}.get(a[0],''))",
+            'getprop': "print({'ro.boot.hardware':m['hardware'],'ro.product.cpu.abi':m.get('abi','arm64-v8a'),'ro.mi.os.version.incremental':m.get('firmware','OS4.99.TEST'),'sys.boot_completed':'1'}.get(a[0],''))",
             'dumpsys': r'''
 user='    User 0: installed='+str(m['installed']).lower()+' hidden='+str(m['hidden']).lower()+' suspended='+str(m['suspended']).lower()+' stopped=false enabled='+str(m['enabled'])+' instant=false'
 block='  Package ['+m['package']+'] (abc):\n    appId='+str(m['uid'])+'\n    pkgFlags=[ '+('SYSTEM HAS_CODE' if m['system'] else 'HAS_CODE')+' ]\n'+user+'\n'
@@ -167,8 +167,15 @@ else:sys.exit(1)
 
     def test_hardware_and_non_system_identity_fail_before_package_changes(self):
         self.update(hardware='physical');self.run_policy('apply',False)
+        self.update(hardware='ranchu',abi='x86_64');self.run_policy('apply',False)
+        self.update(abi='arm64-v8a')
         self.update(hardware='ranchu',system=False);self.run_policy('apply',False)
         self.assertEqual(self.trace.read_text(),'')
+
+    def test_policy_compatibility_uses_content_without_a_firmware_version(self):
+        self.update(firmware='OS5.0.TEST')
+        self.run_policy('apply')
+        self.assertTrue(self.owned_state())
 
     def test_uid_race_during_disable_retains_uncertain_receipt(self):
         self.update(race_uid=True);self.run_policy('apply',False)

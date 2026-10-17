@@ -175,11 +175,21 @@ class BootServiceTests(unittest.TestCase):
 
         def digest(path):
             return fixes.AFTER[Path(path).stem]
-        with patch.object(installer, 'official'), patch.object(installer, 'profile_from_build', return_value=profile('4.0.18.0.XFRCNXM')), patch.object(installer, 'sha256', side_effect=digest), patch.object(installer, 'root', side_effect=root), patch.object(installer, 'adb') as adb:
+        with patch.object(installer, 'official'), patch.object(installer, 'sha256', side_effect=digest), patch.object(installer, 'root', side_effect=root), patch.object(installer, 'adb') as adb:
             with self.assertRaisesRegex(RuntimeError, 'Existing boot service payload differs'):
                 installer.install(device, Path('unused-payload'))
             adb.assert_not_called()
         self.assertFalse(any(('mkdir' in call or 'mount ' in call for call in calls)))
+
+    def test_retired_payload_entry_point_cannot_create_a_standalone_module(self):
+        calls = []
+        with patch.object(installer, 'official'), patch.object(installer, 'root', side_effect=lambda config, command: calls.append(command) or ''), \
+                patch.object(installer, 'sha256') as checksum, patch.object(installer, 'adb') as adb:
+            with self.assertRaisesRegex(RuntimeError, 'Use the shared Core module'):
+                installer.install({'name': 'Any-name'}, Path('missing-payload'))
+            checksum.assert_not_called()
+            adb.assert_not_called()
+        self.assertFalse(any('mkdir' in command or 'mount ' in command or 'getprop ro.mi.os' in command for command in calls))
 
     def test_release_rejects_wrong_version_and_claimed_but_missing_repair(self):
         reader = unittest.mock.Mock(return_value=b'wrong artifact')

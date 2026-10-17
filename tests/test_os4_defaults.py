@@ -402,16 +402,19 @@ class OS4DefaultsTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             boot_defaults(b'service hyperos-lock-fps /unrelated/script\n')
 
-    def test_refresh_script_guards_hardware_and_checks_binder_result(self):
+    def test_current_refresh_uses_content_and_mode_guards_before_binder(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             commands = {
                 'getprop': '''case "$1" in
 ro.boot.hardware) echo "$TEST_HARDWARE" ;;
-ro.miui.product.home) echo com.miui.home ;;
-ro.mi.os.version.incremental) echo OS4.0.17.0.XFRCNXM ;;
+ro.product.cpu.abi) echo "${TEST_ABI:-arm64-v8a}" ;;
+ro.mi.os.version.incremental) echo "$TEST_FIRMWARE" ;;
 ro.boot.qemu.vsync) echo 60 ;;
 esac''',
+                'id': 'echo 0',
+                'uname': 'echo aarch64',
+                'dumpsys': 'echo "  activeMode = {id=${TEST_MODE:-0}, vsyncRate=60.00 Hz}"; echo activeModeId=0; if [ -n "$TEST_SECOND_RATE" ]; then echo "activeMode={id=0, vsyncRate=$TEST_SECOND_RATE.00 Hz}"; fi',
                 'settings': 'echo "settings $*" >> "$TEST_EVENTS"',
                 'service': 'echo "service $*" >> "$TEST_EVENTS"; echo "$TEST_PARCEL"',
                 'log': 'echo done >> "$TEST_EVENTS"',
@@ -421,10 +424,18 @@ esac''',
                 path.write_text('#!/bin/sh\n' + code + '\n')
                 path.chmod(0o755)
             script = folder / 'refresh.sh'
-            script.write_bytes(REFRESH_SCRIPT)
+            body = os4_defaults.phone_scripts()[1]
+            # Substitute only the filesystem query; execute the real capability
+            # selection and mutation ordering in one shell.
+            start = body.index(b'display_file_sha() {')
+            end = body.index(b'\ndisplay_refresh_capable()', start)
+            body = body[:start] + b'display_file_sha() { echo "$TEST_SF"; }\n' + body[end:]
+            script.write_bytes(body)
             events = folder / 'events'
             env = dict(os.environ, PATH=str(folder) + ':' + os.environ['PATH'],
                        TEST_HARDWARE='ranchu', TEST_EVENTS=str(events),
+                       TEST_FIRMWARE='OS5.9.UNKNOWN',
+                       TEST_SF='fef17e489200a456fcff3cc32fc3e8f6b692526fe72afbdd30d313286c809559',
                        TEST_PARCEL='Result: Parcel(NULL)')
             result = subprocess.run(['sh', str(script)], env=env, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -434,14 +445,53 @@ esac''',
                 'settings --user 0 put system peak_refresh_rate 60',
                 'service call SurfaceFlinger 1035 i32 0', 'done'])
             events.unlink()
-            result = subprocess.run(['sh', str(script)], env=dict(env, TEST_HARDWARE='other'),
-                                    capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(events.exists())
+            for changed in ({'TEST_HARDWARE': 'other'}, {'TEST_ABI': 'x86_64'},
+                            {'TEST_SF': 'unknown'}, {'TEST_MODE': '1'}, {'TEST_SECOND_RATE': '90'}):
+                result = subprocess.run(['sh', str(script)], env=dict(env, **changed), capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(events.exists())
             result = subprocess.run(['sh', str(script)], env=dict(env, TEST_PARCEL='Permission denied'),
                                     capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn('done', events.read_text().splitlines())
+
+    def test_current_display_defaults_share_capabilities_and_freeze_legacy_identity(self):
+        from phone_profile import profile
+        library = os4_defaults.display_capability_script()
+        for value in (None, profile('4.0.18.0.XFRCNXM'), profile('4.0.24.0.XFRCNXM')):
+            for body in os4_defaults.phone_scripts(value):
+                self.assertIn(library, body)
+                self.assertNotIn(b'ro.mi.os.version.incremental', body)
+                self.assertNotIn(b'ro.miui.product.home', body)
+        self.assertIn(b'display_aod_capable || exit 0', os4_defaults.phone_scripts()[0])
+        self.assertIn(MODEL_SHA256.encode(), library)
+        self.assertEqual(os4_defaults.legacy_phone_scripts(), (os4_defaults.AOD_SCRIPT, REFRESH_SCRIPT))
+        self.assertEqual(os4_defaults.legacy_refresh_wrapper(), os4_defaults.REFRESH_WRAPPER)
+        self.assertIn(b'OS4.0.18.0.XFRCNXM', os4_defaults.legacy_refresh_wrapper(profile('4.0.18.0.XFRCNXM')))
+
+    def test_display_content_query_rejects_aliased_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'content'; path.write_bytes(b'audited')
+            alias = path.with_name('alias'); alias.symlink_to(path)
+            for target, expected in ((path, 0), (alias, 1), (path.with_name('missing'), 1)):
+                result = subprocess.run(['sh', '-c', os4_defaults.display_capability_script().decode() +
+                                         '\ndisplay_file_sha "$1"', 'sh', str(target)], capture_output=True)
+                self.assertEqual(result.returncode, expected)
+
+    def test_aod_capability_requires_both_original_model_and_signed_apk(self):
+        from patch_lockscreen_video import APK_SHA256
+        guard = '''
+id() { echo 0; }
+getprop() { case "$1" in ro.boot.hardware) echo ranchu;; ro.product.cpu.abi) echo arm64-v8a;; esac; }
+uname() { echo aarch64; }
+display_file_sha() { case "$1" in */emu64a.xml) echo "$TEST_MODEL";; */MIUIAod.apk) echo "$TEST_APK";; esac; }
+display_aod_capable
+'''
+        for model, apk, expected in ((MODEL_SHA256, APK_SHA256, 0),
+                                      ('unknown', APK_SHA256, 1), (MODEL_SHA256, 'unknown', 1)):
+            result = subprocess.run(['sh', '-c', os4_defaults.display_capability_script().decode() + guard],
+                                    env=dict(os.environ, TEST_MODEL=model, TEST_APK=apk), capture_output=True)
+            self.assertEqual(result.returncode, expected)
 
     def test_primary_display_template_does_not_change_other_hardware(self):
         source = 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=440\nhw.cpu.ncore=4\n'

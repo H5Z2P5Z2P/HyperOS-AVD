@@ -60,34 +60,7 @@ def same(actual, expected):
 
 def validate_build(build):
     """Reject unsupported metadata before contacting or changing a guest."""
-    from phone_profile import profile_from_build
-    if not isinstance(build, dict) or build.get('source') != 'official-hongkong-ota':
-        raise RuntimeError('Rear wake requires a verified official hongkong source.')
-    selected = rear.validate_profile(profile_from_build(build))
-    rear.runtime_options(build)
-    marker = build.get('rear_display')
-    overlay = marker.get('overlay_sha256') if isinstance(marker, dict) else None
-    if not isinstance(overlay, str) or not re.fullmatch('[0-9a-f]{64}', overlay):
-        raise RuntimeError('Invalid rear-display resource hash.')
-    displays = []
-    for original, physical, geometry in zip(rear.SOURCE_IDS, rear.PHYSICAL_IDS,
-                                            ((1120, 2436, 480), (912, 596, 450))):
-        source = f'product/etc/displayconfig/display_id_{original}.xml'
-        displays.append({'source_physical_id': original, 'physical_id': physical,
-                         'unique_id': 'local:' + str(physical),
-                         'config': f'/product/etc/displayconfig/display_id_{physical}.xml',
-                         'config_sha256': rear.SOURCE_SHA256[source],
-                         'width': geometry[0], 'height': geometry[1], 'density': geometry[2]})
-    expected = {'schema': 1, 'hyperos': selected['hyperos'],
-                'archive_sha256': selected['archive_sha256'],
-                'source_sha256': dict(rear.SOURCE_SHA256), 'mapping_sha256': rear.MAPPING_SHA256,
-                'overlay': rear.OVERLAY, 'overlay_path': '/' + rear.OVERLAY_PATH,
-                'overlay_sha256': overlay, 'overlay_priority': rear.PRIORITY,
-                'source_overlay_priority': 1000, 'requires_runtime_resource_verification': True,
-                'overridden_resources': ['config_displayUniqueIdArray'], 'displays': displays,
-                'rear_safe_inset_left': 296, 'rear_corner_radius': 106}
-    if not same(marker, expected):
-        raise RuntimeError('Unverified rear-display resource identity.')
+    expected = rear.runtime_marker(build)
     if (not same(build.get('rear_display_wake_fix'), EXPECTED_WAKE_MANIFEST)
             or digest(JAVA_SOURCE.encode()) != EXPECTED_WAKE_MANIFEST['source_sha256']
             or digest(LAUNCHER) != EXPECTED_WAKE_MANIFEST['script_sha256']):
@@ -106,7 +79,7 @@ def display_ready(text):
 
 
 def legacy_boot_script(manifest):
-    """Start only verified baked code; never mount files or change user state."""
+    """Preserve the frozen historical module format for ownership and retirement."""
     wake = manifest['wake']
     values = {'JAR': wake['jar_path'],
               'LAUNCHER': wake['script_path'], 'MARKER': manifest['marker']['path'],
@@ -314,10 +287,12 @@ def verify_start(config):
 
 
 def install(config, build=None):
-    """Keep the frozen legacy producer; modern images use the shared Core module."""
+    """Keep the historical producer byte-compatible; current launches use Core."""
     if build is None:
         build = json.loads((ROOT / 'local/build.json').read_text())
     marker = validate_build(build)
+    if build.get('source') != 'official-hongkong-ota':
+        raise RuntimeError('The legacy rear installer requires its recorded official source.')
     if build['hyperos'] != rear.VERSION or build['archive_sha256'] != rear.ARCHIVE_SHA256:
         raise RuntimeError('This legacy rear installer only owns its frozen 4.0.18 source; '
                            'use the shared Core module for the authenticated current image.')

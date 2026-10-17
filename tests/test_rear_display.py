@@ -259,24 +259,19 @@ class RearResourceGuardTests(unittest.TestCase):
                 sources[path] = original
 
     def test_registered_new_source_reuses_geometry_with_current_provenance(self):
-        from patch_rear_display import MANIFEST as COMPOSER
-        from patch_goldfish_sync import MANIFEST as SYNC
         current = profile('4.0.24.0.XFRCNXM')
         self.assertEqual(rear_config.validate_profile(current), current)
         old = profile('4.0.18.0.XFRCNXM')
         original = b'ro.test.keep=true\npersist.sys.rear_user_preference=false\n'
         self.assertEqual(rear_config.properties(original, current), rear_config.properties(original, old))
         self.assertEqual(rear_config.boot_init(current), rear_config.boot_init(old))
-        marker = {'schema': 1, 'hyperos': current['hyperos'],
-                  'archive_sha256': current['archive_sha256'],
-                  'source_sha256': dict(rear_config.SOURCE_SHA256),
-                  'mapping_sha256': rear_config.MAPPING_SHA256, 'overlay': rear_config.OVERLAY,
-                  'overlay_priority': rear_config.PRIORITY}
-        build = {'source': 'official-hongkong-ota', 'hyperos': current['hyperos'],
-                 'archive_sha256': current['archive_sha256'], 'rear_display': marker,
-                 'rear_display_composer_fix': dict(COMPOSER), 'goldfish_sync_fix': dict(SYNC)}
+        build = build_fixture(rear_fix.EXPECTED_WAKE_MANIFEST, current['hyperos'])
+        marker = build['rear_display']
         expected = ['-append-userspace-opt', rear_config.BOOT_PROPERTY]
         self.assertEqual(rear_config.runtime_options(build), expected)
+        future = {**build, 'source': 'custom', 'hyperos': 'custom-future-build', 'archive_sha256': 'a' * 64,
+                  'rear_display': {**marker, 'hyperos': 'custom-future-build', 'archive_sha256': 'a' * 64}}
+        self.assertEqual(rear_config.runtime_options(future), expected)
         mutations = ({'hyperos': old['hyperos'], 'archive_sha256': old['archive_sha256']},
                      {'hyperos': old['hyperos']}, {'archive_sha256': old['archive_sha256']},
                      {'schema': True}, {'schema': 1.0}, {'source_sha256': {}},
@@ -332,16 +327,8 @@ class RearResourceGuardTests(unittest.TestCase):
             self.assertEqual(init.count(f'    setprop {key} {value}\n'), 2)
 
     def test_static_physical_boot_requires_verified_resources_and_both_native_fixes(self):
-        from patch_rear_display import MANIFEST as COMPOSER
-        from patch_goldfish_sync import MANIFEST as SYNC
         selected = profile('4.0.18.0.XFRCNXM')
-        build = {'source': 'official-hongkong-ota', 'hyperos': selected['hyperos'],
-                 'archive_sha256': selected['archive_sha256'],
-                 'rear_display': {'schema': 1, 'hyperos': rear_config.VERSION,
-                     'archive_sha256': rear_config.ARCHIVE_SHA256,
-                     'source_sha256': rear_config.SOURCE_SHA256, 'mapping_sha256': rear_config.MAPPING_SHA256,
-                     'overlay': rear_config.OVERLAY, 'overlay_priority': rear_config.PRIORITY},
-                 'rear_display_composer_fix': dict(COMPOSER), 'goldfish_sync_fix': dict(SYNC)}
+        build = build_fixture(rear_fix.EXPECTED_WAKE_MANIFEST, selected['hyperos'])
         expected = ['-append-userspace-opt', rear_config.BOOT_PROPERTY]
         for name in ('Any_Renamed_AVD', 'HyperOS_4_R3_API_37'):
             self.assertEqual(rear_config.runtime_options({**build, 'name': name}), expected)
@@ -652,6 +639,9 @@ class RearInstallTests(unittest.TestCase):
     def test_new_baked_context_validates_without_widening_legacy_installer(self):
         current = build_fixture(self.wake, '4.0.24.0.XFRCNXM')
         self.assertEqual(rear_fix.validate_build(current), current['rear_display'])
+        future = {**current, 'source': 'custom', 'hyperos': '5.9.99.0.FUTURE', 'archive_sha256': 'a' * 64,
+                  'rear_display': {**current['rear_display'], 'hyperos': '5.9.99.0.FUTURE', 'archive_sha256': 'a' * 64}}
+        self.assertEqual(rear_fix.validate_build(future), future['rear_display'])
         with self.assertRaisesRegex(RuntimeError, 'legacy rear installer'):
             rear_fix.install(self.config, current)
         self.official.assert_not_called()
@@ -1832,6 +1822,34 @@ class RearReleaseTests(unittest.TestCase):
         read, read_vendor = self.readers(system, vendor)
         return package_release.verify_rear_display(self.selected, self.build if build is None else build,
             read, read_vendor, self.template if template is None else template)
+
+    def test_core_context_reuses_content_across_labels_and_pins_all_original_resources(self):
+        import core_context
+        import core_platform
+        for version, archive, source in ((NEW, self.build['archive_sha256'], self.build['source']),
+                                          ('5.9.99.0.FUTURE', 'a' * 64, 'custom')):
+            marker = {**self.marker, 'hyperos': version, 'archive_sha256': archive}
+            build = {**self.build, 'hyperos': version, 'archive_sha256': archive,
+                     'source': source, 'rear_display': marker}
+            system = {**self.system, '/product/etc/build.prop': b'current product identity',
+                      '/' + rear_config.MARKER_PATH: rear_fix.encode(marker)}
+            context = core_context.context_from_image(build, system.__getitem__)
+            pins = {row['path']: row['sha256'] for row in context['rear']['files']}
+            for path, data in self.sources.items():
+                self.assertEqual(pins['/' + path], hashlib.sha256(data).hexdigest())
+            self.assertIn('rear.record', core_platform.context_files(context))
+            legacy = copy.deepcopy(context)
+            legacy['rear']['files'] = [row for row in legacy['rear']['files']
+                                       if row['path'].removeprefix('/') not in self.sources]
+            self.assertIn('rear.record', core_platform.context_files(legacy))
+            partial = copy.deepcopy(context)
+            partial['rear']['files'].pop()
+            with self.assertRaisesRegex(RuntimeError, 'resource prerequisites'):
+                core_platform.context_files(partial)
+            for path in self.sources:
+                changed = {**system, '/' + path: system['/' + path] + b'tamper'}
+                with self.subTest(version=version, path=path), self.assertRaisesRegex(RuntimeError, 'prerequisite differs'):
+                    core_context.context_from_image(build, changed.__getitem__)
 
     def assert_metadata_rejected_before_reads(self, build, message):
         read, read_vendor = self.readers()

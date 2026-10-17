@@ -110,7 +110,7 @@ class AppBridgeTests(unittest.TestCase):
         for name, body in {
             'id': 'echo 0',
             'getprop': 'case "$1" in ro.boot.hardware) echo ranchu;; '
-                       'ro.mi.os.version.incremental) echo OS4.999.0.TEST;; sys.boot_completed) echo 1;; esac',
+                       'ro.product.cpu.abi) echo arm64-v8a;; sys.boot_completed) echo 1;; esac',
             'sleep': 'exit 0',
             'pm': 'cat "$BRIDGE_TEST_ROOT/pm-path"',
             'pidof': 'case "$1" in zygote64) cat "$BRIDGE_TEST_ROOT/pids";; '
@@ -523,7 +523,7 @@ path.write_text(json.dumps(values))
         calls = []
         def root(config, command):
             calls.append(command)
-            return 'ranchu\nOS4.999.0.TEST' if command.startswith('getprop') else ''
+            return 'ranchu\narm64-v8a' if command.startswith('getprop') else ''
         with patch.object(bridge, 'root', side_effect=root), \
                 patch.object(bridge, '_inspect', return_value=None), patch.object(bridge, 'adb') as adb:
             result = bridge.install({}, **self.options)
@@ -534,10 +534,25 @@ path.write_text(json.dumps(values))
             for forbidden in ('mount -o', 'service.sh', 'am force-stop', 'reboot', 'mv /data/adb/modules'):
                 self.assertNotIn(forbidden, command)
 
+    def test_bridge_guard_uses_abi_instead_of_firmware_version(self):
+        for firmware in ('OS3.TEST', 'OS5.TEST', ''):
+            with self.subTest(firmware=firmware):
+                self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; '
+                           'ro.product.cpu.abi) echo arm64-v8a;; '
+                           'ro.mi.os.version.incremental) printf "%s\\n" ' + shlex.quote(firmware) + ';; esac; }; bridge_guard')
+        result = self.shell('getprop() { case "$1" in ro.boot.hardware) echo ranchu;; '
+                            'ro.product.cpu.abi) echo x86_64;; esac; }; bridge_guard', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        with patch.object(bridge, 'root', return_value='ranchu\nx86_64'), \
+                patch.object(bridge, '_inspect') as inspect:
+            with self.assertRaisesRegex(RuntimeError, 'ARM64 ranchu'):
+                bridge.install({}, **self.options)
+            inspect.assert_not_called()
+
     def test_host_flags_and_unknown_local_manifest_are_preserved_before_staging(self):
         active = {'directory': '/data/adb/modules/' + self.options['module_id'],
                   'revision': 2, 'flags': ['disable'], 'properties': 'owned fixture'}
-        with patch.object(bridge, 'root', return_value='ranchu\nOS4.999.0.TEST'), \
+        with patch.object(bridge, 'root', return_value='ranchu\narm64-v8a'), \
                 patch.object(bridge, '_inspect', side_effect=[active, None]), \
                 patch.object(bridge, 'adb') as adb:
             self.assertTrue(bridge.install({}, **self.options)['disabled'])
@@ -545,7 +560,7 @@ path.write_text(json.dumps(values))
         active['flags'] = []
         saved = json.loads(self.files['manifest.json'])
         saved['files_sha256']['runtime.sh'] = '0' * 64
-        with patch.object(bridge, 'root', return_value='ranchu\nOS4.999.0.TEST'), \
+        with patch.object(bridge, 'root', return_value='ranchu\narm64-v8a'), \
                 patch.object(bridge, '_inspect', side_effect=[active, None]), \
                 patch.object(bridge, '_saved', return_value=saved), \
                 patch.object(bridge, '_verify_assets') as verify, patch.object(bridge, 'adb') as adb:

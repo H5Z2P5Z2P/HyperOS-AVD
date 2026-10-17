@@ -23,27 +23,22 @@ def is_os4():
 
 def vulkan_features(build):
     """Select audited descriptor, submission and presentation workarounds."""
-    if build.get('source') == 'official-yingtian-ota':
-        return ['-feature', VULKAN_BASE_FEATURES]
-    if build.get('source') == 'official-hongkong-ota':
-        from phone_profile import modern_runtime, profile as registered_profile, profile_from_build
-        from patch_pad_hwui import PHONE_BEFORE, PHONE_AFTER, PHONE_PROFILE
-        # Incomplete/unknown builds have no authenticated content recipe.
-        try:
-            selected = registered_profile(build.get('hyperos'))
-        except RuntimeError:
-            return []
-        if not modern_runtime(selected):
-            return []
-        profile = profile_from_build(build)
-        expected = {'before': PHONE_BEFORE, 'after': PHONE_AFTER, 'profile': PHONE_PROFILE}
-        if (profile['pins']['hwui'] == PHONE_BEFORE and build.get('hwui') == expected
-                and build.get('hwui_renderer') == 'skiavk'):
-            # Keep presentation behavior and avoid the observed gfxstream
-            # queue-sequence stall in this verified dual-display workload.
-            return ['-feature', VULKAN_BASE_FEATURES +
-                    ',-GLAsyncSwap,-VulkanQueueSubmitWithCommands']
-    return []
+    from patch_pad_hwui import BEFORE, AFTER, PHONE_BEFORE, PHONE_AFTER, PHONE_PROFILE
+    renderer, receipt = build.get('hwui_renderer'), build.get('hwui')
+    phone = {'before': PHONE_BEFORE, 'after': PHONE_AFTER, 'profile': PHONE_PROFILE}
+    pad = {'before': BEFORE, 'after': AFTER}
+    # Delivered Pad receipts predate the renderer field and describe the exact
+    # baked Vulkan recipe. No other receipt may infer a missing renderer.
+    verified_pad = receipt == pad and (renderer == 'skiavk' or 'hwui_renderer' not in build)
+    if not (verified_pad or receipt == phone and renderer == 'skiavk'):
+        return []
+    from rear_display_config import runtime_options
+    features = VULKAN_BASE_FEATURES
+    if runtime_options(build):
+        # Keep presentation behavior and avoid the observed gfxstream
+        # queue-sequence stall in the verified physical dual-display workload.
+        features += ',-GLAsyncSwap,-VulkanQueueSubmitWithCommands'
+    return ['-feature', features]
 
 
 def prepare_userdata(config):

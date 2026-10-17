@@ -87,6 +87,20 @@ class CatalogTests(unittest.TestCase):
         self.assertIn(frozen, catalog.previous_manifests())
         self.assertEqual(digest(catalog.canonical(frozen)), '3a46a482a1a1ac8581d4959980972b5f01f9a62d49333671c0737ec21606d1f9')
 
+    def test_revision_seven_is_frozen_before_abi_guard_update(self):
+        frozen = json.loads((REPO / 'tests/fixtures/app-compat-v7-manifest.json').read_text())
+        self.assertEqual(frozen['revision'], 7)
+        self.assertIn(frozen, catalog.previous_manifests())
+        self.assertEqual(digest(catalog.canonical(frozen)),
+                         '7c265a868f7607f52e9b43646926381c26563b0aac1a7729694f8fbc47ea4cd4')
+
+    def test_consumer_rejects_a_different_abi_before_reading_modules(self):
+        with patch.object(consumer, 'root', return_value='ranchu\nx86_64'), \
+                patch.object(consumer, '_inspect') as inspect:
+            with self.assertRaisesRegex(RuntimeError, 'ARM64 ranchu'):
+                consumer.install_prebuilt({}, catalog=self.recipes, migration=False)
+            inspect.assert_not_called()
+
     def test_mirror_regular_uses_one_namespace_and_keeps_cache_boundaries(self):
         context = self.module / 'contexts/first'
         cache = context / 'cache'
@@ -744,7 +758,7 @@ class CatalogTests(unittest.TestCase):
         def root(config, command):
             commands.append(command)
             if command.startswith('getprop'):
-                return 'ranchu\nOS4.999.0.TEST'
+                return 'ranchu\narm64-v8a'
             return ''
         with patch.object(consumer, 'root', side_effect=root), patch.object(consumer, '_inspect', return_value=None), patch.object(consumer, 'adb') as adb:
             result = consumer.install_prebuilt({}, workspace, catalog=self.recipes, migration=False)
@@ -753,7 +767,7 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(any(('ksud module install' in command for command in commands)))
         self.assertFalse(any(('am force-stop' in command or 'nsenter' in command for command in commands)))
         (folder / 'app-compat.zip').unlink()
-        with patch.object(consumer, 'root', return_value='ranchu\nOS4.999.0.TEST'), patch.object(consumer, '_inspect', return_value={'flags': ['disable']}), patch.object(consumer, 'adb') as adb:
+        with patch.object(consumer, 'root', return_value='ranchu\narm64-v8a'), patch.object(consumer, '_inspect', return_value={'flags': ['disable']}), patch.object(consumer, 'adb') as adb:
             result = consumer.install_prebuilt({}, workspace, catalog=self.recipes, migration=False)
             self.assertTrue(result['preserved'])
             adb.assert_not_called()
@@ -776,7 +790,7 @@ class CatalogTests(unittest.TestCase):
 
         def root(config, command):
             commands.append(command)
-            return 'ranchu\nOS4.999.0.TEST' if command.startswith('getprop') else ''
+            return 'ranchu\narm64-v8a' if command.startswith('getprop') else ''
 
         def saved(config, module, expected):
             if expected != old:
@@ -799,7 +813,7 @@ class CatalogTests(unittest.TestCase):
         saved = catalog.package_catalog(folder / 'app-compat.zip', self.recipes, self.outputs)
         (folder / 'receipt.json').write_bytes(catalog.canonical(saved))
         pending = {'directory': '/data/adb/modules_update/' + catalog.MODULE_ID, 'flags': []}
-        with patch.object(consumer, 'root', return_value='ranchu\nOS4.999.0.TEST'), patch.object(consumer, '_inspect', side_effect=[None, pending]), patch.object(consumer, '_saved', side_effect=consumer.CatalogMismatch('Unknown pending')), patch.object(consumer, 'adb') as adb, patch.object(consumer, 'set_features') as choices:
+        with patch.object(consumer, 'root', return_value='ranchu\narm64-v8a'), patch.object(consumer, '_inspect', side_effect=[None, pending]), patch.object(consumer, '_saved', side_effect=consumer.CatalogMismatch('Unknown pending')), patch.object(consumer, 'adb') as adb, patch.object(consumer, 'set_features') as choices:
             result = consumer.install_prebuilt({}, workspace, enabled_features={'weather': False}, catalog=self.recipes, migration=False)
             self.assertTrue(result['deferred'])
             adb.assert_not_called()
@@ -1177,7 +1191,7 @@ class AppCompatMigrationTests(unittest.TestCase):
 
         def public_root(config, command):
             if command.startswith('getprop'):
-                return 'ranchu\nOS4.999.0.TEST'
+                return 'ranchu\narm64-v8a'
             return self.root(config, command)
         with patch.object(apply_app_compat, 'root', side_effect=public_root), patch.object(apply_app_compat, 'verify_prebuilt', return_value=(self.base / 'verified.zip', self.owner_manifest)), patch.object(apply_app_compat, 'adb') as adb:
             result = apply_app_compat.install_prebuilt({}, workspace=self.base, catalog=self.catalog, migration=migration)

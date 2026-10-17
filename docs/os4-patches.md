@@ -1,6 +1,6 @@
 # OS4 补丁维护与交付
 
-OS4 的运行时兼容修复统一由 **Core、Apps 两个 KernelSU 模块**交付。Phone 与 Pad 使用同一套模块代码和相同的通用 ZIP；模块根据实际 APK、原生库、系统依赖和硬件能力选择已审计规则。AVD 名称、ADB 端口、工作区目录和 OTA 文件名不作为运行时版本身份。
+OS4 的运行时兼容修复统一由 **Core、Apps 两个 KernelSU 模块**交付。Phone 与 Pad 使用同一套模块代码和相同的通用 ZIP；模块根据实际 APK、原生库、系统依赖和硬件能力选择已审计规则。系统版本号、AVD 名称、ADB 端口、工作区目录和 OTA 文件名不作为运行时补丁选择条件。历史版本记录用于认证旧安装与迁移。
 
 相同内容可以在后续 OS4 基系统中复用。**未知的 APK、ELF、framework、HAL 或内核仍需审计**；匹配不到已审计内容时保留原文件并报告原因，不猜测偏移或放宽 ABI 校验。
 
@@ -39,7 +39,7 @@ Apps 每个模块只有一个调度器，为匹配的应用维护隔离的内容
 | FindDevice / OOBE | 禁用阻塞状态 Provider，保留 APK 和正常引导；系统更新包需来源、签名和 Provider 合约校验。`os4_defaults.py`、`os4_pad.py` | 镜像首次 PM 扫描及受控初始化，不能依赖用户进系统后手动修复。 |
 | 机型 / 默认值 | 原机 XML、公开身份、稳定随机小米格式序列号、thermal label、60 Hz；按硬件能力配置 AOD，一次性常亮/自然色彩/日志默认值。`config/`、`os4_defaults.py`、`os4_pad.py` | Core + 镜像默认值，迁移旧标记和序列号并保留后续用户选择。Pad 不启用原机不支持的 AOD。 |
 | 背屏资源 / 唤醒 | 物理显示 ID alias、最小 RRO、原几何/cutout/corner、双击唤醒 Java bridge。`rear_display_config.py`、`rear_display_wake.py` | 镜像资源/bridge；Core 校验前置文件并管理服务。物理屏创建和独立窗口仍由 Emulator 提供。 |
-| macOS / Emulator / 存储 | sRGB window/Metal 标记、传感器/虚拟 AC 初值、音频后端、Pad 窗口方向、独立背屏窗口及用户分区扩容。`host_color.py`、`launch.py`、`manage.py` | 宿主层。扩容同时校验虚拟磁盘和 `/data` ext4；guest 模块无法修改宿主窗口、音频设备或离线 QCOW2。 |
+| macOS / Emulator / 存储 | sRGB window/Metal 标记、传感器/虚拟 AC 初值、音频后端、Pad 窗口方向、独立背屏窗口、主屏旋转几何与背屏触摸恢复及用户分区扩容。`host_display.py`、`host_color.py`、`launch.py`、`manage.py` | 宿主层。多屏修复从实际 ARM64 二进制推导接口、调用关系与事件布局，加载前重查内容。扩容同时校验虚拟磁盘和 `/data` ext4。 |
 
 ## 激活、状态与迁移
 
