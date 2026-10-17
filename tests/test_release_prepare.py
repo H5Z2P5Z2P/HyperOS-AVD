@@ -330,6 +330,7 @@ class ReleasePreparationTests(unittest.TestCase):
 
     def test_pad_preparation_keeps_shared_boot_policy_and_extra_logical_partitions(self):
         import apply_app_compat
+        from os4_pad import current_refresh_script
         self.use_pad_profile()
         self.entries['/system/build.prop'] = b'ro.adb.secure=0\nro.debuggable=0\nro.product.device=yingtian\n'
         self.assertFalse((self.source / 'work').exists())
@@ -351,6 +352,8 @@ class ReleasePreparationTests(unittest.TestCase):
                 self.assertEqual(packed[name], data)
         self.boot_mock.assert_called_once()
         self.assertIn('system/etc/hyperos-init-capabilities.sh', self.builds[0]['edits'])
+        self.assertEqual(self.builds[0]['edits']['product/etc/init/lock_fps.sh'],
+                         (current_refresh_script(), 0o755, 'u:object_r:system_file:s0'))
         self.assertEqual(json.loads((self.output / 'local/build.json').read_text())['boot_policy'], self.boot_receipt)
         self.assertEqual(json.loads((self.output / 'local/build.json').read_text())['kernelsu_marker_fix'],
                          self.ksu_receipt)

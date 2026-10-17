@@ -235,6 +235,7 @@ def prepare_boot_services(source, output):
 
 def prepare_pad(source, output, info):
     from apply_app_compat import prepare_prebuilt
+    from os4_pad import current_refresh_script
     validate_pad_source(info)
     # The running candidate may have been replaced after the builder's raw image.
     # Derive every partition from the actual packed image, never its stale cache.
@@ -243,7 +244,10 @@ def prepare_pad(source, output, info):
     raw = work / 'accepted/system.img'
     prop = authenticated_properties(erofs(raw, '/system/build.prop'))
     candidate = work / 'hyperos-system.img'
-    edits = {'system/build.prop': (prop, 0o600, 'u:object_r:system_file:s0')}
+    edits = {
+        'system/build.prop': (prop, 0o600, 'u:object_r:system_file:s0'),
+        'product/etc/init/lock_fps.sh': (current_refresh_script(), 0o755, 'u:object_r:system_file:s0'),
+    }
     info['boot_policy'] = shared_boot_edits(raw, work / 'accepted/vendor.img', edits,
                                            work / 'boot-policy')
     build(candidate, [('', raw)], work / 'tree', edits)
