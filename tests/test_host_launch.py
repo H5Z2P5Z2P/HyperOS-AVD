@@ -115,7 +115,9 @@ class HostLaunchTests(unittest.TestCase):
     def test_environment_keeps_color_sdk_and_render_settings_without_caller_secrets(self):
         environment = {'HOME': '/Users/example', 'ANDROID_AVD_HOME': '/tmp/owned-avd',
             'DYLD_INSERT_LIBRARIES': '/tmp/owned-srgb.dylib', 'HYPEROS_AVD_SRGB': '1',
-            'HYPEROS_AVD_SRGB_AVD': self.config['name'], 'QT_SCALE_FACTOR': '0.7',
+            'HYPEROS_AVD_SRGB_AVD': self.config['name'], 'HYPEROS_AVD_MULTI_DISPLAY': '1',
+            'HYPEROS_AVD_DISPLAY_RECIPE': '/tmp/owned-recipe.json',
+            'QT_SCALE_FACTOR': '0.7',
             'MVK_CONFIG_LOG_LEVEL': '0', 'VK_ICD_FILENAMES': '/tmp/driver.json',
             'GITHUB_TOKEN': 'private-token', 'OPENAI_API_KEY': 'private-key',
             'AWS_SECRET_ACCESS_KEY': 'private-cloud', 'PYTHONPATH': '/private/injected',
@@ -126,7 +128,8 @@ class HostLaunchTests(unittest.TestCase):
         request = Path(payload['ProgramArguments'][7])
         selected = json.loads(request.read_text())['environment']
         self.assertEqual(set(selected), {'HOME', 'ANDROID_AVD_HOME', 'DYLD_INSERT_LIBRARIES',
-            'HYPEROS_AVD_SRGB', 'HYPEROS_AVD_SRGB_AVD', 'QT_SCALE_FACTOR',
+            'HYPEROS_AVD_SRGB', 'HYPEROS_AVD_SRGB_AVD', 'HYPEROS_AVD_MULTI_DISPLAY', 'QT_SCALE_FACTOR',
+            'HYPEROS_AVD_DISPLAY_RECIPE',
             'MVK_CONFIG_LOG_LEVEL', 'VK_ICD_FILENAMES'})
         for data in (self.plist.read_bytes(), self.receipt.read_bytes(), request.read_bytes()):
             for value in ('private-token', 'private-key', 'private-cloud', '/private/injected',
@@ -996,6 +999,50 @@ class DiagnosticCommandTests(unittest.TestCase):
                 self.assertEqual(command[command.index('-memory') + 1], '6144')
                 self.assertEqual(arguments[3], {'HYPEROS_AVD_SRGB': '1'})
                 initialize.assert_called_once_with(config, bypass_oobe=False, rotate_window=True)
+
+    def test_multi_display_discovery_uses_owned_gui_launch_without_guest_profile_gates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'images').mkdir()
+            (root / 'images/userdata.img').write_bytes(b'template')
+            avd = root / 'avd/Renamed_Device.avd'
+            avd.mkdir(parents=True)
+            (avd / 'config.ini').write_text('hw.ramSize=6144\nhw.cpu.ncore=4\n')
+            (root / 'local').mkdir()
+            config = {'sdk': str(root / 'sdk'), 'name': 'Renamed_Device', 'port': 5586}
+            verified = ['-append-userspace-opt', 'verified-rear-panel']
+            for metadata, flags, rear_options, color, multi_display in (
+                    (None, [], [], True, True),
+                    ({'source': 'custom'}, [], [], True, True),
+                    ({'source': 'google-apis'}, ['--no-host-color-fix'], [], False, True),
+                    ({'source': 'official-hongkong-ota'}, [], verified, True, True),
+                    ({'source': 'official-hongkong-ota'}, ['--headless'], verified, False, False)):
+                manifest = root / 'local/build.json'
+                if metadata is None:
+                    manifest.unlink(missing_ok=True)
+                else:
+                    manifest.write_text(json.dumps(metadata))
+                with self.subTest(metadata=metadata, flags=flags), \
+                        patch.object(launch, 'ROOT', root), \
+                        patch.object(launch, 'host_check'), patch.object(launch, 'runtime', return_value=config), \
+                        patch.object(launch, 'port_free'), patch.object(launch, 'configure'), \
+                        patch.object(launch, 'fetch_ksu'), patch.object(launch, 'prepare_userdata'), \
+                        patch.object(launch, 'initialize'), \
+                        patch('kernelsu_release.available', return_value=True), \
+                        patch('host_adb.adapter', return_value=root / 'owned-adb'), \
+                        patch('rear_display_config.runtime_options', return_value=rear_options) as rear, \
+                        patch('host_color.environment', return_value={}) as environment, \
+                        patch('host_launch.start', return_value=host_launch.LaunchResult(8123, 'owned/service')) as start, \
+                        patch.object(sys, 'argv', ['launch.py', *flags]):
+                    launch.main()
+                if metadata is None:
+                    rear.assert_not_called()
+                else:
+                    rear.assert_called_once_with(metadata)
+                environment.assert_called_once_with(root, config['name'], enabled=color,
+                                                    multi_display=multi_display,
+                                                    emulator=(root / 'sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64').resolve())
+                self.assertEqual('-no-window' in start.call_args.args[2], '--headless' in flags)
 
 
 class OwnedUserLaunchDirectoryTests(unittest.TestCase):

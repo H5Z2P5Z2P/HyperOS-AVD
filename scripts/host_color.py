@@ -1,4 +1,4 @@
-"""Build and load the owned OS4 emulator's macOS sRGB window tag."""
+"""Build and load the owned emulator's macOS window fixes."""
 import hashlib
 import json
 import os
@@ -123,19 +123,26 @@ def cached_library(library, receipt):
     return cached
 
 
-def environment(root, name, enabled=True):
+def environment(root, name, enabled=True, multi_display=False, emulator=None):
     """Keep the SDK and other emulator processes unchanged."""
     result = os.environ.copy()
     # A copied opt-in from an earlier launch cannot authorize another instance
     # or override this launch's explicit opt-out.
     result.pop('HYPEROS_AVD_SRGB', None)
     result.pop('HYPEROS_AVD_SRGB_AVD', None)
-    if not enabled or not (Path(root) / 'local/build.json').is_file() or json.loads(
-            (Path(root) / 'local/build.json').read_text()).get('source') not in (
-                'official-hongkong-ota', 'official-yingtian-ota'):
+    result.pop('HYPEROS_AVD_MULTI_DISPLAY', None)
+    result.pop('HYPEROS_AVD_DISPLAY_RECIPE', None)
+    manifest = Path(root) / 'local/build.json'
+    color_enabled = enabled and manifest.is_file() and json.loads(manifest.read_text()).get('source') in (
+        'official-hongkong-ota', 'official-yingtian-ota')
+    if (color_enabled or multi_display) and (not isinstance(name, str) or not name):
+        raise RuntimeError('The host window hook requires the owned launch AVD name.')
+    recipe = None
+    if multi_display and emulator is not None:
+        from host_display import prepare
+        recipe = prepare(emulator)
+    if not (color_enabled or recipe):
         return result
-    if not isinstance(name, str) or not name:
-        raise RuntimeError('The sRGB tag requires the owned launch AVD name.')
     library, receipt = build(root)
     cached = cached_library(library, receipt)
     injected = result.get('DYLD_INSERT_LIBRARIES', '')
@@ -144,6 +151,10 @@ def environment(root, name, enabled=True):
     owned_paths = {str(library.resolve()), str(cached.resolve())}
     remaining = [value for value in injected.split(':') if value not in owned_paths and value]
     result['DYLD_INSERT_LIBRARIES'] = ':'.join([str(cached.resolve()), *remaining])
-    result['HYPEROS_AVD_SRGB'] = '1'
+    if color_enabled:
+        result['HYPEROS_AVD_SRGB'] = '1'
+    if recipe:
+        result['HYPEROS_AVD_MULTI_DISPLAY'] = '1'
+        result['HYPEROS_AVD_DISPLAY_RECIPE'] = str(recipe)
     result['HYPEROS_AVD_SRGB_AVD'] = name
     return result

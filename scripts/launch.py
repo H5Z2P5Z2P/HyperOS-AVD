@@ -286,7 +286,10 @@ def main():
         command += ['-no-window']
     from host_color import environment
     launch_environment = environment(ROOT, config['name'],
-                                     enabled=not (args.headless or args.no_host_color_fix))
+                                     enabled=not (args.headless or args.no_host_color_fix),
+                                     multi_display=not args.headless,
+                                     emulator=Path(config['sdk']).resolve() /
+                                     'emulator/qemu/darwin-aarch64/qemu-system-aarch64')
     from host_launch import start
     process = start(ROOT, config, command, launch_environment, log)
     print(f"Starting {config['name']} (PID {process.pid}, {process.service}). Log: {log}", flush=True)

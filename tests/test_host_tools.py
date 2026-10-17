@@ -138,7 +138,12 @@ class HostColorEnvironmentTests(unittest.TestCase):
         (self.root / 'local').mkdir()
         self.library = self.root / 'tools/emulator_srgb.dylib'
         self.cached = self.root / 'owned-user-state/emulator_srgb.dylib'
-        inherited = {'DYLD_INSERT_LIBRARIES': '/existing/plugin.dylib', 'HYPEROS_AVD_SRGB': '1', 'HYPEROS_AVD_SRGB_AVD': 'Old_AVD', 'UNRELATED_OPTION': 'kept'}
+        self.emulator = self.root / 'sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64'
+        self.recipe = self.root / 'owned-user-state/recipe.json'
+        prepare = patch('host_display.prepare', return_value=self.recipe)
+        self.prepare = prepare.start()
+        self.addCleanup(prepare.stop)
+        inherited = {'DYLD_INSERT_LIBRARIES': '/existing/plugin.dylib', 'HYPEROS_AVD_SRGB': '1', 'HYPEROS_AVD_SRGB_AVD': 'Old_AVD', 'HYPEROS_AVD_MULTI_DISPLAY': '1', 'HYPEROS_AVD_DISPLAY_RECIPE': '/old/recipe.json', 'UNRELATED_OPTION': 'kept'}
         environment = patch.dict(os.environ, inherited, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
@@ -156,42 +161,109 @@ class HostColorEnvironmentTests(unittest.TestCase):
                 build.assert_called_once_with(self.root)
                 self.assertEqual(result['HYPEROS_AVD_SRGB'], '1')
                 self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], name)
+                self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+                self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
                 self.assertEqual(result['DYLD_INSERT_LIBRARIES'], str(self.cached.resolve()) + ':/existing/plugin.dylib')
                 cache.assert_called_once_with(self.library, None)
                 self.assertEqual(result['UNRELATED_OPTION'], 'kept')
                 self.assertEqual(dict(os.environ), before)
 
-    def test_default_scope_requires_an_owned_source_manifest(self):
-        for source in (None, 'google-apis', 'official-unverified-ota'):
-            with self.subTest(source=source):
-                if source is None:
-                    (self.root / 'local/build.json').unlink(missing_ok=True)
-                else:
-                    self.manifest(source)
-                with patch.object(host_color, 'build') as build:
-                    result = host_color.environment(self.root, 'Pixel_9')
-                build.assert_not_called()
+    def test_color_scope_does_not_limit_runtime_display_discovery(self):
+        for source in (None, 'google-apis', 'custom', 'official-unverified-ota'):
+            if source is None:
+                (self.root / 'local/build.json').unlink(missing_ok=True)
+            else:
+                self.manifest(source)
+            for multi_display in (False, True):
+                with self.subTest(source=source, multi_display=multi_display), \
+                        patch.object(host_color, 'build', return_value=(self.library, None)) as build, \
+                        patch.object(host_color, 'cached_library', return_value=self.cached):
+                    result = host_color.environment(self.root, 'Arbitrary_Owned_Device',
+                                                    multi_display=multi_display, emulator=self.emulator)
                 self.assertNotIn('HYPEROS_AVD_SRGB', result)
-                self.assertNotIn('HYPEROS_AVD_SRGB_AVD', result)
-                self.assertEqual(result['DYLD_INSERT_LIBRARIES'], '/existing/plugin.dylib')
+                if multi_display:
+                    build.assert_called_once_with(self.root)
+                    self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], 'Arbitrary_Owned_Device')
+                    self.assertEqual(result['HYPEROS_AVD_MULTI_DISPLAY'], '1')
+                    self.assertEqual(result['HYPEROS_AVD_DISPLAY_RECIPE'], str(self.recipe))
+                    self.assertEqual(result['DYLD_INSERT_LIBRARIES'], str(self.cached.resolve()) + ':/existing/plugin.dylib')
+                else:
+                    build.assert_not_called()
+                    self.assertNotIn('HYPEROS_AVD_SRGB_AVD', result)
+                    self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+                    self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
+                    self.assertEqual(result['DYLD_INSERT_LIBRARIES'], '/existing/plugin.dylib')
+
+    def test_color_and_multi_display_opt_ins_are_independent(self):
+        self.manifest('official-hongkong-ota')
+        for color, multi_display in ((True, True), (False, True), (True, False)):
+            self.prepare.reset_mock()
+            with self.subTest(color=color, multi_display=multi_display), \
+                    patch.object(host_color, 'build', return_value=(self.library, None)) as build, \
+                    patch.object(host_color, 'cached_library', return_value=self.cached):
+                result = host_color.environment(self.root, 'Renamed_Phone',
+                                                enabled=color, multi_display=multi_display,
+                                                emulator=self.emulator)
+            build.assert_called_once_with(self.root)
+            self.assertEqual(result.get('HYPEROS_AVD_SRGB'), '1' if color else None)
+            self.assertEqual(result.get('HYPEROS_AVD_MULTI_DISPLAY'), '1' if multi_display else None)
+            self.assertEqual(result.get('HYPEROS_AVD_DISPLAY_RECIPE'), str(self.recipe) if multi_display else None)
+            if multi_display:
+                self.prepare.assert_called_once_with(self.emulator)
+            else:
+                self.prepare.assert_not_called()
+            self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], 'Renamed_Phone')
+            self.assertEqual(result['DYLD_INSERT_LIBRARIES'], str(self.cached.resolve()) + ':/existing/plugin.dylib')
 
     def test_opt_out_clears_inherited_authorization_without_building(self):
         self.manifest('official-yingtian-ota')
         with patch.object(host_color, 'build') as build:
-            result = host_color.environment(self.root, 'Owned_Pad', enabled=False)
+            result = host_color.environment(self.root, 'Owned_Pad', enabled=False, emulator=self.emulator)
         build.assert_not_called()
+        self.prepare.assert_not_called()
         self.assertNotIn('HYPEROS_AVD_SRGB', result)
         self.assertNotIn('HYPEROS_AVD_SRGB_AVD', result)
+        self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+        self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
         self.assertEqual(result['DYLD_INSERT_LIBRARIES'], '/existing/plugin.dylib')
         self.assertEqual(os.environ['HYPEROS_AVD_SRGB_AVD'], 'Old_AVD')
 
     def test_owned_launch_requires_a_nonempty_name(self):
         self.manifest('official-yingtian-ota')
         with patch.object(host_color, 'build') as build:
-            for name in ('', None):
-                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'AVD name'):
-                    host_color.environment(self.root, name)
+            for name, color, multi_display in (('', True, False), (None, True, False),
+                                               ('', False, True), (None, False, True)):
+                with self.subTest(name=name, multi_display=multi_display), self.assertRaisesRegex(RuntimeError, 'AVD name'):
+                    host_color.environment(self.root, name, enabled=color,
+                                           multi_display=multi_display, emulator=self.emulator)
         build.assert_not_called()
+        self.prepare.assert_not_called()
+
+    def test_unsupported_host_capabilities_skip_only_display_and_need_no_compiler(self):
+        self.prepare.return_value = None
+        for source, color in (('custom', False), ('official-hongkong-ota', True)):
+            self.manifest(source)
+            with self.subTest(source=source), \
+                    patch.object(host_color, 'build', return_value=(self.library, None)) as build, \
+                    patch.object(host_color, 'cached_library', return_value=self.cached):
+                result = host_color.environment(self.root, 'Owned_Device',
+                                                multi_display=True, emulator=self.emulator)
+            self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+            self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
+            self.assertEqual(result.get('HYPEROS_AVD_SRGB'), '1' if color else None)
+            self.assertEqual(result.get('HYPEROS_AVD_SRGB_AVD'), 'Owned_Device' if color else None)
+            if color:
+                build.assert_called_once_with(self.root)
+            else:
+                build.assert_not_called()
+        self.prepare.reset_mock()
+        with patch.object(host_color, 'build') as build:
+            result = host_color.environment(self.root, 'Owned_Device', enabled=False,
+                                            multi_display=True)
+        self.prepare.assert_not_called()
+        build.assert_not_called()
+        self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+        self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
 
     def test_only_owned_dyld_entries_are_relocated_without_copying_foreign_plugins(self):
         self.manifest('official-yingtian-ota')
@@ -293,15 +365,18 @@ class NativeHostColorGuardTests(unittest.TestCase):
         self.assertEqual(metadata['install_name'], host_color.INSTALL_NAME)
         self.assertEqual(metadata['sha256'], hashlib.sha256(self.library.read_bytes()).hexdigest())
 
-    def run_probe(self, arguments, enabled='1', expected='Renamed_Pad_API_99'):
+    def run_probe(self, arguments, enabled='1', expected='Renamed_Pad_API_99', multi_display=None):
         environment = os.environ.copy()
         environment.pop('HYPEROS_AVD_SRGB', None)
         environment.pop('HYPEROS_AVD_SRGB_AVD', None)
+        environment.pop('HYPEROS_AVD_MULTI_DISPLAY', None)
         environment['DYLD_INSERT_LIBRARIES'] = str(self.library)
         if enabled is not None:
             environment['HYPEROS_AVD_SRGB'] = enabled
         if expected is not None:
             environment['HYPEROS_AVD_SRGB_AVD'] = expected
+        if multi_display is not None:
+            environment['HYPEROS_AVD_MULTI_DISPLAY'] = multi_display
         result = subprocess.run([str(self.probe), *arguments], env=environment, text=True, capture_output=True, check=True)
         return result.stderr
 
@@ -314,6 +389,419 @@ class NativeHostColorGuardTests(unittest.TestCase):
         for arguments, enabled, expected in cases:
             with self.subTest(arguments=arguments, enabled=enabled, expected=expected):
                 self.assertNotIn('sRGB tagging enabled', self.run_probe(arguments, enabled, expected))
+
+    def test_primary_rotation_uses_only_each_reviewed_independent_window_pose(self):
+        harness = self.root / 'rotation.m'
+        harness.write_text('#include ' + json.dumps(str(REPO / 'native/emulator_srgb.m')) + '\n' + r'''
+#include <assert.h>
+static bool independent = true;
+static int poseStatus = 0;
+static uint32_t poseWidth = 1120, poseHeight = 2436;
+static unsigned int poseCalls = 0;
+static unsigned int rotation = 0, eventCount = 0, nextCalls = 0;
+static bool repeatDisplayId = false;
+static struct { uint32_t type, id, width, height; } events[8];
+static const struct {
+    uint32_t id, width, height, buffer;
+    bool enabled;
+} panels[] = {
+    {0, 1120, 2436, 1, true}, {2, 912, 596, 10, true},
+    {4, 320, 240, 0, true}, {7, 640, 480, 11, true},
+    {8, 111, 222, 12, false}, {9, 0, 240, 13, true}
+};
+static bool independentWindows(void) { return independent; }
+static int currentPose(uint32_t display, int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) {
+    assert(display == 0);
+    ++poseCalls;
+    *x = 17; *y = 19; *w = poseWidth; *h = poseHeight;
+    return poseStatus;
+}
+static bool enumerateDisplay(int32_t previous, uint32_t *id, int32_t *x, int32_t *y,
+                             uint32_t *w, uint32_t *h, uint32_t *dpi,
+                             uint32_t *flags, uint32_t *buffer) {
+    ++nextCalls;
+    if (repeatDisplayId) { *id = previous < 0 ? 0 : (uint32_t)previous; return true; }
+    for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); ++i) {
+        if (previous >= 0 && panels[i].id <= (uint32_t)previous) continue;
+        *id = panels[i].id; *x = 20; *y = 30; *dpi = 450; *flags = 0;
+        *w = rotation ? panels[i].height : panels[i].width;
+        *h = rotation ? panels[i].width : panels[i].height;
+        *buffer = panels[i].buffer;
+        return true;
+    }
+    return false;
+}
+static bool naturalDisplay(uint32_t id, int32_t *x, int32_t *y, uint32_t *w,
+                           uint32_t *h, uint32_t *dpi, uint32_t *flags, bool *enabled) {
+    for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); ++i) {
+        if (id != panels[i].id) continue;
+        *x = 20; *y = 30; *dpi = 450; *flags = 0;
+        *w = panels[i].width; *h = panels[i].height; *enabled = panels[i].enabled;
+        return true;
+    }
+    return false;
+}
+static void recordEvent(const void *event) {
+    assert(eventCount < sizeof(events) / sizeof(events[0]));
+    const unsigned char *bytes = event;
+    memcpy(&events[eventCount].type, bytes + skinEventTypeOffset, 4);
+    memcpy(&events[eventCount].id, bytes + skinEventIdOffset, 4);
+    memcpy(&events[eventCount].width, bytes + skinEventWidthOffset, 4);
+    memcpy(&events[eventCount].height, bytes + skinEventHeightOffset, 4);
+    ++eventCount;
+}
+static void expectSize(uintptr_t caller, bool handled) {
+    uint32_t w = 123, h = 456;
+    eventCount = nextCalls = 0;
+    assert(primaryRotationSize(caller, &w, &h) == handled);
+    assert(w == (handled ? poseWidth : 123));
+    assert(h == (handled ? poseHeight : 456));
+    if (!handled) assert(eventCount == 0 && nextCalls == 0);
+}
+int main(void) {
+    primaryDisplayPose = currentPose;
+    separateDisplayWindows = independentWindows;
+    nextDisplay = enumerateDisplay;
+    displayInfo = naturalDisplay;
+    queueSkinEvent = recordEvent;
+    skinEventSize = 64; skinEventTypeOffset = 56;
+    skinEventIdOffset = 8; skinEventWidthOffset = 12; skinEventHeightOffset = 16;
+    skinEventAdd = 71; skinEventRemove = 72;
+    rotationSizeCallers[0] = 0x1111;
+    rotationSizeCallers[1] = 0x2222;
+    const unsigned int rotations[] = {0, 1, 3};
+    for (size_t r = 0; r < sizeof(rotations) / sizeof(rotations[0]); ++r) {
+        rotation = rotations[r];
+        poseWidth = rotation ? 2436 : 1120; poseHeight = rotation ? 1120 : 2436;
+        expectSize(rotationSizeCallers[0], true);
+        assert(eventCount == 0 && nextCalls == 0);
+        expectSize(rotationSizeCallers[1], true);
+        assert(eventCount == 4);
+        const uint32_t ids[] = {2, 7}, widths[] = {912, 640}, heights[] = {596, 480};
+        for (unsigned int i = 0; i < eventCount; ++i) {
+            assert(events[i].type == (i % 2 ? skinEventAdd : skinEventRemove));
+            assert(events[i].id == ids[i / 2]);
+            if (i % 2) {
+                assert(events[i].width == widths[i / 2]);
+                assert(events[i].height == heights[i / 2]);
+            }
+        }
+    }
+    expectSize(0x3333, false);
+    independent = false;
+    expectSize(rotationSizeCallers[1], false);
+    assert(poseCalls == 6);
+    independent = true; poseStatus = -1;
+    expectSize(rotationSizeCallers[1], false);
+    poseStatus = 0; poseWidth = 0;
+    expectSize(rotationSizeCallers[1], false);
+    poseWidth = 2436; poseHeight = 0;
+    expectSize(rotationSizeCallers[1], false);
+    poseHeight = 1120; repeatDisplayId = true;
+    expectSize(rotationSizeCallers[1], true);
+    assert(nextCalls == 2 && eventCount == 0);
+    return 0;
+}
+''')
+        executable = self.root / 'rotation'
+        result = subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror',
+                                 '-arch', 'arm64', '-mmacosx-version-min=12.0',
+                                 '-framework', 'AppKit', '-framework', 'QuartzCore',
+                                 str(harness), '-o', str(executable)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ('HYPEROS_AVD_SRGB', 'HYPEROS_AVD_SRGB_AVD',
+                                      'HYPEROS_AVD_MULTI_DISPLAY', 'DYLD_INSERT_LIBRARIES')}
+        result = subprocess.run([str(executable)], env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.run_probe(['-avd', 'Renamed_Phone'], enabled=None,
+                                expected='Renamed_Phone', multi_display='1')
+        self.assertNotIn('independent primary-window rotation enabled', output)
+        self.assertNotIn('sRGB tagging enabled', output)
+
+class HostDisplayRecipeTests(unittest.TestCase):
+    """Exercise byte-level discovery without an SDK, disassembler, or compiler."""
+
+    @staticmethod
+    def fixture(slots=21, base=0x100000000, code_offset=0x1000, data_gap=0,
+                uuid=b'fixture UUID one', version='37.1.11', missing=None,
+                extra_caller=False, bad_stack=False, type_offset=48,
+                event_size=56, add_type=33, remove_type=34, chained=False,
+                copy_move=False, copy_clobber=None, wrong_event_object=False,
+                height_padding=0, payload_offset=0):
+        import host_display as display
+
+        def mov(destination, source):
+            return 0xAA0003E0 | source << 16 | destination
+
+        def imm(register, value):
+            return 0x52800000 | value << 5 | register
+
+        def add(destination, source, value):
+            return 0x91000000 | value << 10 | source << 5 | destination
+
+        def load(register, source, offset, width=8):
+            return (0xF9400000 if width == 8 else 0xB9400000) | (offset // width) << 10 | source << 5 | register
+
+        def store(register, source, offset, width=8):
+            return (0xF9000000 if width == 8 else 0xB9000000) | (offset // width) << 10 | source << 5 | register
+
+        def pair(first, second, source, offset, width=8):
+            return (0xA9000000 if width == 8 else 0x29000000) | ((offset // width) & 127) << 15 | second << 10 | source << 5 | first
+
+        def call(name, link=True):
+            return ('branch', name, link)
+
+        slot_map = dict(display_info=2, next_display=3, combined=5, pose=12,
+                        separate_windows=18 if slots == 21 else 16,
+                        perform_rotation=19 if slots == 21 else 17)
+        bodies = {}
+        for role in display.FUNCTIONS:
+            bodies[role] = [0xD65F03C0]
+        names = dict(display.FUNCTIONS)
+        names['unused'] = '_ZN8Fixture06unusedEv'
+        bodies['unused'] = [0xD65F03C0]
+        for number, role in enumerate(display.AGENT_SIGNATURES):
+            name = 'wrapper_' + role
+            names[name] = '_ZN3$_' + str(number) + display.AGENT_SIGNATURES[role]
+            count = dict(combined=2, pose=5, separate_windows=0, next_display=9,
+                         display_info=8, perform_rotation=1)[role]
+            body = [0xD10203FF]
+            body += [mov(19 + index, index) for index in range(min(count, 8))]
+            body += [call('instance'), 0xB4000040]
+            if role == 'display_info':
+                body += [pair(19 if bad_stack else 31, 26, 31, 0)]
+            if role == 'next_display':
+                body += [load(27, 31, 128), pair(26, 27, 31, 0)]
+            body += [mov(index + 1, 19 + index) for index in range(min(count, 7))]
+            body += [call(role, role in ('display_info', 'next_display')), 0xD65F03C0]
+            bodies[name] = body
+
+        def agent_call(role):
+            return [load(8, 21, 0), load(8, 8, 120), load(8, 8, slot_map[role] * 8)]
+
+        def size_call(number):
+            return (agent_call('combined') + [add(0, 31, 0), add(1, 31, 4), 0xD63F0100,
+                    load(3, 31, 0, 4), load(4, 31, 4, 4), mov(0, 19), imm(1, 0),
+                    imm(2, 0), imm(5, number), call('resize')])
+
+        bodies['rotate'] = ([0xD10203FF, mov(19, 0), mov(20, 1), ('adrp', 21, 'ui'), ('add_address', 21, 'ui')]
+                            + size_call(0) + agent_call('perform_rotation') + [mov(0, 20), 0xD63F0100]
+                            + size_call(1))
+        if extra_caller:
+            bodies['rotate'] += agent_call('combined') + [add(0, 31, 0), add(1, 31, 4), 0xD63F0100]
+        bodies['rotate'] += [0xD65F03C0]
+        event = [0xD10203FF, mov(19, 0), call('instance'),
+                 0xAD400660, 0xAD0007E0]
+        for offset in range(32, event_size - 8, 16):
+            event += [0x3DC00000 | (offset // 16) << 10 | 19 << 5]
+            if copy_clobber == 'simd':
+                event += [0x6F00E400]
+            event += [0x3D800000 | (offset // 16) << 10 | 31 << 5]
+        event += [load(8, 19, event_size - 8)]
+        if copy_move:
+            event += [mov(9, 8)]
+        if copy_clobber == 'gpr':
+            event += [imm(8, 0)]
+        if copy_clobber == 'call':
+            event += [call('instance')]
+        if copy_clobber == 'narrow':
+            event += [0x2A0803E9]
+        event += [store(9 if copy_move or copy_clobber == 'narrow' else 8, 31, event_size - 8),
+                  add(1, 31, 0), call('queue_event'), 0xD65F03C0]
+        bodies['event'] = event
+        bodies['create_event'] = [store(0, 8, type_offset, 4), 0xD65F03C0]
+        bodies['add_window'] = [0xD10203FF, mov(20, 1), ('cbz', 2, 'remove'),
+                                mov(21, 3), mov(22, 4), add(8, 31, 64 if wrong_event_object else 16), imm(0, add_type),
+                                call('create_event'), ('jump', 'payload'), ('label', 'remove'),
+                                add(8, 31, 64 if wrong_event_object else 16), imm(0, remove_type), call('create_event'),
+                                ('label', 'payload'), pair(20, 21, 31, 16 + payload_offset, 4),
+                                store(22, 31, 24 + payload_offset + height_padding, 4),
+                                add(1, 31, 16), mov(0, 19), call('queue_event'), 0xD65F03C0]
+        addresses, cursor = {}, base + code_offset
+        for name, body in bodies.items():
+            addresses[name] = cursor
+            cursor += 4 * sum(not (isinstance(item, tuple) and item[0] == 'label') for item in body)
+        code_size = cursor - base - code_offset
+        data_file = (code_offset + code_size + 4095) & ~4095
+        data_address = base + data_file + data_gap
+        addresses.update(table=data_address, exported=data_address + slots * 8,
+                         ui=data_address + slots * 8 + 8)
+        code = bytearray()
+        for name, body in bodies.items():
+            labels, position = {}, addresses[name]
+            for item in body:
+                if isinstance(item, tuple) and item[0] == 'label':
+                    labels[item[1]] = position
+                else:
+                    position += 4
+            position = addresses[name]
+            for item in body:
+                if isinstance(item, tuple):
+                    kind = item[0]
+                    if kind == 'label':
+                        continue
+                    if kind == 'branch':
+                        word = (0x94000000 if item[2] else 0x14000000) | (((addresses[item[1]] - position) // 4) & 0x3FFFFFF)
+                    elif kind == 'adrp':
+                        immediate = ((addresses[item[2]] & ~4095) - (position & ~4095)) // 4096
+                        word = 0x90000000 | (immediate & 3) << 29 | ((immediate >> 2) & 0x7FFFF) << 5 | item[1]
+                    elif kind == 'add_address':
+                        word = add(item[1], item[1], addresses[item[2]] & 4095)
+                    elif kind == 'cbz':
+                        word = 0x34000000 | (((labels[item[2]] - position) // 4) & 0x7FFFF) << 5 | item[1]
+                    elif kind == 'jump':
+                        word = 0x14000000 | (((labels[item[1]] - position) // 4) & 0x3FFFFFF)
+                    else:
+                        raise AssertionError(kind)
+                else:
+                    word = item
+                code += struct.pack('<I', word)
+                position += 4
+        table = [addresses['unused']] * slots
+        for role, index in slot_map.items():
+            table[index] = addresses['wrapper_' + role]
+        const = struct.pack('<' + 'Q' * (slots + 2), *table, addresses['table'], 0)
+        strings = bytearray(b'\0')
+        symbols = bytearray()
+        for name in bodies:
+            if name == missing:
+                continue
+            text = ('_' + names[name]).encode() + b'\0'
+            symbols += struct.pack('<IBBHQ', len(strings), 0x0E if name.startswith('wrapper_') else 0x0F,
+                                   1, 0, addresses[name])
+            strings += text
+        for name, symbol_name, external in (('table', 'arbitraryLocalAgentTable', False),
+                                             ('exported', display.AGENT_GLOBAL, True),
+                                             ('ui', display.UI_AGENT_GLOBAL, True)):
+            symbols += struct.pack('<IBBHQ', len(strings), 0x0F if external else 0x0E, 2, 0, addresses[name])
+            strings += ('_' + symbol_name).encode() + b'\0'
+        strings += version.encode() + b'\0'
+        sym_offset = (data_file + len(const) + 7) & ~7
+        strings_offset = sym_offset + len(symbols)
+        link_size = len(symbols) + len(strings)
+
+        def segment(name, address, offset, file_size, protection, section=None):
+            command = struct.pack('<II16sQQQQiiII', 0x19, 152 if section else 72,
+                                  name.ljust(16, b'\0'), address, file_size, offset,
+                                  file_size, protection, protection, int(section is not None), 0)
+            if section:
+                section_name, section_address, section_size, section_offset = section
+                command += struct.pack('<16s16sQQIIIIIIII', section_name.ljust(16, b'\0'),
+                                       name.ljust(16, b'\0'), section_address, section_size,
+                                       section_offset, 2, 0, 0, 0, 0, 0, 0)
+            return command
+
+        commands = (segment(b'__TEXT', base, 0, data_file, 5,
+                            (b'__text', base + code_offset, code_size, code_offset))
+                    + segment(b'__DATA_CONST', data_address, data_file, len(const), 1,
+                              (b'__const', data_address, len(const), data_file))
+                    + segment(b'__LINKEDIT', base + sym_offset + data_gap, sym_offset, link_size, 1)
+                    + struct.pack('<IIIIII', 2, 24, sym_offset, len(symbols) // 16, strings_offset, len(strings))
+                    + struct.pack('<II16s', 0x1B, 24, uuid.ljust(16, b'\0')[:16]))
+        if chained:
+            commands += struct.pack('<IIII', 0x80000034, 16, sym_offset, 0)
+        result = bytearray(strings_offset + len(strings))
+        header = struct.pack('<8I', 0xFEEDFACF, 0x0100000C, 0, 2, 6 if chained else 5, len(commands), 0, 0)
+        result[:32 + len(commands)] = header + commands
+        result[code_offset:code_offset + len(code)] = code
+        result[data_file:data_file + len(const)] = const
+        result[sym_offset:sym_offset + len(symbols)] = symbols
+        result[strings_offset:] = strings
+        return bytes(result)
+
+    def test_discovers_full_19_and_21_slot_tables_and_real_member_abi(self):
+        import host_display as display
+        for slots in (19, 21):
+            with self.subTest(slots=slots):
+                data = self.fixture(slots=slots)
+                recipe = display.analyze(data)
+                self.assertEqual(recipe['binary_sha256'], hashlib.sha256(data).hexdigest())
+                self.assertEqual(recipe['agent']['table_size'], slots * 8)
+                self.assertEqual(recipe['agent']['slots']['combined'], 5)
+                self.assertEqual(recipe['agent']['slots']['separate_windows'], slots - 3)
+                self.assertEqual(len(recipe['rotation_callers']), 2)
+                self.assertEqual(set(recipe['agent']['entries']), set(display.AGENT_SIGNATURES))
+                self.assertEqual(recipe['event'], dict(size=56, type_offset=48, add_type=33,
+                                 remove_type=34, id_offset=0, width_offset=4, height_offset=8))
+
+    def test_code_data_base_uuid_and_version_are_not_identity_pins(self):
+        import host_display as display
+        first = display.analyze(self.fixture())
+        moved = display.analyze(self.fixture(base=0x200000000, code_offset=0x3000, data_gap=0x4000,
+                                             uuid=b'different UUID!!', version='future SDK'))
+        self.assertEqual(first['bindings'], moved['bindings'])
+        self.assertEqual(first['rotation_callers'], moved['rotation_callers'])
+        self.assertEqual(first['agent']['slots'], moved['agent']['slots'])
+        self.assertEqual(first['event'], moved['event'])
+        self.assertNotEqual(first['image_preferred_base'], moved['image_preferred_base'])
+        self.assertNotEqual(first['agent']['table_offset'], moved['agent']['table_offset'])
+
+    def test_derives_event_size_and_discriminator_values(self):
+        import host_display as display
+        event = display.analyze(self.fixture(event_size=72, type_offset=64,
+                                             add_type=71, remove_type=9, height_padding=4,
+                                             payload_offset=8))['event']
+        self.assertEqual((event['size'], event['type_offset'], event['add_type'], event['remove_type']),
+                         (72, 64, 71, 9))
+        self.assertEqual((event['id_offset'], event['width_offset'], event['height_offset']), (8, 12, 20))
+
+    def test_copy_provenance_supports_register_moves_and_rejects_clobbers(self):
+        import host_display as display
+        self.assertEqual(display.analyze(self.fixture(copy_move=True))['event']['size'], 56)
+        for clobber in ('gpr', 'simd', 'call', 'narrow'):
+            with self.subTest(clobber=clobber), self.assertRaises(ValueError):
+                display.analyze(self.fixture(copy_clobber=clobber))
+        with self.assertRaisesRegex(ValueError, 'queued event object'):
+            display.analyze(self.fixture(wrong_event_object=True))
+
+    def test_missing_symbols_ambiguous_calls_and_unknown_abi_fail_closed(self):
+        import host_display as display
+        cases = (dict(missing='pose'), dict(extra_caller=True), dict(bad_stack=True),
+                 dict(type_offset=8), dict(type_offset=64), dict(chained=True))
+        for options in cases:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                display.analyze(self.fixture(**options))
+        for data in (b'', b'not a Mach-O', self.fixture()[:64]):
+            with self.subTest(length=len(data)), self.assertRaises(ValueError):
+                display.analyze(data)
+
+    def test_prepare_reuses_private_content_cache_and_preserves_unknown_entries(self):
+        import host_display as display
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state = root / 'state'
+            state.mkdir()
+            executable = root / 'qemu'
+            data = self.fixture()
+            executable.write_bytes(data)
+            with patch('host_launch.job_directory', return_value=state / 'launchd'), \
+                    patch('sys.stderr', new_callable=io.StringIO) as diagnostic:
+                target = display.prepare(executable)
+                self.assertEqual(target, state / 'host-display' / hashlib.sha256(data).hexdigest() / 'recipe.json')
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+                before = (target.read_bytes(), target.stat().st_ino, target.stat().st_mtime_ns)
+                self.assertEqual(json.loads(before[0]), display.analyze(data))
+                self.assertEqual(display.prepare(executable), target)
+                self.assertEqual((target.read_bytes(), target.stat().st_ino, target.stat().st_mtime_ns), before)
+                target.write_bytes(b'unknown cache contents')
+                self.assertIsNone(display.prepare(executable))
+                self.assertEqual(target.read_bytes(), b'unknown cache contents')
+                self.assertIn('modified', diagnostic.getvalue())
+                target.unlink()
+                foreign = root / 'foreign.json'
+                foreign.write_bytes(b'foreign contents')
+                target.symlink_to(foreign)
+                self.assertIsNone(display.prepare(executable))
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(foreign.read_bytes(), b'foreign contents')
+            executable.write_bytes(b'unsupported executable')
+            with patch('host_launch.job_directory', return_value=root / 'unknown/launchd'), \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                self.assertIsNone(display.prepare(executable))
+            self.assertFalse((root / 'unknown').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
