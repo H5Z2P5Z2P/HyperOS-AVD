@@ -87,11 +87,11 @@ target manifest and `SHA256SUMS` are written. Packaging does not publish assets.
 
 ## Delta-only repair releases
 
-Installer 1.3.1 supports `distribution: delta-only-v1`. These releases contain
+Installer 1.3.0 supports `distribution: delta-only-v1`. These releases contain
 no full target archive: `parts` is empty and `deltas` contains one patch from
 a full release. `base_release` embeds the exact full base `manifest` and its
 canonical `manifest_sha256`. A base cannot itself be delta-only. The target
-keeps a complete file inventory and sets `minimum_installer` to at least 1.3.1.
+keeps a complete file inventory and sets `minimum_installer` to at least 1.3.0.
 Full releases retain the original 1.2.3 protocol baseline.
 
 An existing intact base under `versions/<base-version>` is reused. Otherwise

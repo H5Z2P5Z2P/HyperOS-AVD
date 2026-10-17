@@ -1,6 +1,6 @@
-# HyperOS-AVD Installer v1.3.1
+# HyperOS-AVD Installer v1.3.0
 
-Release Tag：`installer-v1.3.1`。
+Release Tag：`installer-v1.3.0`。
 
 - 支持 **r6.1 / r3.1 等仅增量修复版**，复用本地完整包，只下载修复内容。
 - 新用户可直接选择修复版，安装器自动下载并校验所需完整包，然后还原并安装目标版本，无需先手动安装旧版。

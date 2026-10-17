@@ -48,7 +48,7 @@ Installer 打包前核对 `scripts/manage.py` 与生成的 `installer.json` 版�
 
 ### 后续同底包更新的增量包
 
-Phone 和 Pad 后续发布小修复时，如果官方底包没有变化，采用仅增量修复版，例如 Phone r6.1、Pad r3.1。保留它依赖的已发布完整包，新的 Release 只上传增量分卷、`manifest.json` 与 `SHA256SUMS`。安装器 1.3.1 会为新用户自动下载所需完整包，已有用户复用本地素材。
+Phone 和 Pad 后续发布小修复时，如果官方底包没有变化，采用仅增量修复版，例如 Phone r6.1、Pad r3.1。保留它依赖的已发布完整包，新的 Release 只上传增量分卷、`manifest.json` 与 `SHA256SUMS`。安装器 1.3.0 会为新用户自动下载所需完整包，已有用户复用本地素材。
 
 打包命令添加 `--delta-only --delta-from`，指向完整基包的发行文件清单。仅增量版只允许依赖一个完整包，不依赖另一个仅增量版本：
 
@@ -61,19 +61,19 @@ HYPEROS_AVD_WORKSPACE=/path/to/accepted-build \
 
 打包器核对官方 OTA 的 SHA-256、机型、固件版本及加密模板，只为同底包生成差分。完整基包必须已经解包，并保留清单列出的发行文件。仅增量模式直接生成差分，不会先创建数 GiB 的完整目标包。更换官方底包时不添加这两个参数，按完整包流程发布。
 
-仅增量修复版的 `minimum_installer` 为 **1.3.1**，发行清单记录完整基包的原始清单和摘要。上传时保留基包 Release 的全部附件。若需要兼容旧安装器，仍可省略 `--delta-only`，同时分发完整目标包与增量包，这种模式保留 **1.2.3** 的安装基线。协议细节见 [安装器协议](installer-protocol.md#delta-only-repair-releases)。
+仅增量修复版的 `minimum_installer` 为 **1.3.0**，发行清单记录完整基包的原始清单和摘要。上传时保留基包 Release 的全部附件。若需要兼容旧安装器，仍可省略 `--delta-only`，同时分发完整目标包与增量包，这种模式保留 **1.2.3** 的安装基线。协议细节见 [安装器协议](installer-protocol.md#delta-only-repair-releases)。
 
 ## 附件和清单
 
-仅增量修复批次使用以下命名。先发布 Installer 1.3.1 并设为 Latest，再发布两端修复版并设置 `--latest=false`。Phone r6、Pad r3 的完整包附件继续保留，供首次安装自动下载。
+仅增量修复批次使用以下命名。先发布 Installer 1.3.0 并设为 Latest，再发布两端修复版并设置 `--latest=false`。Phone r6、Pad r3 的完整包附件继续保留，供首次安装自动下载。
 
 | 内容 | 输出目录 | 上传内容 |
 | --- | --- | --- |
-| Installer 1.3.1 | `releases/installer-v1.3.1/` | Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS` |
+| Installer 1.3.0 | `releases/installer-v1.3.0/` | Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS` |
 | Phone r6.1 | `releases/v0.2.5-a17-hyperos4-hongkong-r6.1/` | 全部增量分卷、`manifest.json`、`SHA256SUMS` |
 | Pad r3.1 | `releases/pad-v0.1.2-a17-hyperos4-yingtian-r3.1/` | 全部增量分卷、`manifest.json`、`SHA256SUMS` |
 
-发布说明分别使用 `docs/releases/installer-v1.3.1.md`、`docs/releases/os4-r6.1.md` 与 `docs/releases/os4-pad-r3.1.md`。以下保留原完整包批次的命名示例。
+发布说明分别使用 `docs/releases/installer-v1.3.0.md`、`docs/releases/os4-r6.1.md` 与 `docs/releases/os4-pad-r3.1.md`。以下保留原完整包批次的命名示例。
 
 | Release | 输出目录 | 上传内容 |
 | --- | --- | --- |

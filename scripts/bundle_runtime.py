@@ -12,7 +12,7 @@ from common import sha256
 INSTALL_PROTOCOL = 'verified-bundle-runtime-v1'
 PROTOCOL_MINIMUM = '1.2.3'
 DELTA_DISTRIBUTION = 'delta-only-v1'
-DELTA_MINIMUM = '1.3.1'
+DELTA_MINIMUM = '1.3.0'
 REVISION_PATTERN = r'(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*'
 ENTRYPOINT = 'runtime/scripts/bundle_runtime.py'
 FAMILIES = {
