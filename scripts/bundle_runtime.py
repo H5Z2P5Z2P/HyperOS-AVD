@@ -11,6 +11,9 @@ from common import sha256
 
 INSTALL_PROTOCOL = 'verified-bundle-runtime-v1'
 PROTOCOL_MINIMUM = '1.2.3'
+DELTA_DISTRIBUTION = 'delta-only-v1'
+DELTA_MINIMUM = '1.3.1'
+REVISION_PATTERN = r'(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*'
 ENTRYPOINT = 'runtime/scripts/bundle_runtime.py'
 FAMILIES = {
     'os4-official': ('official-hongkong-ota', 'hongkong', 'os4-hongkong-api37-ranchu-4k'),
@@ -56,6 +59,44 @@ def file_entries(manifest):
     return files
 
 
+def delta_base(manifest):
+    """Authenticate one complete base without permitting dependency chains."""
+    distribution = manifest.get('distribution')
+    if distribution is None:
+        if 'base_release' in manifest:
+            raise RuntimeError('A base release requires delta-only distribution.')
+        return None
+    if distribution != DELTA_DISTRIBUTION:
+        raise RuntimeError('Unsupported release distribution; update the installer.')
+    reference = manifest.get('base_release')
+    if (not isinstance(reference, dict) or set(reference) != {'manifest', 'manifest_sha256'}
+            or not isinstance(reference['manifest'], dict)
+            or reference['manifest'].get('distribution') is not None
+            or 'base_release' in reference['manifest']):
+        raise RuntimeError('Delta-only releases require one complete base release.')
+    base = validate_envelope(reference['manifest'])
+    if reference['manifest_sha256'] != manifest_digest(base):
+        raise RuntimeError('Delta-only base manifest checksum mismatch.')
+    minimum = manifest.get('compatibility', {}).get('minimum_installer', '')
+    if (not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
+            or tuple(map(int, minimum.split('.'))) < tuple(map(int, DELTA_MINIMUM.split('.')))):
+        raise RuntimeError('Delta-only distribution requires Installer ' + DELTA_MINIMUM + ' or newer.')
+    from incremental import validate_sources
+    projected = {key: value for key, value in manifest.items()
+                 if key not in ('distribution', 'base_release', 'deltas')}
+    projected['parts'] = base['parts']
+    validate_sources(base, projected)
+    from delta_install import validate_descriptor
+    deltas = manifest.get('deltas')
+    if not isinstance(deltas, list) or len(deltas) != 1:
+        raise RuntimeError('Delta-only releases require one matching base patch.')
+    descriptor = validate_descriptor(deltas[0], manifest)
+    if (descriptor['from_version'] != base['version']
+            or descriptor['from_manifest_sha256'] != manifest_digest(base)):
+        raise RuntimeError('Incremental patch does not match the complete base release.')
+    return base
+
+
 def validate_envelope(manifest):
     """Validate the stable transport contract without a firmware source registry."""
     if not isinstance(manifest, dict) or not has_protocol(manifest):
@@ -65,8 +106,8 @@ def validate_envelope(manifest):
     if variant not in FAMILIES or not isinstance(build, dict):
         raise RuntimeError('Unsupported verified bundle firmware family.')
     source, device, family = FAMILIES[variant]
-    tag = ((r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r\d+') if variant == 'os4-official'
-           else r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+')
+    tag = ((r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r') if variant == 'os4-official'
+           else r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r') + REVISION_PATTERN
     minimum = compat.get('minimum_installer')
     if (manifest.get('project') != 'HyperOS-AVD' or type(manifest.get('format')) is not int
             or manifest['format'] != 3 or manifest.get('platform') != 'macos-arm64'
@@ -93,7 +134,8 @@ def validate_envelope(manifest):
     if not required <= set(files):
         raise RuntimeError('Verified bundle is missing its runtime or encryption template.')
     parts = manifest.get('parts')
-    if not isinstance(parts, list) or not parts:
+    delta_only = manifest.get('distribution') == DELTA_DISTRIBUTION
+    if not isinstance(parts, list) or (not parts and not delta_only) or (parts and delta_only):
         raise RuntimeError('Missing release archive parts.')
     seen = set()
     for item in parts:
@@ -104,6 +146,7 @@ def validate_envelope(manifest):
                 or not isinstance(item['sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', item['sha256'])):
             raise RuntimeError('Invalid release archive integrity metadata.')
         seen.add(item['name'])
+    delta_base(manifest)
     return manifest
 
 

@@ -22,9 +22,10 @@ MANIFEST_LIMIT = 2 * 1024 * 1024
 
 def validate_descriptor(value, manifest):
     """Validate the optional transport without changing the complete release."""
-    tag = (r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+'
+    revision = bundle_runtime.REVISION_PATTERN
+    tag = (r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r' + revision
            if manifest.get('variant') == 'os4-pad'
-           else r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r\d+')
+           else r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r' + revision)
     if (not isinstance(value, dict)
             or set(value) != {'protocol', 'from_version', 'from_manifest_sha256', 'parts'}
             or value.get('protocol') != incremental.PROTOCOL
@@ -65,13 +66,21 @@ def _verify_file(path, root, info):
 
 
 def _source_context(root, manifest, descriptor):
-    """Use only the exact currently installed immutable release directory."""
-    old = _read_manifest(root / 'local/installed-release.json', root)
+    """Authenticate the active source or the pinned full base for delta-only releases."""
+    pinned = bundle_runtime.delta_base(manifest)
+    old = pinned if pinned is not None else _read_manifest(root / 'local/installed-release.json', root)
     if (old.get('version') != descriptor['from_version']
             or bundle_runtime.manifest_digest(old) != descriptor['from_manifest_sha256']):
-        raise RuntimeError('Installed release does not match the incremental source.')
+        raise RuntimeError('Release does not match the incremental source.')
     incremental.validate_sources(old, manifest)
     source = root / 'versions' / old['version']
+    if pinned is not None:
+        try:
+            bundle_runtime.verify_staged(source, old)
+        except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
+            raise RuntimeError('The cached incremental base is missing or corrupt. Inspect it before retrying: '
+                               + str(source)) from error
+        return source, old
     saved = _read_manifest(source / 'local/installed-release.json', root)
     if saved != old:
         raise RuntimeError('Immutable incremental source manifest has changed.')
@@ -85,6 +94,18 @@ def _source_context(root, manifest, descriptor):
 def select_delta(root, manifest):
     """Choose a smaller applicable delta, or keep the complete-package fallback."""
     root = Path(root).resolve()
+    # A delta-only release has no complete fallback. Authenticate its pinned
+    # source independently of the active manifest, including on fresh installs.
+    pinned = bundle_runtime.delta_base(manifest)
+    if pinned is not None:
+        source = root / 'versions' / pinned['version']
+        if (root / 'versions').is_symlink():
+            raise RuntimeError('Invalid release versions directory.')
+        if not source.exists() and not source.is_symlink():
+            return None
+        descriptor = min(manifest['deltas'], key=lambda item: sum(part['size'] for part in item['parts']))
+        source, old = _source_context(root, manifest, descriptor)
+        return descriptor, source, old
     values = manifest.get('deltas', [])
     if not isinstance(values, list):
         return None
@@ -108,6 +129,51 @@ def select_delta(root, manifest):
     except (RuntimeError, OSError, ValueError, TypeError, KeyError):
         return None
     return None
+
+
+def stage_base(root, base_manifest_path, base_manifest):
+    """Cache a full immutable delta source without installing or activating it."""
+    import manage
+    import setup
+    bundle_runtime.validate_envelope(base_manifest)
+    if bundle_runtime.delta_base(base_manifest) is not None:
+        raise RuntimeError('An incremental base must be a complete release.')
+    root = Path(root).resolve()
+    versions = root / 'versions'
+    target = versions / base_manifest['version']
+    if versions.is_symlink() or target.is_symlink():
+        raise RuntimeError('Invalid incremental base cache directory.')
+    if target.exists():
+        try:
+            bundle_runtime.verify_staged(target, base_manifest)
+        except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
+            raise RuntimeError('The cached incremental base is incomplete or corrupt. Inspect it before retrying: '
+                               + str(target)) from error
+        return target
+    root.mkdir(parents=True, exist_ok=True)
+    required = (sum(info['size'] for info in base_manifest['files'].values())
+                + 2 * sum(info['size'] for info in base_manifest['parts']) + 2 * 1024**3)
+    if shutil.disk_usage(root).free < required:
+        raise RuntimeError('Not enough free disk space to stage the complete incremental base.')
+    versions.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.delta-base-', dir=versions) as temporary:
+        files = Path(temporary) / 'release'
+        files.mkdir()
+        try:
+            with manage.scope(files):
+                setup.stage_bundle(str(base_manifest_path))
+        except OSError as error:
+            raise RuntimeError('The complete incremental base could not be staged. Keep its manifest and all '
+                               'archive parts together, or retry the online update: '
+                               + str(base_manifest_path)) from error
+        bundle_runtime.verify_staged(files, base_manifest)
+        # These archives were downloaded only for this temporary extraction.
+        shutil.rmtree(files / 'downloads', ignore_errors=True)
+        if target.exists() or target.is_symlink():
+            raise RuntimeError('The incremental base cache appeared during staging. Inspect it before retrying: '
+                               + str(target))
+        files.rename(target)
+    return target
 
 
 def _copy_part(source, output, info):
@@ -268,7 +334,7 @@ def stage_delta(root, target, manifest_path, manifest, descriptor, source_root, 
                 raise RuntimeError('Invalid incremental archive.') from error
         if seen != changed:
             raise RuntimeError('Incremental archive is incomplete.')
-        # Recheck the installed identity after all reads, before the new version
+        # Recheck the source identity after all reads, before the new version
         # becomes visible, and authenticate every resulting target file.
         current_source, current_old = _source_context(root, manifest, descriptor)
         if current_source != source or current_old != old:

@@ -85,7 +85,7 @@ def validate_phone_manifest(manifest, build):
             or compatibility.get('module_upgrade_preflight') != MODULE_UPGRADE_PREFLIGHT
             or (not forward and compatibility.get('upgrade_from') != ['v0.2.1-a17-hyperos4-hongkong-r2'])
             or (not frozen_source and not re.fullmatch(
-                r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r\d+', manifest['version']))
+                r'v\d+\.\d+\.\d+-a17-hyperos4-hongkong-r\d+(?:\.\d+)*', manifest['version']))
             or not isinstance(minimum, str) or not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
             or tuple(map(int, minimum.split('.'))) < floor):
         raise RuntimeError('Invalid official OS4 ' + ('r4' if repaired else 'r3') + ' upgrade profile.')
@@ -145,7 +145,7 @@ def validate_manifest(manifest):
         if source == PAD_SOURCE:
             compatibility = manifest.get('compatibility', {})
             minimum = compatibility.get('minimum_installer', '')
-            if (not re.fullmatch(r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+', manifest['version'])
+            if (not re.fullmatch(r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+(?:\.\d+)*', manifest['version'])
                     or type(manifest['format']) is not int or manifest['format'] != 3
                     or manifest.get('source') != PAD_SOURCE
                     or manifest.get('source_device') != 'yingtian'
@@ -307,6 +307,9 @@ def stage_bundle(value):
 
 
 def extract_bundle(manifest, base):
+    from bundle_runtime import DELTA_MINIMUM, delta_base
+    if delta_base(manifest) is not None:
+        raise RuntimeError('Use Installer ' + DELTA_MINIMUM + ' or newer to reconstruct this delta-only release.')
     validate_memory()
     cache = ROOT / 'downloads' / manifest['version']
     cache.mkdir(parents=True, exist_ok=True)

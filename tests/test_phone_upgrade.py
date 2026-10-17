@@ -135,7 +135,7 @@ class PhoneUpgradeTests(unittest.TestCase):
             path.write_text(json.dumps(future_revision))
             manage.compatible(parsed, setup.read_manifest(str(path))[0])
 
-    def test_new_source_release_metadata_preserves_recipe_and_selects_r6(self):
+    def test_new_source_release_metadata_preserves_recipe_and_selects_r6_patch(self):
         from patch_boot_services import image_receipts
         recipe = image_receipts()[-1]
         build = {'source': common.OS4_SOURCE, 'hyperos': LATEST, 'android_api': 37, 'archive_sha256': ARCHIVES[LATEST], 'adb_authentication': True, 'flutter_render_fix': 6, 'native_quickstep_identity': True, 'preinstalled_apps': {'apps': ['fixture']}, 'avd_defaults': {'fixture': True}, 'boot_service_fix': recipe, 'rear_display': {'source': LATEST}, 'lockscreen_video_fix': {'audited': True}}
@@ -152,7 +152,7 @@ class PhoneUpgradeTests(unittest.TestCase):
             from bundle_runtime import PROTOCOL_MINIMUM
             self.assertEqual(metadata['compatibility']['minimum_installer'], PROTOCOL_MINIMUM)
             self.assertNotIn('upgrade_from', metadata['compatibility'])
-            self.assertEqual(package_release.default_release_version('os4-official', metadata), R6)
+            self.assertEqual(package_release.default_release_version('os4-official', metadata), R6 + '.1')
             del build['boot_service_fix']
             file.write_text(json.dumps(build))
             with self.assertRaisesRegex(RuntimeError, 'boot-service repairs'):

@@ -7,6 +7,7 @@ import json
 import marshal
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -144,6 +145,107 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
         part = path.parent / descriptor['parts'][0]['name']
         descriptor['parts'][0].update(size=part.stat().st_size, sha256=common.sha256(part))
         path.write_text(json.dumps(manifest))
+
+    def delta_only_bundle(self, directory):
+        root, path, manifest, descriptor, source, old, patches = self.delta_bundle(directory)
+        base_directory = directory / 'complete-base'; base_directory.mkdir()
+        archive_path = base_directory / 'base.part001'
+        with tarfile.open(archive_path, 'w:gz') as archive:
+            for name in old['files']:
+                data = (source / name).read_bytes()
+                item = tarfile.TarInfo(name); item.size = len(data)
+                archive.addfile(item, io.BytesIO(data))
+        old['parts'] = [{'name': archive_path.name, 'size': archive_path.stat().st_size,
+                         'sha256': common.sha256(archive_path)}]
+        base_path = base_directory / 'manifest.json'
+        base_path.write_text(json.dumps(old))
+        (source / 'local/installed-release.json').write_text(json.dumps(old))
+        descriptor['from_manifest_sha256'] = protocol.manifest_digest(old)
+        manifest['version'] = old['version'] + '.1'
+        manifest['distribution'] = protocol.DELTA_DISTRIBUTION
+        manifest['compatibility']['minimum_installer'] = protocol.DELTA_MINIMUM
+        manifest['base_release'] = {'manifest': copy.deepcopy(old),
+                                    'manifest_sha256': protocol.manifest_digest(old)}
+        manifest['parts'] = []
+        path.write_text(json.dumps(manifest))
+        return root, path, manifest, descriptor, source, old, base_path
+
+    def test_delta_only_stages_full_base_then_patch_without_activating_base(self):
+        for active in (False, True):
+            with self.subTest(active=active), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, base_path = self.delta_only_bundle(Path(directory))
+                direct = Path(directory) / 'direct-extraction'
+                with manage.scope(direct), self.assertRaisesRegex(RuntimeError, 'reconstruct this delta-only release'):
+                    setup.stage_bundle(str(path))
+                self.assertFalse(direct.exists())
+                shutil.rmtree(source)
+                if active:
+                    previous = copy.deepcopy(old); previous['version'] = old['version'].replace('-r998', '-r997')
+                    (root / 'local/installed-release.json').write_text(json.dumps(previous))
+                    active_bytes = (root / 'local/installed-release.json').read_bytes()
+                else:
+                    for name in ('local', 'images', 'avd'):
+                        shutil.rmtree(root / name)
+                self.assertIsNone(delta_install.select_delta(root, manifest))
+                self.assertEqual(delta_install.stage_base(root, base_path, old), source)
+                protocol.verify_staged(source, old)
+                self.assertEqual(delta_install.stage_base(root, base_path, old), source)
+                selected = delta_install.select_delta(root, manifest)
+                self.assertEqual(selected, (descriptor, source, old))
+                target = root / 'versions' / manifest['version']
+                delta_install.stage_delta(root, target, path, manifest, *selected)
+                protocol.verify_staged(target, manifest)
+                self.assertEqual((target / 'images/system.img').read_bytes(), b'new')
+                if active:
+                    self.assertEqual((root / 'local/installed-release.json').read_bytes(), active_bytes)
+                    self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+                    self.assertEqual((root / 'images/system.img').read_bytes(), b'mutable instance firmware')
+                else:
+                    self.assertFalse((root / 'local').exists())
+                    self.assertFalse((root / 'avd').exists())
+                    self.assertFalse((root / 'images').exists())
+                self.assertFalse((source / 'downloads').exists())
+                self.assertFalse(list((root / 'versions').glob('.delta-*')))
+
+    def test_delta_only_missing_or_corrupt_base_never_overwrites_existing_state(self):
+        for failure in ('missing-part', 'cached-bytes', 'cached-manifest', 'wrong-pin', 'low-disk', 'symlink'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, base_path = self.delta_only_bundle(Path(directory))
+                active = (root / 'local/installed-release.json').read_bytes()
+                if failure in ('missing-part', 'low-disk'):
+                    shutil.rmtree(source)
+                    if failure == 'missing-part':
+                        (base_path.parent / old['parts'][0]['name']).unlink()
+                        with self.assertRaisesRegex(RuntimeError, 'manifest and all archive parts'):
+                            delta_install.stage_base(root, base_path, old)
+                    else:
+                        with patch.object(delta_install.shutil, 'disk_usage',
+                                          return_value=type('Disk', (), {'free': 0})()), \
+                                self.assertRaisesRegex(RuntimeError, 'free disk space'):
+                            delta_install.stage_base(root, base_path, old)
+                    self.assertFalse(source.exists())
+                elif failure == 'wrong-pin':
+                    manifest['base_release']['manifest_sha256'] = '0' * 64
+                    with self.assertRaises(RuntimeError):
+                        delta_install.select_delta(root, manifest)
+                else:
+                    marker = source / 'custom-file'; marker.write_bytes(b'preserved custom data')
+                    if failure == 'cached-bytes':
+                        (source / 'images/system.img').write_bytes(b'corrupt cached source')
+                    elif failure == 'cached-manifest':
+                        (source / 'local/installed-release.json').write_text('{}')
+                    else:
+                        actual = source.with_name(source.name + '-actual'); source.rename(actual)
+                        source.symlink_to(actual, target_is_directory=True)
+                    with self.assertRaisesRegex(RuntimeError, 'base|cache'):
+                        delta_install.stage_base(root, base_path, old)
+                    with self.assertRaisesRegex(RuntimeError, 'base|cache'):
+                        delta_install.select_delta(root, manifest)
+                    self.assertEqual((source / 'custom-file').read_bytes(), b'preserved custom data')
+                self.assertEqual((root / 'local/installed-release.json').read_bytes(), active)
+                self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+                self.assertFalse((root / 'versions' / manifest['version']).exists())
+                self.assertFalse(list((root / 'versions').glob('.delta-*')))
 
     def test_delta_stages_exact_target_with_new_removed_and_unchanged_files(self):
         with tempfile.TemporaryDirectory() as directory:

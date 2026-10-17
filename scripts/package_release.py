@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package verified firmware into GitHub-sized parts, excluding all personal data."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -566,13 +567,13 @@ def default_release_version(variant, metadata):
         from phone_profile import profile
         selected = profile(metadata['hyperos'])
         if selected['hyperos'] == '4.0.24.0.XFRCNXM':
-            return 'v0.2.5-a17-hyperos4-hongkong-r6'
+            return 'v0.2.5-a17-hyperos4-hongkong-r6.1'
         if metadata.get('build', {}).get('boot_service_fix') is not None:
             return 'v0.2.4-a17-hyperos4-hongkong-r5'
         if metadata['hyperos'] == '4.0.18.0.XFRCNXM':
             return 'v0.2.2-a17-hyperos4-hongkong-r3'
         return 'v0.2.1-a17-hyperos4-hongkong-r2'
-    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.2-a17-hyperos4-yingtian-r3'}[variant]
+    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.2-a17-hyperos4-yingtian-r3.1'}[variant]
 
 
 def runtime_files():
@@ -603,7 +604,7 @@ def runtime_files():
     return paths
 
 
-def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_from=()):
+def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_from=(), delta_only=False):
     """Archive only explicit portable files; publish the manifest last."""
     if not re.fullmatch(r'(?:pad-)?v[0-9A-Za-z_.-]+', version):
         raise RuntimeError('Invalid release version.')
@@ -623,6 +624,28 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
     if included_current and (metadata.get('format') != 3 or metadata.get('variant') not in RUNTIME_PAYLOADS
                              or included_current != current_paths.keys()):
         raise RuntimeError('A portable current KernelSU stack must contain every verified runtime asset.')
+    base = base_root = None
+    delta_from = tuple(delta_from)
+    if delta_only:
+        from bundle_runtime import DELTA_DISTRIBUTION, DELTA_MINIMUM, manifest_digest, regular, validate_envelope
+        if len(delta_from) != 1:
+            raise RuntimeError('A delta-only release requires exactly one full --delta-from source.')
+        previous = Path(delta_from[0])
+        if previous.name == 'installed-release.json' and previous.parent.name == 'local':
+            base_root = previous.parent.parent
+        elif previous.name == 'manifest.json':
+            base_root = previous.parent
+        else:
+            raise RuntimeError('Use a source manifest beside unpacked release files.')
+        regular(previous, base_root)
+        if previous.stat().st_size > 16 * 1024**2:
+            raise RuntimeError('Oversized incremental source manifest.')
+        base = json.loads(previous.read_text())
+        validate_envelope(base)
+        if base.get('distribution') is not None:
+            raise RuntimeError('A delta-only release requires a full base release, without incremental chains.')
+        if metadata.get('format') != 3:
+            raise RuntimeError('A delta-only release requires a verified format3 runtime.')
     files = {}
     for relative, path in paths.items():
         if path.is_symlink() or not path.is_file():
@@ -640,31 +663,52 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
                        for name in names))
         if not allowed or '..' in Path(relative).parts or Path(relative).is_absolute():
             raise RuntimeError('Unexpected release path: ' + relative)
-        files[relative] = {'size': path.stat().st_size, 'sha256': sha256(path)}
+        # Unchanged source paths are verified before and after delta generation.
+        # Reuse their authenticated entries here to avoid a redundant image scan.
+        if base is not None and relative in base['files'] and path == base_root / relative:
+            regular(path, base_root)
+            if path.stat().st_size != base['files'][relative]['size']:
+                raise RuntimeError('Incremental input differs from its manifest: ' + relative)
+            files[relative] = dict(base['files'][relative])
+        else:
+            files[relative] = {'size': path.stat().st_size, 'sha256': sha256(path)}
         if relative in included_current and (path.stat().st_nlink != 1
                                              or files[relative]['sha256'] != current_paths[relative]):
             raise RuntimeError('Current KernelSU release attachment differs from its official pin.')
-    directory.mkdir(parents=True, exist_ok=False)
-    writer = PartsWriter(directory, 'HyperOS-AVD-' + version + '-macos-arm64', part_mib * 1024**2)
-    try:
-        with tarfile.open(fileobj=writer, mode='w|gz', compresslevel=6) as archive:
-            for relative, path in sorted(paths.items()):
-                print('Packaging: ' + relative, flush=True)
-                entry = archive.gettarinfo(str(path), arcname=relative)
-                entry.uid = entry.gid = 0
-                entry.uname = entry.gname = ''
-                entry.mtime = 0
-                entry.mode = 0o644
-                with path.open('rb') as source:
-                    archive.addfile(entry, source)
-                # Do not publish an image that changed during packaging.
-                if sha256(path) != files[relative]['sha256']:
-                    raise RuntimeError('Firmware changed while packaging: ' + relative)
-    finally:
-        writer.close_part()
-    manifest = {**metadata, 'version': version, 'parts': writer.parts, 'files': files}
+    manifest = {**copy.deepcopy(metadata), 'version': version, 'parts': [], 'files': files}
     if manifest['format'] in (2, 3):
         manifest['build']['system_sha256'] = files['images/system.img']['sha256']
+    if delta_only:
+        manifest['distribution'] = DELTA_DISTRIBUTION
+        manifest['base_release'] = {'manifest': base, 'manifest_sha256': manifest_digest(base)}
+        minimum = manifest['compatibility']['minimum_installer']
+        if tuple(map(int, minimum.split('.'))) < tuple(map(int, DELTA_MINIMUM.split('.'))):
+            manifest['compatibility']['minimum_installer'] = DELTA_MINIMUM
+        from incremental import validate_sources
+        validation_target = {key: value for key, value in manifest.items()
+                             if key not in ('distribution', 'base_release')}
+        validation_target['parts'] = base['parts']
+        validate_sources(base, validation_target)
+    directory.mkdir(parents=True, exist_ok=False)
+    if not delta_only:
+        writer = PartsWriter(directory, 'HyperOS-AVD-' + version + '-macos-arm64', part_mib * 1024**2)
+        try:
+            with tarfile.open(fileobj=writer, mode='w|gz', compresslevel=6) as archive:
+                for relative, path in sorted(paths.items()):
+                    print('Packaging: ' + relative, flush=True)
+                    entry = archive.gettarinfo(str(path), arcname=relative)
+                    entry.uid = entry.gid = 0
+                    entry.uname = entry.gname = ''
+                    entry.mtime = 0
+                    entry.mode = 0o644
+                    with path.open('rb') as source:
+                        archive.addfile(entry, source)
+                    # Do not publish an image that changed during packaging.
+                    if sha256(path) != files[relative]['sha256']:
+                        raise RuntimeError('Firmware changed while packaging: ' + relative)
+        finally:
+            writer.close_part()
+        manifest['parts'] = writer.parts
     if delta_from:
         from incremental import write_delta
         deltas = []
@@ -679,12 +723,15 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
                 deltas.append(entry)
         if deltas:
             manifest['deltas'] = deltas
+    if delta_only:
+        validate_envelope(manifest)
     (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (directory / 'SHA256SUMS').write_text(''.join(
         f'{entry["sha256"]}  {entry["name"]}\n'
-        for entry in [*writer.parts, *(part for delta in manifest.get('deltas', []) for part in delta['parts'])])
+        for entry in [*manifest['parts'], *(part for delta in manifest.get('deltas', []) for part in delta['parts'])])
         + sha256(directory / 'manifest.json') + '  manifest.json\n')
-    print(json.dumps({'directory': str(directory), 'parts': writer.parts}, indent=2))
+    print(json.dumps({'directory': str(directory), 'parts': manifest['parts'],
+                      'deltas': manifest.get('deltas', [])}, indent=2))
     return manifest
 
 
@@ -696,9 +743,13 @@ def main():
     parser.add_argument('--part-mib', type=int, default=1536)
     parser.add_argument('--delta-from', type=Path, action='append', default=[],
                         help='Previous unpacked release manifest with the same base OTA; repeat for multiple versions')
+    parser.add_argument('--delta-only', action='store_true',
+                        help='Publish only patches against exactly one complete --delta-from release')
     parser.add_argument('--compat-cache-root', type=Path, action='append', default=[],
                         help='Verified producer cache for the complete common app recipe union')
     args = parser.parse_args()
+    if args.delta_only and len(args.delta_from) != 1:
+        parser.error('--delta-only requires exactly one full --delta-from source')
     root = ROOT
     if args.variant != 'os3' and 'HYPEROS_AVD_WORKSPACE' not in os.environ:
         root = REPO_ROOT / 'work' / args.variant
@@ -736,7 +787,8 @@ def main():
         raise RuntimeError('A release template already exists; choose a new revision.')
     paths['images/userdata.img'] = create_userdata(temporary)
     directory = args.output or REPO_ROOT / 'releases' / version
-    write_bundle(directory, version, metadata, paths, args.part_mib, delta_from=args.delta_from)
+    write_bundle(directory, version, metadata, paths, args.part_mib, delta_from=args.delta_from,
+                 delta_only=args.delta_only)
 
 
 if __name__ == '__main__':

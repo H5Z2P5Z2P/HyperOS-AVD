@@ -629,8 +629,15 @@ class IncrementalReleaseTests(unittest.TestCase):
         new, _ = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2', b'new')
         incremental.validate_sources(old, new)
         revised = copy.deepcopy(old)
-        revised['version'] = 'v1.0.0-a17-hyperos4-hongkong-r2'
+        revised['version'] = 'v1.0.0-a17-hyperos4-hongkong-r1.1'
         incremental.validate_sources(old, revised)
+        following = copy.deepcopy(revised)
+        following['version'] = 'v1.0.0-a17-hyperos4-hongkong-r1.2'
+        incremental.validate_sources(revised, following)
+        equivalent = copy.deepcopy(revised)
+        equivalent['version'] = 'v1.0.0-a17-hyperos4-hongkong-r1.1.0'
+        with self.assertRaisesRegex(RuntimeError, 'newer release'):
+            incremental.validate_sources(revised, equivalent)
         with self.assertRaisesRegex(RuntimeError, 'newer release'):
             incremental.validate_sources(revised, old)
         changes = [('build', 'archive_sha256', 'c' * 64), ('build', 'archive_sha256', ''),
@@ -717,6 +724,77 @@ class IncrementalReleaseTests(unittest.TestCase):
             self.assertEqual(digest((output / part['name']).read_bytes()), part['sha256'])
         self.assertEqual(checksums['manifest.json'], digest((output / 'manifest.json').read_bytes()))
         self.assertEqual(json.loads((output / 'manifest.json').read_text()), manifest)
+
+    def test_delta_only_bundle_embeds_full_base_without_creating_full_archive(self):
+        import bundle_runtime
+        import package_release
+        old, paths = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r6', b'unchanged image')
+        metadata = copy.deepcopy(old)
+        version = 'v1.0.0-a17-hyperos4-hongkong-r6.1'
+        replacement = self.root / 'fixed-manage.py'
+        replacement.write_bytes(b'# fixed installer runtime\n')
+        paths['runtime/scripts/manage.py'] = replacement
+        output = self.root / 'release'
+        original = copy.deepcopy(metadata)
+        with patch.object(package_release, 'sha256', wraps=package_release.sha256) as hashes:
+            manifest = package_release.write_bundle(output, version, metadata, paths,
+                part_mib=1, delta_from=[self.root / 'old/manifest.json'], delta_only=True)
+        self.assertEqual(metadata, original)
+        self.assertEqual(manifest['parts'], [])
+        self.assertEqual(manifest['distribution'], bundle_runtime.DELTA_DISTRIBUTION)
+        self.assertEqual(manifest['compatibility']['minimum_installer'], bundle_runtime.DELTA_MINIMUM)
+        self.assertEqual(manifest['base_release'], {
+            'manifest': old, 'manifest_sha256': bundle_runtime.manifest_digest(old)})
+        self.assertNotIn(self.root / 'old/images/system.img', [call.args[0] for call in hashes.call_args_list])
+        descriptor, = manifest['deltas']
+        assets = {part['name'] for part in descriptor['parts']}
+        self.assertEqual({path.name for path in output.iterdir()}, assets | {'manifest.json', 'SHA256SUMS'})
+        self.assertTrue(all('-from-' in name and '-delta.tar.gz.part' in name for name in assets))
+        archive = b''.join((output / part['name']).read_bytes() for part in descriptor['parts'])
+        with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as packed:
+            self.assertEqual(packed.getnames(), ['runtime/scripts/manage.py'])
+            result = io.BytesIO()
+            info = old['files']['runtime/scripts/manage.py']
+            incremental.apply_patch(self.root / 'old/runtime/scripts/manage.py',
+                packed.extractfile('runtime/scripts/manage.py'), result,
+                info['size'], len(replacement.read_bytes()))
+            self.assertEqual(result.getvalue(), replacement.read_bytes())
+        checksums = dict(line.split('  ', 1)[::-1]
+                         for line in (output / 'SHA256SUMS').read_text().splitlines())
+        self.assertEqual(set(checksums), assets | {'manifest.json'})
+        bundle_runtime.validate_envelope(manifest)
+        # The delta may exceed a tiny full archive. Delta-only distributions
+        # have no target full archive to fall back to or compare against.
+        self.assertGreater(sum(part['size'] for part in descriptor['parts']), 1)
+
+    def test_delta_only_requires_one_full_base_and_authenticates_reused_images(self):
+        import package_release
+        old, paths = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r6', b'accepted image')
+        version = 'v1.0.0-a17-hyperos4-hongkong-r6.1'
+        previous = self.root / 'old/manifest.json'
+        for sources in ([], [previous, previous]):
+            output = self.root / 'invalid-count'
+            with self.subTest(sources=sources), self.assertRaisesRegex(RuntimeError, 'exactly one'):
+                package_release.write_bundle(output, version, old, paths,
+                    delta_from=sources, delta_only=True)
+            self.assertFalse(output.exists())
+        released = self.root / 'first-release'
+        derived = package_release.write_bundle(released, version, old, paths,
+            delta_from=[previous], delta_only=True)
+        chained = self.root / 'chained-release'
+        with self.assertRaisesRegex(RuntimeError, 'full base release'):
+            package_release.write_bundle(chained, 'v1.0.0-a17-hyperos4-hongkong-r6.2',
+                derived, paths, delta_from=[released / 'manifest.json'], delta_only=True)
+        self.assertFalse(chained.exists())
+        # Even when inventory construction reuses an authenticated source entry,
+        # real archive generation checks all source bytes again.
+        paths['images/system.img'].write_bytes(b'tampered image')
+        output = self.root / 'tampered-release'
+        with self.assertRaisesRegex(RuntimeError, 'differs from its manifest'):
+            package_release.write_bundle(output, version, old, paths,
+                delta_from=[previous], delta_only=True)
+        self.assertFalse((output / 'manifest.json').exists())
+        self.assertEqual(list(output.iterdir()), [])
 
     def test_unhelpful_or_invalid_delta_cleans_only_created_assets(self):
         old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'old')

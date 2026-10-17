@@ -827,6 +827,100 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
                                  b'personal data remains untouched')
 
+    def delta_only_release(self, directory):
+        import bundle_runtime
+        root, path, manifest, release = self.incremental_release(directory)
+        base = json.loads((root / 'local/installed-release.json').read_text())
+        manifest.update(version=base['version'] + '.1', parts=[], distribution=bundle_runtime.DELTA_DISTRIBUTION,
+                        base_release={'manifest': base, 'manifest_sha256': bundle_runtime.manifest_digest(base)})
+        manifest['compatibility']['minimum_installer'] = bundle_runtime.DELTA_MINIMUM
+        path.write_text(json.dumps(manifest))
+        release['tag_name'] = manifest['version']
+        release['asset_map']['manifest.json'].update(size=path.stat().st_size, digest='sha256:' + common.sha256(path))
+        base_assets = [{'name': candidate.name, 'size': candidate.stat().st_size,
+                        'digest': 'sha256:' + common.sha256(candidate), 'browser_download_url': candidate.as_uri()}
+                       for candidate in (directory / 'old').iterdir()]
+        return root, path, manifest, release, {'tag_name': base['version'], 'assets': base_assets}
+
+    def test_delta_only_online_fresh_downloads_pinned_base_while_existing_users_only_download_patch(self):
+        import bundle_runtime
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                existing, _, manifest, release, base_release = self.delta_only_release(folder)
+                root = folder / 'fresh' if fresh else existing
+                with patch('sys.stdout', new_callable=io.StringIO), \
+                        patch.object(manage, 'remote_json', return_value=base_release) as remote, \
+                        patch.object(manage, 'download', wraps=manage.download) as transfer:
+                    manage.fetch_release(release, folder / 'cache', root=root)
+                bundle_runtime.verify_staged(root / 'versions' / manifest['version'], manifest)
+                base = manifest['base_release']['manifest']
+                bundle_runtime.verify_staged(root / 'versions' / base['version'], base)
+                downloaded = [call.args[1].name for call in transfer.call_args_list]
+                if fresh:
+                    remote.assert_called_once()
+                    self.assertIn(base['parts'][0]['name'], downloaded)
+                    self.assertFalse((root / 'local/installed-release.json').exists())
+                    self.assertFalse((root / 'avd').exists())
+                else:
+                    remote.assert_not_called()
+                    self.assertEqual(downloaded, ['manifest.json', manifest['deltas'][0]['parts'][0]['name']])
+                    self.assertEqual(json.loads((root / 'local/installed-release.json').read_text()), base)
+
+    def test_delta_only_rejects_changed_remote_base_before_downloading_its_full_parts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            _, _, manifest, release, base_release = self.delta_only_release(folder)
+            path = folder / 'old/manifest.json'
+            changed = json.loads(path.read_text()); changed['kernelsu'] = 'unexpected'
+            path.write_text(json.dumps(changed))
+            for asset in base_release['assets']:
+                if asset['name'] == 'manifest.json':
+                    asset.update(size=path.stat().st_size, digest='sha256:' + common.sha256(path))
+            with patch.object(manage, 'remote_json', return_value=base_release), \
+                    patch.object(manage, 'download', wraps=manage.download) as transfer, \
+                    patch('sys.stdout', new_callable=io.StringIO), \
+                    self.assertRaisesRegex(RuntimeError, 'differs from the patch dependency'):
+                manage.fetch_release(release, folder / 'cache', root=folder / 'fresh')
+            self.assertTrue(all(call.args[1].name == 'manifest.json' for call in transfer.call_args_list))
+
+    def test_delta_only_offline_requires_base_then_reaches_verified_runtime(self):
+        import bundle_runtime
+        from test_bundle_runtime import BundleRuntimeTests
+        for available in (False, True):
+            with self.subTest(available=available), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                _, path, manifest, _, _ = self.delta_only_release(folder)
+                root = folder / 'fresh'
+                base = manifest['base_release']['manifest']
+                if available:
+                    (folder / 'old').rename(folder / base['version'])
+                with patch('sys.stdout', new_callable=io.StringIO):
+                    if available:
+                        BundleRuntimeTests().install(root, path)
+                        bundle_runtime.verify_staged(root / 'versions' / manifest['version'], manifest)
+                        self.assertEqual((root / 'executed').read_text(), 'verified bundle entrypoint')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'requires the full base bundle'):
+                            BundleRuntimeTests().install(root, path)
+                        self.assertFalse((root / 'executed').exists())
+                        self.assertFalse((root / 'versions' / manifest['version']).exists())
+
+    def test_patch_revision_catalog_and_upgrade_order(self):
+        self.assertEqual(manage.release_variant({'tag_name': 'pad-v0.1.2-a17-hyperos4-yingtian-r3.1'}), 'os4-pad')
+        rows = [{'tag_name': 'v0.2.5-a17-hyperos4-hongkong-r' + revision,
+                 'published_at': published, 'assets': [{'name': 'manifest.json'}]}
+                for revision, published in (('6', '2026-10-19'), ('6.1', '2026-10-17'), ('6.2', '2026-10-18'))]
+        with patch.object(manage, 'release_rows', return_value=rows):
+            self.assertEqual([item['tag_name'].rsplit('-r', 1)[1] for item in manage.catalog()], ['6.2', '6.1', '6'])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            _, _, manifest, _, _ = self.delta_only_release(folder)
+            base = manifest['base_release']['manifest']
+            manage.compatible(base, manifest, firmware_specific=False)
+            with self.assertRaisesRegex(RuntimeError, 'downgrades'):
+                manage.compatible(manifest, base, firmware_specific=False)
+
     def test_automatic_port_preserves_stopped_instances(self):
         entries = [{'runtime': {'port': 5580}}, {'runtime': {'port': 5582}}]
         with patch.object(manage, 'instances', return_value=entries), patch.object(manage, 'port_free') as available:

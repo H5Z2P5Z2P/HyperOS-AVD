@@ -27,7 +27,7 @@ import setup
 from https_transport import secure_urlopen
 from common import REPO_ROOT, avd_home, host_check, port_free, sdk_path, sha256
 
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 MODULE_UPGRADE_PREFLIGHT = 'phone-owned-module-guards-v1'
 FORWARD_UPGRADE_POLICY = 'same-family-forward-v1'
 REPOSITORY = 'NEORUAA/HyperOS-AVD'
@@ -105,7 +105,7 @@ def release_variant(release):
     tag = release.get('tag_name', '').lower()
     if tag in ('v0.1.0', 'v0.1.0-a16-hyperos3-fuxi-r1') or re.fullmatch(r'v\d+\.\d+\.\d+-a\d+-hyperos3-.+', tag):
         return 'os3'
-    if re.fullmatch(r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+', tag):
+    if re.fullmatch(r'pad-v\d+\.\d+\.\d+-a17-hyperos4-yingtian-r\d+(?:\.\d+)*', tag):
         return 'os4-pad'
     # Unpublished shared-version Pad tags must not appear as phone images.
     if re.fullmatch(r'v\d+\.\d+\.\d+-a\d+-hyperos4-yingtian-.+', tag):
@@ -118,6 +118,14 @@ def release_variant(release):
 def version_key(tag):
     match = re.match(r'(?:pad-)?v?(\d+)\.(\d+)\.(\d+)', tag)
     return tuple(map(int, match.groups())) if match else (0, 0, 0)
+
+
+def release_order(version):
+    revision = re.search(r'(?:-|_)r(\d+(?:\.\d+)*)$', version)
+    parts = tuple(map(int, revision.group(1).split('.'))) if revision else (0,)
+    while len(parts) > 1 and parts[-1] == 0:
+        parts = parts[:-1]
+    return version_key(version), parts
 
 
 def request(url):
@@ -152,7 +160,7 @@ def catalog(variant='all', stable_only=False):
         assets = {item['name']: item for item in release.get('assets', [])}
         if 'manifest.json' in assets:
             found.append({**release, 'asset_map': assets})
-    return sorted(found, key=lambda item: (version_key(item['tag_name']), item.get('published_at', '')), reverse=True)
+    return sorted(found, key=lambda item: (release_order(item['tag_name']), item.get('published_at', '')), reverse=True)
 
 
 def installer_catalog():
@@ -219,7 +227,46 @@ def download(url, target, size, checksum):
     return target
 
 
-def fetch_release(release, cache, root=None):
+def local_base_bundle(manifest_path, base):
+    """Find an offline full dependency beside or inside the patch directory."""
+    from bundle_runtime import manifest_digest, regular
+    parent = Path(manifest_path).resolve().parent
+    for directory in (parent / base['version'], parent.parent / base['version']):
+        path = directory / 'manifest.json'
+        try:
+            regular(path, directory)
+            if path.stat().st_size <= 2 * 1024**2 and manifest_digest(json.loads(path.read_text())) == manifest_digest(base):
+                return path
+        except (OSError, RuntimeError, ValueError, TypeError):
+            continue
+    return None
+
+
+def prepare_delta_base(root, manifest_path, manifest, *, cache=None):
+    """Cache a full dependency without installing it or touching active data."""
+    from bundle_runtime import delta_base
+    from delta_install import stage_base
+    base = delta_base(manifest)
+    if base is None:
+        return
+    target = root / 'versions' / base['version']
+    path = local_base_bundle(manifest_path, base)
+    if not target.exists() and path is None:
+        if cache is None:
+            raise RuntimeError('This delta-only release requires the full base bundle ' + base['version']
+                               + '. Place its release folder beside the patch folder, or install online.')
+        say('先下载所需的完整包：' + base['version'], 'Downloading the required full base: ' + base['version'])
+        release = remote_json('https://api.github.com/repos/' + REPOSITORY + '/releases/tags/'
+                              + urllib.parse.quote(base['version'], safe=''))
+        if release.get('draft') or release.get('tag_name') != base['version']:
+            raise RuntimeError('The required complete base release is unavailable.')
+        release['asset_map'] = {item['name']: item for item in release.get('assets', [])}
+        path = fetch_release(release, cache, expected_manifest=base)
+    with lock(root):
+        stage_base(root, path or manifest_path, base)
+
+
+def fetch_release(release, cache, root=None, *, expected_manifest=None):
     assets = release['asset_map']
     cache = Path(cache) / release['tag_name']
     cache.mkdir(parents=True, exist_ok=True)
@@ -243,6 +290,10 @@ def fetch_release(release, cache, root=None):
         # OS3 r1 used v0.1.0 as its bundle version; only that known legacy mapping is accepted.
         if (manifest['version'], release['tag_name']) != ('v0.1.0', 'v0.1.0-a16-hyperos3-fuxi-r1'):
             raise RuntimeError('Manifest does not match the selected release.')
+    if expected_manifest is not None:
+        from bundle_runtime import manifest_digest
+        if manifest_digest(manifest) != manifest_digest(expected_manifest):
+            raise RuntimeError('The downloaded base manifest differs from the patch dependency.')
     minimum = manifest.get('compatibility', {}).get('minimum_installer', '0.2.1')
     if version_key(minimum) > version_key(VERSION):
         raise RuntimeError('This release needs a newer installer; download the latest stable Installer Release.')
@@ -254,6 +305,10 @@ def fetch_release(release, cache, root=None):
                 raise RuntimeError('Release is missing a matching archive part.')
             download(asset['browser_download_url'], cache / part['name'], part['size'], part['sha256'])
 
+    from bundle_runtime import delta_base
+    base = delta_base(manifest)
+    if base is not None and root is None:
+        raise RuntimeError('A delta-only release requires an instance root to reconstruct its complete base.')
     if root is not None:
         from bundle_runtime import has_protocol, verify_staged
         from delta_install import select_delta, stage_delta
@@ -263,6 +318,25 @@ def fetch_release(release, cache, root=None):
             if (target / 'local/installed-release.json').is_file():
                 verify_staged(target, manifest)
                 say('目标版本已在本地，直接使用。', 'Using the verified local target version.')
+                return manifest_path
+            if base is not None:
+                prepare_delta_base(root, manifest_path, manifest, cache=cache.parent)
+                selection = select_delta(root, manifest)
+                if selection is None:
+                    raise RuntimeError('The complete base could not be prepared for this delta-only release.')
+                descriptor, source, old = selection
+                size = sum(part['size'] for part in descriptor['parts'])
+                say(f'仅增量修复：{size / 1024**2:.1f} MiB', f'Delta-only repair: {size / 1024**2:.1f} MiB')
+                fetch_parts(descriptor['parts'])
+                with lock(root):
+                    current = select_delta(root, manifest)
+                    if current != selection:
+                        raise RuntimeError('Incremental base changed during download.')
+                    if target.exists():
+                        verify_staged(target, manifest)
+                    else:
+                        stage_delta(root, target, manifest_path, manifest, descriptor, source, old)
+                say('增量还原与校验完成。', 'Incremental reconstruction and verification complete.')
                 return manifest_path
             selection = select_delta(root, manifest)
             if selection is not None:
@@ -588,9 +662,6 @@ def compatible(old, new, *, firmware_specific=True):
         after = new.get('files', {}).get(field, {}).get('sha256')
         if not before or before != after:
             raise RuntimeError('Encryption template changed; automatic data migration is unsafe.')
-    def release_order(version):
-        revision = re.search(r'(?:-|_)r(\d+)$', version)
-        return version_key(version), int(revision.group(1)) if revision else 0
     if release_order(new['version']) < release_order(old['version']):
         raise RuntimeError('Data-preserving downgrades are not supported. Use a separate AVD.')
     migration = new.get('compatibility', {}).get('module_upgrade_preflight')
@@ -1241,6 +1312,19 @@ def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options,
             if target.exists():
                 raise RuntimeError('An incomplete version directory exists; inspect it before retrying: ' + str(target))
             from delta_install import select_delta, stage_delta
+            from bundle_runtime import delta_base
+            delta_only = delta_base(manifest) is not None
+            if delta_only:
+                # Already holding the instance lock; stage_base never activates
+                # a dependency or obtains the lock recursively.
+                from delta_install import stage_base
+                base = delta_base(manifest)
+                base_target = root / 'versions' / base['version']
+                base_path = local_base_bundle(manifest_path, base)
+                if not base_target.exists() and base_path is None:
+                    raise RuntimeError('This delta-only release requires the full base bundle ' + base['version']
+                                       + '. Place its release folder beside the patch folder, or install online.')
+                stage_base(root, base_path or manifest_path, base)
             selection = select_delta(root, manifest)
             if selection is not None and all((manifest_path.parent / part['name']).is_file()
                                              for part in selection[0]['parts']):
@@ -1248,11 +1332,15 @@ def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options,
                 try:
                     stage_delta(root, target, manifest_path, manifest, descriptor, source, old)
                 except (OSError, RuntimeError, ValueError, EOFError, tarfile.TarError, http.client.HTTPException):
+                    if delta_only:
+                        raise
                     if not all((manifest_path.parent / part['name']).is_file() for part in manifest['parts']):
                         raise RuntimeError('Incremental bundle verification failed. Retry the online upgrade '
                                            'or provide the full bundle; the installed version was preserved.') from None
                     say('增量校验失败，使用本地完整包。', 'Incremental verification failed; using the local full bundle.')
             if not target.exists():
+                if delta_only:
+                    raise RuntimeError('Missing incremental archive parts; download the complete patch release.')
                 total = sum(item['size'] for item in manifest['files'].values())
                 if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
                     raise RuntimeError('Insufficient free storage for staging and archive validation.')
@@ -1622,7 +1710,12 @@ def main():
         else:
             idle(root, args.name, port)
             rows = catalog(args.variant)
-            choices = rows if args.release == 'latest' else [r for r in rows if r['tag_name'] == args.release or version_key(r['tag_name']) == version_key(args.release)]
+            if args.release == 'latest':
+                choices = rows
+            elif release_variant({'tag_name': args.release}) is not None:
+                choices = [r for r in rows if r['tag_name'] == args.release]
+            else:
+                choices = [r for r in rows if version_key(r['tag_name']) == version_key(args.release)]
             if not choices:
                 raise RuntimeError('Requested release is not published.')
             path = fetch_release(choices[0], HOME / 'downloads', root=root)

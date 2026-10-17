@@ -84,3 +84,29 @@ an intact portable release, never a personal AVD image. Full parts are always
 retained. A generated delta is advertised only when it is smaller than the full
 archive. Archive SHA-256 entries and delta descriptors are finalized before the
 target manifest and `SHA256SUMS` are written. Packaging does not publish assets.
+
+## Delta-only repair releases
+
+Installer 1.3.1 supports `distribution: delta-only-v1`. These releases contain
+no full target archive: `parts` is empty and `deltas` contains one patch from
+a full release. `base_release` embeds the exact full base `manifest` and its
+canonical `manifest_sha256`. A base cannot itself be delta-only. The target
+keeps a complete file inventory and sets `minimum_installer` to at least 1.3.1.
+Full releases retain the original 1.2.3 protocol baseline.
+
+An existing intact base under `versions/<base-version>` is reused. Otherwise
+the installer downloads that exact full release from the configured GitHub
+repository, checks its manifest against the embedded dependency before any
+large transfer, and stages its files without activating it or creating guest
+userdata. It then applies and validates the repair patch before the usual
+installation transaction. Failures preserve the active release and resumable
+downloads. Delta-only transport has no nonexistent full-target fallback.
+
+Offline installations accept a complete base release folder beside the patch
+folder, named by its release tag, or a previously verified base cache. Revisions
+may have dotted components such as `r6.1`; ordering treats them as numeric
+components, so `r6 < r6.1 < r6.2 < r7` and downgrade protection remains active.
+
+Use `--delta-only --delta-from /path/to/full-base/manifest.json` during image
+packaging. This mode writes only patch parts, the manifest, and checksums. It
+never creates a full target archive as an intermediate artifact.

@@ -48,18 +48,20 @@ Installer 打包前核对 `scripts/manage.py` 与生成的 `installer.json` 版�
 
 ### 后续同底包更新的增量包
 
-Phone 和 Pad 后续发布适配修复时，如果官方底包没有变化，应在完整包之外生成对应旧版本的增量包。打包命令添加 `--delta-from`，指向旧版实例中完整保留的发行文件清单，支持重复指定多个版本：
+Phone 和 Pad 后续发布小修复时，如果官方底包没有变化，采用仅增量修复版，例如 Phone r6.1、Pad r3.1。保留它依赖的已发布完整包，新的 Release 只上传增量分卷、`manifest.json` 与 `SHA256SUMS`。安装器 1.3.1 会为新用户自动下载所需完整包，已有用户复用本地素材。
+
+打包命令添加 `--delta-only --delta-from`，指向完整基包的发行文件清单。仅增量版只允许依赖一个完整包，不依赖另一个仅增量版本：
 
 ```sh
 HYPEROS_AVD_WORKSPACE=/path/to/accepted-build \
   python3 scripts/package_release.py --variant os4-official \
   --version <new-tag> --output /path/to/new-release \
-  --delta-from /path/to/instance/versions/<old-tag>/local/installed-release.json
+  --delta-only --delta-from /path/to/instance/versions/<full-base-tag>/local/installed-release.json
 ```
 
-打包器核对官方 OTA 的 SHA-256、机型、固件版本及加密模板，只为同底包生成差分。旧版本必须已经解包，并保留清单列出的发行文件。增量包不小于完整包时会自动省略。更换官方底包时不添加该参数，按完整包流程发布。
+打包器核对官方 OTA 的 SHA-256、机型、固件版本及加密模板，只为同底包生成差分。完整基包必须已经解包，并保留清单列出的发行文件。仅增量模式直接生成差分，不会先创建数 GiB 的完整目标包。更换官方底包时不添加这两个参数，按完整包流程发布。
 
-上传附件时同时包含输出目录中的完整分卷、全部增量分卷、`manifest.json` 和 `SHA256SUMS`。Installer 1.3.0 及更新版本自动选用匹配的增量包，旧安装器继续下载完整包。增量更新不改变运行包协议，`minimum_installer` 仍沿用 **1.2.3** 基线。协议细节见 [安装器协议](installer-protocol.md#optional-incremental-transport)。
+仅增量修复版的 `minimum_installer` 为 **1.3.1**，发行清单记录完整基包的原始清单和摘要。上传时保留基包 Release 的全部附件。若需要兼容旧安装器，仍可省略 `--delta-only`，同时分发完整目标包与增量包，这种模式保留 **1.2.3** 的安装基线。协议细节见 [安装器协议](installer-protocol.md#delta-only-repair-releases)。
 
 ## 附件和清单
 
