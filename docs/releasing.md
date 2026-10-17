@@ -65,6 +65,16 @@ HYPEROS_AVD_WORKSPACE=/path/to/accepted-build \
 
 ## 附件和清单
 
+仅增量修复批次使用以下命名。先发布 Installer 1.3.1 并设为 Latest，再发布两端修复版并设置 `--latest=false`。Phone r6、Pad r3 的完整包附件继续保留，供首次安装自动下载。
+
+| 内容 | 输出目录 | 上传内容 |
+| --- | --- | --- |
+| Installer 1.3.1 | `releases/installer-v1.3.1/` | Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS` |
+| Phone r6.1 | `releases/v0.2.5-a17-hyperos4-hongkong-r6.1/` | 全部增量分卷、`manifest.json`、`SHA256SUMS` |
+| Pad r3.1 | `releases/pad-v0.1.2-a17-hyperos4-yingtian-r3.1/` | 全部增量分卷、`manifest.json`、`SHA256SUMS` |
+
+发布说明分别使用 `docs/releases/installer-v1.3.1.md`、`docs/releases/os4-r6.1.md` 与 `docs/releases/os4-pad-r3.1.md`。以下保留原完整包批次的命名示例。
+
 | Release | 输出目录 | 上传内容 |
 | --- | --- | --- |
 | Installer 1.2.3 | `releases/installer-v1.2.3/` | Installer ZIP、`install.sh`、`installer.json`、`SHA256SUMS` |

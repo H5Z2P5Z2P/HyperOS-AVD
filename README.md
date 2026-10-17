@@ -18,6 +18,8 @@ Pad 采用独立的 `pad-v*` 版本号，手机与 OS3 沿用 `v*` 版本号。�
 
 Phone r6 与 Pad r3 均搭载 **Core 18 / Apps 7** 自适应 KernelSU 模块与离线状态页。运行包采用 format 3 协议，只需使用 [Installer 1.2.3](docs/releases/installer-v1.2.3.md) 或更高版本即可安装（后续镜像只要协议保持兼容，无需重复升级安装器）。虚拟机的 CPU、内存与存储空间均可自由调整（平板默认的 4 GiB 内存仅为推荐起步配置，并非上限）。
 
+小修复采用仅增量版本：[Phone r6.1](docs/releases/os4-r6.1.md) / [Pad r3.1](docs/releases/os4-pad-r3.1.md) 更新至 **Core 19 / Apps 8**，需要 [Installer 1.3.1](docs/releases/installer-v1.3.1.md)。已有用户只需下载修复包，新用户直接选择修复版，安装器会自动下载它依赖的完整包并完成安装。
+
 完整的发布附件校验与运行验证记录请参考 [Phone r6 / Pad r3 验证报告](docs/releases/os4-r6-pad-r3-validation.md)。
 
 ## Pad OS4 截图
