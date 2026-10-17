@@ -18,6 +18,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import bundle_runtime as protocol
 import common
+import delta_install
+import incremental
 import manage
 import setup
 
@@ -80,6 +82,201 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
         path = directory / 'manifest.json'
         path.write_text(json.dumps(manifest))
         return path, manifest
+
+    def delta_bundle(self, directory):
+        """Keep immutable source bytes separate from mutable instance images."""
+        path, manifest = self.bundle(directory / 'bundle')
+        manifest['build']['archive_sha256'] = 'a' * 64
+        with tarfile.open(path.parent / manifest['parts'][0]['name']) as archive:
+            payloads = {item.name: archive.extractfile(item).read() for item in archive}
+        payloads['tools/new.txt'] = b'new release helper'
+        manifest['files']['tools/new.txt'] = {'size': len(payloads['tools/new.txt']),
+            'sha256': hashlib.sha256(payloads['tools/new.txt']).hexdigest()}
+        archive_path = path.parent / manifest['parts'][0]['name']
+        with tarfile.open(archive_path, 'w:gz') as archive:
+            for name, data in payloads.items():
+                item = tarfile.TarInfo(name); item.size = len(data)
+                archive.addfile(item, io.BytesIO(data))
+        manifest['parts'][0].update(size=archive_path.stat().st_size, sha256=common.sha256(archive_path))
+        old = copy.deepcopy(manifest)
+        old['version'] = 'v8.0.0-a17-hyperos4-hongkong-r998'
+        old_payloads = dict(payloads)
+        old_payloads['images/system.img'] = b'old immutable firmware'
+        old_payloads['tools/obsolete.txt'] = b'removed release helper'
+        old_payloads.pop('tools/new.txt')
+        old['files'] = {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                        for name, data in old_payloads.items()}
+        root = (directory / 'instance').resolve(); source = root / 'versions' / old['version']
+        for name, data in old_payloads.items():
+            current = source / name; current.parent.mkdir(parents=True, exist_ok=True)
+            current.write_bytes(data)
+        for base in (root, source):
+            (base / 'local').mkdir(exist_ok=True)
+            (base / 'local/installed-release.json').write_text(json.dumps(old))
+            (base / 'local/build.json').write_text(json.dumps(old['build']))
+        (root / 'images').mkdir(); (root / 'images/system.img').write_bytes(b'mutable instance firmware')
+        (root / 'avd').mkdir(); (root / 'avd/userdata-qemu.img').write_bytes(b'personal userdata')
+        patches = {}
+        for name, data in payloads.items():
+            if old['files'].get(name) == manifest['files'][name]:
+                continue
+            target = directory / 'target-files' / name
+            target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
+            stream = io.BytesIO()
+            incremental.write_patch(source / name if name in old['files'] else None, target, stream)
+            patches[name] = stream.getvalue()
+        delta_path = path.parent / 'delta.part001'
+        self.write_delta_archive(delta_path, patches.items())
+        descriptor = {'protocol': incremental.PROTOCOL, 'from_version': old['version'],
+            'from_manifest_sha256': protocol.manifest_digest(old), 'parts': [
+                {'name': delta_path.name, 'size': delta_path.stat().st_size, 'sha256': common.sha256(delta_path)}]}
+        manifest['deltas'] = [descriptor]
+        path.write_text(json.dumps(manifest))
+        return root, path, manifest, descriptor, source, old, patches
+
+    def write_delta_archive(self, path, members):
+        with tarfile.open(path, 'w:gz', format=tarfile.USTAR_FORMAT) as archive:
+            for name, data in members:
+                item = tarfile.TarInfo(name); item.size = len(data)
+                archive.addfile(item, io.BytesIO(data))
+
+    def refresh_delta_part(self, path, manifest, descriptor):
+        part = path.parent / descriptor['parts'][0]['name']
+        descriptor['parts'][0].update(size=part.stat().st_size, sha256=common.sha256(part))
+        path.write_text(json.dumps(manifest))
+
+    def test_delta_stages_exact_target_with_new_removed_and_unchanged_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+            compressed = (path.parent / descriptor['parts'][0]['name']).read_bytes()
+            descriptor['parts'] = []
+            split = len(compressed) // 2
+            for index, data in enumerate((compressed[:split], compressed[split:]), 1):
+                part = path.parent / ('delta.part%03d' % index); part.write_bytes(data)
+                descriptor['parts'].append({'name': part.name, 'size': len(data), 'sha256': common.sha256(part)})
+            path.write_text(json.dumps(manifest))
+            selected = delta_install.select_delta(root, manifest)
+            self.assertEqual(selected, (descriptor, source, old))
+            target = root / 'versions' / manifest['version']
+            delta_install.stage_delta(root, target, path, manifest, *selected)
+            protocol.verify_staged(target, manifest)
+            self.assertEqual((target / 'images/system.img').read_bytes(), b'new')
+            self.assertEqual((target / 'tools/new.txt').read_bytes(), b'new release helper')
+            self.assertFalse((target / 'tools/obsolete.txt').exists())
+            self.assertEqual(json.loads((target / 'local/build.json').read_text()), manifest['build'])
+            self.assertEqual((source / 'images/system.img').read_bytes(), b'old immutable firmware')
+            self.assertEqual((root / 'images/system.img').read_bytes(), b'mutable instance firmware')
+            self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+            self.assertFalse(list((root / 'versions').glob('.delta-*')))
+
+    def test_delta_selection_falls_back_for_unusable_or_non_saving_source(self):
+        for case in ('changed-bytes', 'unchanged-bytes', 'missing-version', 'source-manifest',
+                     'source-symlink', 'source-hardlink', 'different-base', 'non-saving', 'future-protocol'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+                if case == 'changed-bytes':
+                    (source / 'images/system.img').write_bytes(b'corrupt patch base')
+                elif case == 'unchanged-bytes':
+                    (source / 'images/encryptionkey.img').write_bytes(b'corrupt copied file')
+                elif case == 'missing-version':
+                    (source / 'local/installed-release.json').unlink()
+                elif case == 'source-manifest':
+                    (source / 'local/installed-release.json').write_text('{}')
+                elif case == 'source-symlink':
+                    current = source / 'images/system.img'; current.unlink()
+                    current.symlink_to(root / 'images/system.img')
+                elif case == 'source-hardlink':
+                    os.link(source / 'images/system.img', root / 'aliased.img')
+                elif case == 'different-base':
+                    manifest['build']['archive_sha256'] = 'b' * 64
+                elif case == 'non-saving':
+                    descriptor['parts'][0]['size'] = manifest['parts'][0]['size']
+                else:
+                    descriptor['protocol'] = 'future-delta-v2'
+                self.assertIsNone(delta_install.select_delta(root, manifest))
+                self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+                self.assertFalse((root / 'versions' / manifest['version']).exists())
+                self.assertFalse(list((root / 'versions').glob('.delta-*')))
+
+    def test_delta_descriptor_rejects_ambiguous_parts_and_types(self):
+        for case in ('extra', 'path', 'full-collision', 'duplicate', 'bool-size', 'hash'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+                if case == 'extra':
+                    descriptor['unrecognized'] = True
+                elif case == 'path':
+                    descriptor['parts'][0]['name'] = '../delta.part001'
+                elif case == 'full-collision':
+                    descriptor['parts'][0]['name'] = manifest['parts'][0]['name']
+                elif case == 'duplicate':
+                    descriptor['parts'].append(copy.deepcopy(descriptor['parts'][0]))
+                elif case == 'bool-size':
+                    descriptor['parts'][0]['size'] = True
+                else:
+                    descriptor['from_manifest_sha256'] = 'invalid'
+                with self.assertRaises(RuntimeError):
+                    delta_install.validate_descriptor(descriptor, manifest)
+
+    def test_delta_archive_rejections_leave_source_userdata_and_target_untouched(self):
+        for case in ('duplicate', 'traversal', 'alias', 'symlink', 'hardlink', 'pax', 'directory', 'missing',
+                     'unlisted', 'oversized', 'invalid-patch', 'part-checksum'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+                part = path.parent / descriptor['parts'][0]['name']
+                members = list(patches.items())
+                if case == 'duplicate':
+                    members.append(members[0])
+                elif case == 'traversal':
+                    members[0] = ('images/../outside.img', members[0][1])
+                elif case == 'alias':
+                    members[0] = ('images//system.img', members[0][1])
+                elif case == 'missing':
+                    members.pop()
+                elif case == 'unlisted':
+                    members.append(('tools/unlisted.txt', b'unlisted'))
+                elif case == 'oversized':
+                    members[0] = (members[0][0], b'x' * (incremental.patch_limit(3) + 1))
+                elif case == 'invalid-patch':
+                    members[0] = (members[0][0], b'corrupt')
+                if case in ('symlink', 'hardlink', 'pax', 'directory'):
+                    with tarfile.open(part, 'w:gz') as archive:
+                        item = tarfile.TarInfo(members[0][0]); item.linkname = 'outside'
+                        item.type = {'symlink': tarfile.SYMTYPE, 'hardlink': tarfile.LNKTYPE,
+                                     'pax': tarfile.XHDTYPE, 'directory': tarfile.DIRTYPE}[case]
+                        archive.addfile(item)
+                else:
+                    self.write_delta_archive(part, members)
+                if case == 'part-checksum':
+                    part.write_bytes(part.read_bytes() + b'corrupt')
+                else:
+                    self.refresh_delta_part(path, manifest, descriptor)
+                selected = delta_install.select_delta(root, manifest)
+                self.assertIsNotNone(selected)
+                target = root / 'versions' / manifest['version']
+                with self.assertRaises(RuntimeError):
+                    delta_install.stage_delta(root, target, path, manifest, *selected)
+                self.assertFalse(target.exists())
+                self.assertFalse((root / 'outside.img').exists())
+                self.assertEqual((source / 'images/system.img').read_bytes(), b'old immutable firmware')
+                self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+                self.assertFalse(list((root / 'versions').glob('.delta-*')))
+
+    def test_delta_rechecks_source_and_available_disk_before_staging(self):
+        for case in ('source-changed', 'low-disk'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+                selected = delta_install.select_delta(root, manifest)
+                target = root / 'versions' / manifest['version']
+                if case == 'source-changed':
+                    (source / 'images/system.img').write_bytes(b'changed after selection')
+                    with self.assertRaises(RuntimeError):
+                        delta_install.stage_delta(root, target, path, manifest, *selected)
+                else:
+                    with patch.object(delta_install.shutil, 'disk_usage', return_value=type('Disk', (), {'free': 0})()), \
+                            self.assertRaisesRegex(RuntimeError, 'free disk space'):
+                        delta_install.stage_delta(root, target, path, manifest, *selected)
+                self.assertFalse(target.exists())
+                self.assertFalse(list((root / 'versions').glob('.delta-*')))
 
     def install(self, root, path):
         with patch('userdata_resize.check_dependencies'), patch.object(manage, 'idle'), \

@@ -1,11 +1,15 @@
 """Prepare phone releases from accepted packed images without source caches."""
 from contextlib import ExitStack
+import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import struct
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +20,7 @@ import patch_flutter
 import patch_boot_services
 import phone_profile
 import prepare_release_image as prepare
+import incremental
 
 
 def digest(data):
@@ -521,6 +526,214 @@ class ReleaseKernelSUPreparationTests(unittest.TestCase):
         self.assertTrue((self.output / 'logs').is_symlink())
         self.producer.assert_not_called()
         self.boot.assert_not_called()
+
+
+class IncrementalReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def bundle(self, root, version, system):
+        import bundle_runtime
+        payloads = {name: name.encode() for name in (
+            'config/avd.ini', 'images/encryptionkey.img', bundle_runtime.ENTRYPOINT,
+            'runtime/scripts/manage.py', 'runtime/scripts/setup.py', 'runtime/scripts/common.py',
+            'tools/os4-core/context.json', 'tools/os4-core/receipt.json',
+            'tools/os4-app-compat/app-compat.zip', 'tools/os4-app-compat/receipt.json')}
+        payloads['images/system.img'] = system
+        paths = {}
+        for name, data in payloads.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            paths[name] = path
+        manifest = {'project': 'HyperOS-AVD', 'format': 3, 'platform': 'macos-arm64',
+            'version': version, 'variant': 'os4-official', 'source': 'official-hongkong-ota',
+            'source_device': 'hongkong', 'android_api': 37, 'hyperos': '4.0.24.0.XFRCNXM',
+            'build': {'source': 'official-hongkong-ota', 'android_api': 37,
+                'hyperos': '4.0.24.0.XFRCNXM', 'adb_authentication': True,
+                'archive_sha256': 'a' * 64, 'kernel_page_size': 4096,
+                'hardware_base_api': 36, 'kernel_kmi': 'android15-6.6'},
+            'compatibility': {'install_protocol': bundle_runtime.INSTALL_PROTOCOL,
+                'minimum_installer': bundle_runtime.PROTOCOL_MINIMUM,
+                'userdata_family': 'os4-hongkong-api37-ranchu-4k', 'runtime_in_bundle': True},
+            'files': {name: {'size': len(data), 'sha256': digest(data)}
+                      for name, data in payloads.items()},
+            'parts': [{'name': 'full.tar.gz.part001', 'size': 2 * 1024**2, 'sha256': 'b' * 64}]}
+        (root / 'manifest.json').write_text(json.dumps(manifest))
+        return manifest, paths
+
+    def test_block_codec_reuses_moved_ranges_and_handles_file_sizes(self):
+        block = incremental.BLOCK
+        original = os.urandom(block * 4)
+        source, target = self.root / 'source', self.root / 'target'
+        source.write_bytes(original)
+        cases = [(source, b'new-prefix'.ljust(block, b'!') + original + b'new tail'),
+                 (source, original[:block]), (source, b''), (None, b'new file'),
+                 (None, b'')]
+        for previous, content in cases:
+            with self.subTest(size=len(content), source=previous is not None):
+                target.write_bytes(content)
+                patch_data = io.BytesIO()
+                incremental.write_patch(previous, target, patch_data)
+                self.assertLessEqual(len(patch_data.getvalue()), incremental.patch_limit(len(content)))
+                restored = io.BytesIO()
+                incremental.apply_patch(previous, io.BytesIO(patch_data.getvalue()), restored,
+                    len(original) if previous else 0, len(content))
+                self.assertEqual(restored.getvalue(), content)
+                if len(content) > len(original):
+                    self.assertLess(len(patch_data.getvalue()), block + 256)
+                    self.assertIn(b'C' + struct.pack('<QQ', 0, len(original)), patch_data.getvalue())
+        # Model a large image's sparse source index while shifting EROFS data by
+        # one 4 KiB page. The first indexed source anchor is absent from target.
+        original = os.urandom(1024**2)
+        source.write_bytes(original)
+        content = b'new-prefix'.ljust(8192, b'!') + original[4096:]
+        target.write_bytes(content)
+        patch_data = io.BytesIO()
+        with patch.object(incremental, 'MAX_INDEX_BLOCKS', 16):
+            incremental.write_patch(source, target, patch_data)
+        self.assertLess(len(patch_data.getvalue()), 128 * 1024)
+        self.assertIn(b'C' + struct.pack('<QQ', 65536, len(original) - 65536), patch_data.getvalue())
+        restored = io.BytesIO()
+        incremental.apply_patch(source, io.BytesIO(patch_data.getvalue()), restored,
+                                len(original), len(content))
+        self.assertEqual(restored.getvalue(), content)
+
+    def test_patch_parser_rejects_corruption_expansion_and_aliases(self):
+        source = self.root / 'source'
+        source.write_bytes(b'abcd')
+        header = incremental.MAGIC + struct.pack('<QQ', 4, 4)
+        invalid = [b'', header[:-1], b'wrong' + header, header + b'X', header + b'E',
+            header + b'C' + struct.pack('<QQ', 1, 4) + b'E',
+            header + b'C' + struct.pack('<QQ', 0, 0) + b'E',
+            header + b'D' + struct.pack('<Q', 5) + b'abcdeE',
+            header + b'D' + struct.pack('<Q', 4) + b'ab',
+            header + b'D' + struct.pack('<Q', 4) + b'abcdEtrailing']
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaises(RuntimeError):
+                incremental.apply_patch(source, io.BytesIO(data), io.BytesIO(), 4, 4)
+        for alias in ('symlink', 'hardlink'):
+            path = self.root / alias
+            if alias == 'symlink':
+                path.symlink_to(source)
+            else:
+                os.link(source, path)
+            with self.subTest(alias=alias), self.assertRaises(RuntimeError):
+                incremental.apply_patch(path, io.BytesIO(header + b'E'), io.BytesIO(), 4, 4)
+            path.unlink()
+
+    def test_same_base_validation_rejects_provenance_and_version_changes(self):
+        old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'old')
+        new, _ = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2', b'new')
+        incremental.validate_sources(old, new)
+        revised = copy.deepcopy(old)
+        revised['version'] = 'v1.0.0-a17-hyperos4-hongkong-r2'
+        incremental.validate_sources(old, revised)
+        with self.assertRaisesRegex(RuntimeError, 'newer release'):
+            incremental.validate_sources(revised, old)
+        changes = [('build', 'archive_sha256', 'c' * 64), ('build', 'archive_sha256', ''),
+            ('build', 'kernel_page_size', 16384), ('build', 'kernel_kmi', 'different'),
+            ('build', 'hardware_base_api', 37), ('compatibility', 'userdata_family', 'different'),
+            (None, 'hyperos', '4.0.25.0.XFRCNXM'),
+            (None, 'version', old['version']),
+            (None, 'version', 'v0.9.9-a17-hyperos4-hongkong-r2')]
+        for section, name, value in changes:
+            invalid = copy.deepcopy(new)
+            (invalid[section] if section else invalid)[name] = value
+            with self.subTest(section=section, name=name), self.assertRaises(RuntimeError):
+                incremental.validate_sources(old, invalid)
+        new['files']['images/encryptionkey.img']['sha256'] = 'd' * 64
+        with self.assertRaisesRegex(RuntimeError, 'encryption template'):
+            incremental.validate_sources(old, new)
+
+    def test_delta_archive_roundtrip_and_source_manifest_locations(self):
+        import bundle_runtime
+        old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'a' * incremental.BLOCK)
+        new, paths = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2',
+                                 b'b' * incremental.BLOCK + b'a' * incremental.BLOCK)
+        name = 'runtime/scripts/new_module.py'
+        paths[name] = self.root / 'new' / name
+        paths[name].write_bytes(b'# new module\n')
+        new['files'][name] = {'size': paths[name].stat().st_size, 'sha256': digest(paths[name].read_bytes())}
+        original_manifest = copy.deepcopy(new)
+        for location in ('manifest.json', 'local/installed-release.json'):
+            source_manifest = self.root / 'old' / location
+            source_manifest.parent.mkdir(exist_ok=True)
+            source_manifest.write_text(json.dumps(old))
+            output = self.root / ('output-' + source_manifest.name)
+            output.mkdir()
+            descriptor = incremental.write_delta(output, new, paths, source_manifest, part_mib=1)
+            self.assertEqual(set(descriptor), {'protocol', 'from_version', 'from_manifest_sha256', 'parts'})
+            self.assertEqual(descriptor['from_manifest_sha256'], bundle_runtime.manifest_digest(old))
+            archive = b''.join((output / item['name']).read_bytes() for item in descriptor['parts'])
+            with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as packed:
+                self.assertEqual(set(packed.getnames()), {'images/system.img', name})
+                for member in packed:
+                    old_info = old['files'].get(member.name)
+                    source = self.root / 'old' / member.name if old_info else None
+                    result = io.BytesIO()
+                    incremental.apply_patch(source, packed.extractfile(member), result,
+                        old_info['size'] if old_info else 0, new['files'][member.name]['size'])
+                    self.assertEqual(result.getvalue(), paths[member.name].read_bytes())
+            self.assertEqual(new, original_manifest)
+
+    def test_delta_headers_support_large_images_and_ustar_path_prefixes(self):
+        import delta_install
+        names = ('images/system.img', 'runtime/' + 'a' * 90 + '/' + 'module.py')
+        for name in names:
+            for size in (8**11 - 1, 8**11, 8745123840):
+                with self.subTest(name=name, size=size):
+                    entry = incremental._PatchMember(name)
+                    entry.size = size
+                    header = entry.tobuf()
+                    self.assertEqual(len(header), tarfile.BLOCKSIZE)
+                    with tarfile.open(fileobj=io.BytesIO(header), mode='r|',
+                                      tarinfo=delta_install._RegularMember) as archive:
+                        member = next(iter(archive))
+                        self.assertEqual((member.name, member.size), (name, size))
+                        self.assertTrue(member.isfile())
+
+    def test_full_bundle_includes_delta_and_all_archive_checksums(self):
+        import bundle_runtime
+        import package_release
+        content = os.urandom(incremental.BLOCK * 4)
+        old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', content)
+        new, paths = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2',
+                                 b'changed'.ljust(incremental.BLOCK, b'!') + content[incremental.BLOCK:])
+        output = self.root / 'release'
+        manifest = package_release.write_bundle(output, new['version'], new, paths,
+            part_mib=1, delta_from=[self.root / 'old/manifest.json'])
+        descriptor, = manifest['deltas']
+        self.assertEqual(descriptor['from_manifest_sha256'], bundle_runtime.manifest_digest(old))
+        self.assertEqual(manifest['compatibility']['minimum_installer'], '1.2.3')
+        checksums = dict(line.split('  ', 1)[::-1]
+                         for line in (output / 'SHA256SUMS').read_text().splitlines())
+        assets = [*manifest['parts'], *descriptor['parts']]
+        self.assertEqual(set(checksums), {part['name'] for part in assets} | {'manifest.json'})
+        for part in assets:
+            self.assertEqual(checksums[part['name']], part['sha256'])
+            self.assertEqual(digest((output / part['name']).read_bytes()), part['sha256'])
+        self.assertEqual(checksums['manifest.json'], digest((output / 'manifest.json').read_bytes()))
+        self.assertEqual(json.loads((output / 'manifest.json').read_text()), manifest)
+
+    def test_unhelpful_or_invalid_delta_cleans_only_created_assets(self):
+        old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'old')
+        new, paths = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2', b'new')
+        output = self.root / 'output'
+        output.mkdir()
+        sentinel = output / 'existing.part001'
+        sentinel.write_bytes(b'preserve')
+        new['parts'][0]['size'] = 1
+        self.assertIsNone(incremental.write_delta(output, new, paths, self.root / 'old/manifest.json'))
+        self.assertEqual(list(output.iterdir()), [sentinel])
+        new['parts'][0]['size'] = 2 * 1024**2
+        (self.root / 'old/images/system.img').write_bytes(b'tampered source')
+        with self.assertRaisesRegex(RuntimeError, 'differs from its manifest'):
+            incremental.write_delta(output, new, paths, self.root / 'old/manifest.json')
+        self.assertEqual(list(output.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_bytes(), b'preserve')
 
 
 class SharedFlutterPreparationTests(unittest.TestCase):

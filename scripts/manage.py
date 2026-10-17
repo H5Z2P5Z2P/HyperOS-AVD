@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unicodedata
@@ -25,7 +27,7 @@ import setup
 from https_transport import secure_urlopen
 from common import REPO_ROOT, avd_home, host_check, port_free, sdk_path, sha256
 
-VERSION = '1.2.3'
+VERSION = '1.3.0'
 MODULE_UPGRADE_PREFLIGHT = 'phone-owned-module-guards-v1'
 FORWARD_UPGRADE_POLICY = 'same-family-forward-v1'
 REPOSITORY = 'NEORUAA/HyperOS-AVD'
@@ -207,7 +209,7 @@ def download(url, target, size, checksum):
                             last = time.monotonic()
             progress(target.name, offset, size)
             print(flush=True)
-        except (OSError, urllib.error.URLError):
+        except (OSError, urllib.error.URLError, http.client.HTTPException):
             if attempt == 2:
                 raise
         # Verification occurs on the next iteration, or here after the final attempt.
@@ -217,7 +219,7 @@ def download(url, target, size, checksum):
     return target
 
 
-def fetch_release(release, cache):
+def fetch_release(release, cache, root=None):
     assets = release['asset_map']
     cache = Path(cache) / release['tag_name']
     cache.mkdir(parents=True, exist_ok=True)
@@ -241,11 +243,51 @@ def fetch_release(release, cache):
         # OS3 r1 used v0.1.0 as its bundle version; only that known legacy mapping is accepted.
         if (manifest['version'], release['tag_name']) != ('v0.1.0', 'v0.1.0-a16-hyperos3-fuxi-r1'):
             raise RuntimeError('Manifest does not match the selected release.')
-    for part in manifest['parts']:
-        asset = assets.get(part['name'])
-        if not asset or asset['size'] != part['size']:
-            raise RuntimeError('Release is missing a matching archive part.')
-        download(asset['browser_download_url'], cache / part['name'], part['size'], part['sha256'])
+    minimum = manifest.get('compatibility', {}).get('minimum_installer', '0.2.1')
+    if version_key(minimum) > version_key(VERSION):
+        raise RuntimeError('This release needs a newer installer; download the latest stable Installer Release.')
+
+    def fetch_parts(parts):
+        for part in parts:
+            asset = assets.get(part['name'])
+            if not asset or asset['size'] != part['size']:
+                raise RuntimeError('Release is missing a matching archive part.')
+            download(asset['browser_download_url'], cache / part['name'], part['size'], part['sha256'])
+
+    if root is not None:
+        from bundle_runtime import has_protocol, verify_staged
+        from delta_install import select_delta, stage_delta
+        root = Path(root).expanduser().resolve()
+        target = root / 'versions' / manifest['version']
+        if has_protocol(manifest):
+            if (target / 'local/installed-release.json').is_file():
+                verify_staged(target, manifest)
+                say('目标版本已在本地，直接使用。', 'Using the verified local target version.')
+                return manifest_path
+            selection = select_delta(root, manifest)
+            if selection is not None:
+                descriptor, source, old = selection
+                delta_size = sum(part['size'] for part in descriptor['parts'])
+                full_size = sum(part['size'] for part in manifest['parts'])
+                say(f'增量更新：{delta_size / 1024**2:.1f} MiB（完整包 {full_size / 1024**2:.1f} MiB）',
+                    f'Incremental update: {delta_size / 1024**2:.1f} MiB (full bundle {full_size / 1024**2:.1f} MiB)')
+                try:
+                    fetch_parts(descriptor['parts'])
+                    # Download outside the instance lock, then repeat source
+                    # selection under the lock before constructing a new version.
+                    with lock(root):
+                        current = select_delta(root, manifest)
+                        if current is None or current != selection:
+                            raise RuntimeError('Incremental source changed during download.')
+                        if target.exists():
+                            verify_staged(target, manifest)
+                        else:
+                            stage_delta(root, target, manifest_path, manifest, descriptor, source, old)
+                    say('增量还原与校验完成。', 'Incremental reconstruction and verification complete.')
+                    return manifest_path
+                except (OSError, RuntimeError, ValueError, EOFError, tarfile.TarError, http.client.HTTPException):
+                    say('增量更新未完成，改用完整包。', 'Incremental update unavailable; using the full bundle.')
+    fetch_parts(manifest['parts'])
     return manifest_path
 
 
@@ -1160,6 +1202,7 @@ def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options,
     """Stage all bytes before invoking the protocol's single fixed entrypoint."""
     from bundle_runtime import ENTRYPOINT, INSTALL_PROTOCOL, manifest_digest, validate_envelope, verify_staged
     validate_envelope(manifest)
+    manifest_path = Path(manifest_path)
     root = Path(root).expanduser().resolve()
     validate_name(name)
     if type(port) is not int or port % 2 or not 5556 <= port <= 5682:
@@ -1197,12 +1240,25 @@ def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options,
         if not (target / 'local/installed-release.json').is_file():
             if target.exists():
                 raise RuntimeError('An incomplete version directory exists; inspect it before retrying: ' + str(target))
-            total = sum(item['size'] for item in manifest['files'].values())
-            if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
-                raise RuntimeError('Insufficient free storage for staging and archive validation.')
-            target.mkdir(parents=True)
-            with scope(target):
-                setup.stage_bundle(str(manifest_path))
+            from delta_install import select_delta, stage_delta
+            selection = select_delta(root, manifest)
+            if selection is not None and all((manifest_path.parent / part['name']).is_file()
+                                             for part in selection[0]['parts']):
+                descriptor, source, old = selection
+                try:
+                    stage_delta(root, target, manifest_path, manifest, descriptor, source, old)
+                except (OSError, RuntimeError, ValueError, EOFError, tarfile.TarError, http.client.HTTPException):
+                    if not all((manifest_path.parent / part['name']).is_file() for part in manifest['parts']):
+                        raise RuntimeError('Incremental bundle verification failed. Retry the online upgrade '
+                                           'or provide the full bundle; the installed version was preserved.') from None
+                    say('增量校验失败，使用本地完整包。', 'Incremental verification failed; using the local full bundle.')
+            if not target.exists():
+                total = sum(item['size'] for item in manifest['files'].values())
+                if shutil.disk_usage(root).free < total + sum(item['size'] for item in manifest['parts']) + 2 * 1024**3:
+                    raise RuntimeError('Insufficient free storage for staging and archive validation.')
+                target.mkdir(parents=True)
+                with scope(target):
+                    setup.stage_bundle(str(manifest_path))
         verify_staged(target, manifest)
     # The child obtains the normal instance lock and repeats ownership/idle
     # checks. No inherited lock or environment flag can bypass its transaction.
@@ -1462,7 +1518,7 @@ def tui(language=None):
                     f"RAM: {int(settings['hw.ramSize']) / 1024:g} GiB | Storage: {settings['disk.dataPartition.size']} | CPU: {settings['hw.cpu.ncore']}",
                     'Port: ' + str(port), str(root)])
                 idle(root, name, port)
-                path = fetch_release(release, HOME / 'downloads')
+                path = fetch_release(release, HOME / 'downloads', root=root)
                 install(root, path, name, port, sdk_path(), settings, camera=
                     variant == 'os4-official' and ask('启用实验性小米相机？1 是，0 否（后摄录像仍掉帧）',
                     'Enable experimental Xiaomi camera? 1 yes, 0 no (rear video drops frames)', 0) == '1')
@@ -1569,7 +1625,7 @@ def main():
             choices = rows if args.release == 'latest' else [r for r in rows if r['tag_name'] == args.release or version_key(r['tag_name']) == version_key(args.release)]
             if not choices:
                 raise RuntimeError('Requested release is not published.')
-            path = fetch_release(choices[0], HOME / 'downloads')
+            path = fetch_release(choices[0], HOME / 'downloads', root=root)
         install(root, path, args.name, port, sdk_path(args.sdk), settings, args.camera)
         if args.start:
             start({'root': root})
@@ -1580,7 +1636,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError, http.client.HTTPException) as error:
         raise SystemExit(tr('操作失败：', 'Operation failed: ') + str(error))
     except (KeyboardInterrupt, EOFError):
         print('\n' + tr('已退出；下载缓存和备份保留。', 'Exited; download cache and backups retained.'))

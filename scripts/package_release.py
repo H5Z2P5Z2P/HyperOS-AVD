@@ -603,7 +603,7 @@ def runtime_files():
     return paths
 
 
-def write_bundle(directory, version, metadata, paths, part_mib=1536):
+def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_from=()):
     """Archive only explicit portable files; publish the manifest last."""
     if not re.fullmatch(r'(?:pad-)?v[0-9A-Za-z_.-]+', version):
         raise RuntimeError('Invalid release version.')
@@ -665,9 +665,24 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536):
     manifest = {**metadata, 'version': version, 'parts': writer.parts, 'files': files}
     if manifest['format'] in (2, 3):
         manifest['build']['system_sha256'] = files['images/system.img']['sha256']
+    if delta_from:
+        from incremental import write_delta
+        deltas = []
+        sources = set()
+        for previous in delta_from:
+            entry = write_delta(directory, manifest, paths, previous, part_mib)
+            if entry is not None:
+                identity = entry['from_manifest_sha256']
+                if identity in sources:
+                    raise RuntimeError('Duplicate incremental source manifest.')
+                sources.add(identity)
+                deltas.append(entry)
+        if deltas:
+            manifest['deltas'] = deltas
     (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (directory / 'SHA256SUMS').write_text(''.join(
-        f'{entry["sha256"]}  {entry["name"]}\n' for entry in writer.parts)
+        f'{entry["sha256"]}  {entry["name"]}\n'
+        for entry in [*writer.parts, *(part for delta in manifest.get('deltas', []) for part in delta['parts'])])
         + sha256(directory / 'manifest.json') + '  manifest.json\n')
     print(json.dumps({'directory': str(directory), 'parts': writer.parts}, indent=2))
     return manifest
@@ -679,6 +694,8 @@ def main():
     parser.add_argument('--output', type=Path, help='Stage a new bundle before replacing an unpublished release')
     parser.add_argument('--variant', choices=('os3', 'os4-official', 'os4-pad'), default='os3')
     parser.add_argument('--part-mib', type=int, default=1536)
+    parser.add_argument('--delta-from', type=Path, action='append', default=[],
+                        help='Previous unpacked release manifest with the same base OTA; repeat for multiple versions')
     parser.add_argument('--compat-cache-root', type=Path, action='append', default=[],
                         help='Verified producer cache for the complete common app recipe union')
     args = parser.parse_args()
@@ -719,7 +736,7 @@ def main():
         raise RuntimeError('A release template already exists; choose a new revision.')
     paths['images/userdata.img'] = create_userdata(temporary)
     directory = args.output or REPO_ROOT / 'releases' / version
-    write_bundle(directory, version, metadata, paths, args.part_mib)
+    write_bundle(directory, version, metadata, paths, args.part_mib, delta_from=args.delta_from)
 
 
 if __name__ == '__main__':

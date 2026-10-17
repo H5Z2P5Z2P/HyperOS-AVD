@@ -1,5 +1,6 @@
 """Exercise recoverable upgrades, isolation, discovery and release downloads."""
 import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -692,6 +693,139 @@ class ManagerTests(unittest.TestCase):
             manage.download(source.as_uri(), target, 7, hashlib.sha256(b'payload').hexdigest())
             self.assertEqual(target.read_bytes(), b'payload')
             manage.download(source.as_uri(), target, 7, hashlib.sha256(b'payload').hexdigest())
+
+    def incremental_release(self, directory):
+        """Build tiny real archives and an immutable installed source version."""
+        from test_bundle_runtime import BundleRuntimeTests
+        from incremental import write_delta
+        fixture = BundleRuntimeTests()
+        source_path, old = fixture.bundle(directory / 'old')
+        old['build']['archive_sha256'] = 'a' * 64
+        source_path.write_text(json.dumps(old))
+        root = directory / 'instance'
+        source = root / 'versions' / old['version']
+        source.mkdir(parents=True)
+        with manage.scope(source):
+            setup.stage_bundle(str(source_path))
+        (root / 'local').mkdir()
+        (root / 'local/installed-release.json').write_text(json.dumps(old))
+        personal = root / 'avd/Custom_Name.avd/userdata-qemu.img'
+        personal.parent.mkdir(parents=True)
+        personal.write_bytes(b'personal data remains untouched')
+        target_path, new = fixture.bundle(directory / 'new')
+        new['version'] = 'v9.0.1-a17-hyperos4-hongkong-r1000'
+        new['build']['archive_sha256'] = 'a' * 64
+        with tarfile.open(target_path.parent / new['parts'][0]['name']) as archive:
+            payloads = {member.name: archive.extractfile(member).read() for member in archive}
+        payloads['images/system.img'] = b'updated system image'
+        unpacked = directory / 'target-files'
+        paths = {}
+        for name, data in payloads.items():
+            path = unpacked / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            paths[name] = path
+        archive_path = target_path.parent / new['parts'][0]['name']
+        with tarfile.open(archive_path, 'w:gz') as archive:
+            for name, data in payloads.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        new['files'] = {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                        for name, data in payloads.items()}
+        new['parts'][0].update(size=archive_path.stat().st_size, sha256=common.sha256(archive_path))
+        descriptor = write_delta(target_path.parent, new, paths, source / 'local/installed-release.json', 1)
+        self.assertIsNotNone(descriptor)
+        new['deltas'] = [descriptor]
+        target_path.write_text(json.dumps(new))
+        assets = {path.name: {'name': path.name, 'size': path.stat().st_size,
+                             'digest': 'sha256:' + common.sha256(path),
+                             'browser_download_url': path.as_uri()}
+                  for path in target_path.parent.iterdir()}
+        return root, target_path, new, {'tag_name': new['version'], 'asset_map': assets}
+
+    def test_online_incremental_download_restores_verified_target_without_full_archive(self):
+        import bundle_runtime
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            root, _, manifest, release = self.incremental_release(folder)
+            with patch('sys.stdout', new_callable=io.StringIO), \
+                    patch.object(manage, 'download', wraps=manage.download) as download:
+                path = manage.fetch_release(release, folder / 'downloads', root=root)
+            names = [call.args[1].name for call in download.call_args_list]
+            self.assertEqual(names, ['manifest.json', *[p['name'] for p in manifest['deltas'][0]['parts']]])
+            self.assertFalse((path.parent / manifest['parts'][0]['name']).exists())
+            target = root / 'versions' / manifest['version']
+            bundle_runtime.verify_staged(target, manifest)
+            self.assertEqual((target / 'images/system.img').read_bytes(), b'updated system image')
+            self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                             b'personal data remains untouched')
+            with patch.object(manage, 'download', wraps=manage.download) as download, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                manage.fetch_release(release, folder / 'downloads', root=root)
+            self.assertEqual([call.args[1].name for call in download.call_args_list], ['manifest.json'])
+
+    def test_online_incremental_falls_back_for_bad_source_missing_asset_and_failed_reconstruction(self):
+        for failure in ('source', 'asset', 'patch', 'transport'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                root, path, manifest, release = self.incremental_release(folder)
+                if failure == 'source':
+                    old = json.loads((root / 'local/installed-release.json').read_text())
+                    (root / 'versions' / old['version'] / 'images/system.img').write_bytes(b'changed locally')
+                elif failure == 'asset':
+                    release['asset_map'].pop(manifest['deltas'][0]['parts'][0]['name'])
+                elif failure == 'patch':
+                    descriptor = manifest['deltas'][0]
+                    part = path.parent / descriptor['parts'][0]['name']
+                    part.write_bytes(b'broken incremental archive')
+                    descriptor['parts'][0].update(size=part.stat().st_size, sha256=common.sha256(part))
+                    path.write_text(json.dumps(manifest))
+                    for updated in (path, part):
+                        release['asset_map'][updated.name].update(size=updated.stat().st_size,
+                            digest='sha256:' + common.sha256(updated))
+                original_download = manage.download
+                def transfer(url, target, size, checksum):
+                    if failure == 'transport' and target.name == manifest['deltas'][0]['parts'][0]['name']:
+                        raise http.client.IncompleteRead(b'partial chunk')
+                    return original_download(url, target, size, checksum)
+                with patch('sys.stdout', new_callable=io.StringIO), \
+                        patch.object(manage, 'download', side_effect=transfer):
+                    fetched = manage.fetch_release(release, folder / 'downloads', root=root)
+                self.assertTrue((fetched.parent / manifest['parts'][0]['name']).is_file())
+                self.assertFalse((root / 'versions' / manifest['version']).exists())
+                self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                                 b'personal data remains untouched')
+
+    def test_offline_incremental_handoff_and_full_fallback_preserve_existing_data(self):
+        from test_bundle_runtime import BundleRuntimeTests
+        import bundle_runtime
+        for mode in ('delta', 'full-fallback', 'unavailable'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                root, path, manifest, _ = self.incremental_release(folder)
+                if mode != 'full-fallback':
+                    (path.parent / manifest['parts'][0]['name']).unlink()
+                if mode != 'delta':
+                    part = manifest['deltas'][0]['parts'][0]
+                    archive = path.parent / part['name']
+                    archive.write_bytes(b'invalid delta')
+                    part.update(size=archive.stat().st_size, sha256=common.sha256(archive))
+                    path.write_text(json.dumps(manifest))
+                with patch.object(manage, 'validate_userdata'), \
+                        patch.object(manage, 'data_size', return_value={'virtual-size': 32 * 1024**3}), \
+                        patch('sys.stdout', new_callable=io.StringIO):
+                    if mode == 'unavailable':
+                        with self.assertRaisesRegex(RuntimeError, 'installed version was preserved'):
+                            BundleRuntimeTests().install(root, path)
+                        self.assertFalse((root / 'executed').exists())
+                        self.assertFalse((root / 'versions' / manifest['version']).exists())
+                    else:
+                        BundleRuntimeTests().install(root, path)
+                        self.assertEqual((root / 'executed').read_text(), 'verified bundle entrypoint')
+                        bundle_runtime.verify_staged(root / 'versions' / manifest['version'], manifest)
+                self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                                 b'personal data remains untouched')
 
     def test_automatic_port_preserves_stopped_instances(self):
         entries = [{'runtime': {'port': 5580}}, {'runtime': {'port': 5582}}]
