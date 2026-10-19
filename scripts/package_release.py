@@ -57,7 +57,7 @@ BUILD_KEYS = ('hyperos', 'source', 'android_api', 'archive_sha256', 'kernel_page
               'hardware_base_api', 'kernel_kmi', 'surfaceflinger_backend', 'hwui_renderer', 'gnss_patch',
               'mi_ext_overlays', 'mi_ext_software_identity', 'flutter_render_fix',
               'preinstalled_apps', 'native_quickstep_identity', 'factory_launcher_deadlines', 'avd_defaults',
-              'assistant_render_fix', 'composer_alpha_fix', 'audio_pcm_fix', 'camera_scene_fix',
+              'assistant_render_fix', 'composer_alpha_fix', 'audio_pcm_fix', 'audio_codecs', 'camera_scene_fix',
               'adb_authentication', 'experimental', 'device', 'display', 'model_xml_sha256',
               'identity_source_sha256', 'vendor_fixes', 'hwui',
               'flutter_engine', 'finddevice_provider_disabled', 'boot_service_fix', 'boot_policy',
@@ -370,6 +370,14 @@ def verify_os4_image(root, metadata):
         return subprocess.check_output([dump, '--cat', '--path=' + path, str(raw)])
     def read_vendor(path):
         return subprocess.check_output([dump, '--cat', '--path=' + path.removeprefix('/vendor'), str(vendor)])
+    if metadata['build'].get('audio_codecs') is not None:
+        from dolby_codecs import image_receipt
+        recipe = image_receipt()
+        if metadata['build']['audio_codecs'] != recipe:
+            raise RuntimeError('Unknown system audio codec image receipt.')
+        for path, checksum in recipe['files_sha256'].items():
+            if hashlib.sha256(read_vendor(path)).hexdigest() != checksum:
+                raise RuntimeError('System audio codec image checksum mismatch: ' + path)
     template = dict(line.split('=', 1) for line in (root / 'config/avd.ini').read_text().splitlines() if '=' in line)
     rear_files = verify_rear_display(selected, metadata['build'], read, read_vendor, template)
     boot_service_files = verify_boot_services(metadata['build'], read)
@@ -577,13 +585,18 @@ def default_release_version(variant, metadata):
 
 
 def runtime_files():
-    """Explicit portable source set; exclude logs, secrets, user state and binaries."""
+    """Explicit portable sources and reviewed offline assets, excluding user state."""
     paths = {'Install.command': REPO_ROOT / 'Install.command', 'install.sh': REPO_ROOT / 'install.sh'}
     for directory, patterns in {'scripts': ('*.py',), 'config': ('*.ini', '*.xml', '*.json', '*.sh', '*.rc'),
                                 'native': ('*.S', '*.c', '*.cpp', '*.m')}.items():
         for pattern in patterns:
             for path in sorted((REPO_ROOT / directory).glob(pattern)):
                 paths[path.relative_to(REPO_ROOT).as_posix()] = path
+    # This reviewed payload lets the image producer run without an OTA donor.
+    from dolby_codecs import PAYLOAD
+    if not PAYLOAD.is_file() or PAYLOAD.is_symlink():
+        raise RuntimeError('Missing offline system audio codec payload.')
+    paths[PAYLOAD.relative_to(REPO_ROOT).as_posix()] = PAYLOAD
     # The reviewed migration history is data, not guest-supplied trust.
     for name in ('app_compat_legacy_records.json', 'app_compat_history.json'):
         history = REPO_ROOT / 'scripts' / name

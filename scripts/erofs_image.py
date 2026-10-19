@@ -114,7 +114,8 @@ def tar_entry(path, inode):
 
 
 def build(destination, partitions, work, replacements, removals=(),
-          preserve_replacement_metadata=False):
+          preserve_replacement_metadata=False,
+          directory_label='u:object_r:system_file:s0'):
     """Merge trees in order; prefix:subtree selects an OTA overlay subtree.
 
     Resolve precedence before emitting the tar so duplicate members cannot
@@ -182,7 +183,7 @@ def build(destination, partitions, work, replacements, removals=(),
                         raise RuntimeError('Replacement parent is not a directory: ' + parent)
                 else:
                     expected[parent] = {'uid': 0, 'gid': 0, 'mode': stat.S_IFDIR | 0o755,
-                        'attrs': {'security.selinux': b'u:object_r:system_file:s0\0'}}
+                        'attrs': {'security.selinux': directory_label.encode() + b'\0'}}
         command = [tool('mkfs.erofs', 'erofs-utils'), '-b4096', '-z', 'lz4',
                    '--workers=2', '--tar=f', '--sort=none', str(temporary)]
         with subprocess.Popen(command, stdin=subprocess.PIPE) as process:

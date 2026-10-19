@@ -32,6 +32,7 @@ import package_native_module as package
 class NativeModulePackageTests(unittest.TestCase):
 
     def test_privacy_capability_recipe_is_canonical_and_integrity_bound(self):
+        import dolby_codecs
         import patch_display_privacy as privacy
         files = package.module_files()
         name = 'display-privacy-capability.tsv'
@@ -48,6 +49,8 @@ class NativeModulePackageTests(unittest.TestCase):
         pins = {row[1]: row[2] for row in rows if row[0] == 'file'}
         self.assertEqual(pins, {privacy.VINTF_ROOT + '/' + path: checksum for path, checksum in privacy.VINTF_FILES.items()})
         self.assertEqual(len(pins), 26)
+        self.assertEqual([row[1:] for row in rows if row[0] == 'optional-file'],
+                         [[dolby_codecs.VINTF_PATH, dolby_codecs.VINTF_SHA256]])
         manifest = json.loads(files['manifest.json'])
         self.assertEqual(manifest['files_sha256'][name], hashlib.sha256(files[name]).hexdigest())
         self.assertIn('display-privacy', manifest['features'])
@@ -351,6 +354,30 @@ class NativeModuleInstallTests(unittest.TestCase):
         result, commands, _ = self.run_install(active={'ownership': prop, 'manifest': previous})
         self.assertTrue(result['installed'])
         self.assertTrue(any(expected in command for command in commands))
+
+    def test_core19_controls_authenticate_before_image_codec_support(self):
+        previous = (REPO / 'tests/fixtures/native-compat-v19-final-manifest.json').read_text()
+        saved = json.loads(previous)
+        expected = 'bce0dedee9a79e538d32b28b36ccd9721e81adc9fb4f8ed75dd12d46835573ec'
+        record = next(row for row in history.REVIEWED if row['revision'] == 19)
+        self.assertEqual(history.checksum_for(saved), expected)
+        self.assertEqual(record['manifest_sha256'], hashlib.sha256(previous.encode()).hexdigest())
+        self.assertEqual(record['package_sha256'],
+                         '9bdb1d8293160295199f0198b5c12edff39aa92577b652fc348b030b5b97275b')
+        for feature, controls in record['policy_controls'].items():
+            self.assertEqual(controls['helper'], saved['files_sha256'][feature + '-policy.sh'])
+            self.assertEqual(controls['recovery'], saved['files_sha256'][feature + '-recovery.sh'])
+        prop = PROPERTY.rsplit('=', 1)[0] + '=19'
+        result, commands, _ = self.run_install(active={'ownership': prop, 'manifest': previous})
+        self.assertTrue(result['installed'])
+        self.assertTrue(any(expected in command for command in commands))
+        saved['files_sha256']['platform.sh'] = '0' * 64
+        self.assertIsNone(history.checksum_for(saved))
+        result, commands, adb = self.run_install(active={
+            'ownership': prop, 'manifest': json.dumps(saved)})
+        self.assertEqual(result['reason'], 'unreviewed-core-controls')
+        self.assertFalse(any('/data/adb/ksud module install ' in command for command in commands))
+        adb.assert_not_called()
 
     def previous_manifest(self):
         return (REPO / 'tests/fixtures/native-compat-v2-manifest.json').read_text()

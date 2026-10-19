@@ -331,6 +331,7 @@ def main():
     from patch_composer import build_vendor
     from patch_camera_scene import build_vendor as build_scene_vendor
     from patch_audio import build_vendor as build_audio_vendor
+    from dolby_codecs import build_vendor as build_codec_vendor
     from preinstall_os4_apps import REMOVALS, replacements as app_replacements, validated_apks
     from os4_defaults import image_replacements as default_replacements, production_properties
     from setup import configure, select_build_instance
@@ -414,6 +415,9 @@ def main():
     audio_manifest = build_audio_vendor(vendor, ROOT / 'work/vendor-audio-fixed.img',
                                        ROOT / 'work/vendor-audio')
     (ROOT / 'work/vendor-audio-fixed.img').replace(vendor)
+    codec_manifest = build_codec_vendor(vendor, ROOT / 'work/vendor-codecs.img',
+                                       ROOT / 'work/vendor-codecs')
+    (ROOT / 'work/vendor-codecs.img').replace(vendor)
     replacements = {}
     def put(path, data, mode=0o644, label='u:object_r:system_file:s0'):
         replacements[path] = (data, mode, label)
@@ -560,6 +564,7 @@ def main():
         'composer_alpha_fix': composer_manifest,
         'camera_scene_fix': scene_manifest,
         'audio_pcm_fix': audio_manifest,
+        'audio_codecs': codec_manifest,
         'avd_defaults': default_manifest,
         'adb_authentication': not args.diagnostic_adb,
         'experimental': True, 'ota_metadata': metadata}

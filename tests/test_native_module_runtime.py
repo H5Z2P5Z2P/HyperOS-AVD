@@ -267,6 +267,7 @@ print(os.environ['CPU_TEST_COUNT'])''',
             for key, value in values.items()) + '\nesac; }\n'
 
     def privacy_capability_fixture(self):
+        import dolby_codecs
         vendor_root, odm_root = self.root / 'vendor', self.root / 'odm'
         apex_root, data_apex = self.root / 'apex', self.root / 'data-apex'
         vendor = vendor_root / 'etc/vintf'
@@ -315,10 +316,13 @@ print(os.environ['CPU_TEST_COUNT'])''',
                 'composer|' + str(composer) + '|' + digest(composer.read_bytes())]
         rows.extend('file|' + str(path) + '|' + digest(path.read_bytes())
                     for path in sorted(vendor.rglob('*.xml')))
+        self.privacy_codec_fragment = Path(translate(dolby_codecs.VINTF_PATH))
+        rows.append('optional-file|' + str(self.privacy_codec_fragment) + '|' + dolby_codecs.VINTF_SHA256)
         (self.module / 'display-privacy-capability.tsv').write_text('\n'.join(rows) + '\n')
         self.privacy_odm_etc, self.privacy_odm_link = odm_etc, odm_link
         self.privacy_apex_package, self.privacy_apex_fragment = apex_package, apex_fragment
         self.privacy_active = active
+        self.checksums()
         return vendor, absent, composer
 
     def test_privacy_requires_complete_reviewed_declarations_not_a_live_service_failure(self):
@@ -400,6 +404,40 @@ print(os.environ['CPU_TEST_COUNT'])''',
         recipe.write_text('\n'.join(row for row in original.splitlines() if not row.startswith('tree|')) + '\n')
         self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
         recipe.write_text(original)
+        self.shell('native_eligible display-privacy')
+
+    def test_privacy_allows_only_the_exact_optional_software_codec_fragment(self):
+        import dolby_codecs
+        self.privacy_capability_fixture()
+        fragment = self.privacy_codec_fragment
+        self.shell('native_eligible display-privacy')
+        fragment.write_bytes(dolby_codecs.VINTF_XML)
+        self.shell('native_eligible display-privacy')
+        recipe = self.module / 'display-privacy-capability.tsv'
+        original = recipe.read_text()
+        recipe.write_text(original.replace(dolby_codecs.VINTF_SHA256, '0' * 64))
+        self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
+        recipe.write_text(original)
+        fragment.write_bytes(dolby_codecs.VINTF_XML + b'<!-- changed declaration -->')
+        self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
+        fragment.unlink()
+        saved = self.root / 'aliased-codec-fragment'
+        saved.write_bytes(dolby_codecs.VINTF_XML)
+        fragment.symlink_to(saved)
+        self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
+        fragment.unlink()
+        fragment.mkdir()
+        self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
+        fragment.rmdir()
+        optional_row = next(row for row in original.splitlines(True) if row.startswith('optional-file|'))
+        for invalid in (original + optional_row, original.replace(optional_row, ''),
+                        original.replace(str(fragment), str(fragment.with_name('unknown-codec.xml')))):
+            with self.subTest(recipe=invalid.splitlines()[-1]):
+                recipe.write_text(invalid)
+                self.checksums()
+                self.assertNotEqual(self.shell('native_eligible display-privacy', check=False).returncode, 0)
+        recipe.write_text(original)
+        self.checksums()
         self.shell('native_eligible display-privacy')
 
     def composer_chain(self):

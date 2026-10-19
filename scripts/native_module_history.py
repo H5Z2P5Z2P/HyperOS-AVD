@@ -63,6 +63,19 @@ REVIEWED = (
     {'revision': 17, 'source_kind': 'deployed-final-canonical-package', 'package_sha256': '797ff25ee6b32c212ed6cf38eb7228cc50dd9ae33de61a31c17737bd849cc66e', 'manifest_sha256': '706e655f1a2235dd2284803c68dec063c7b52831bea41c1d78ac4c601e25e687', 'checksums_sha256': '31e5461352a04a5771e2dbfd2a9ecba429451be03dc5c3d53595eb28d5cd1910', 'policy_controls': {'finddevice': {'helper': '9ee75c8097d71babe793fa06a4138e539c7af39c725023514d02766374781a26', 'recovery': '27414971e4ac5c476e60a27e2e85d0d04704aa63857956b2d9b3efb2e5f71ff1'}, 'vendor-ims': {'helper': '9e32f98d444372e3834b95e9be3a083a9cb17b8108aae9117bad218af85854e2', 'recovery': '6a40df9f4f5aaf75dc3f5d76a32cb894dd16cde8d50b5513f2dbbccffeab0e75'}}},
     # Frozen Core18 controls before firmware-independent ABI guards.
     {'checksums_sha256': '1d7856b5b812ccf309f8d20e1393f4c1d6455a82117a6fb18651f55f3aa73514', 'manifest_sha256': '92194ddd65e588c152fda085a3617122484aef76f364c9456f9609ab7f9c6776', 'package_sha256': '51e89df525fe14fcf069e7013bb4a33a50a3b927dff50cc049482c9af141e7ef', 'policy_controls': {'finddevice': {'helper': '0cb8f66c37f7012fbaff11234b86b4ab8972989a3bdfe2319dcf6085570a817a', 'recovery': 'b10ffd236e10b35820a90441bab315bec51b05167cf4fb674415ea685bd4ebb0'}, 'vendor-ims': {'helper': 'bba4d843fd41bc89462164c786628545f161fa08849262730b0540b5648056e7', 'recovery': '46a2f87cffadee9c69cd9caf84b2d39540f4f9b74bea704c7998413b43dcd37c'}}, 'revision': 18, 'source_kind': 'deployed-final-canonical-package'},
+    # Reproduced from the complete pre-codec producer and matched to the
+    # deployed Core19 manifest and retained checksum list byte-for-byte.
+    {'revision': 19, 'source_kind': 'deployed-final-canonical-package',
+     'package_sha256': '9bdb1d8293160295199f0198b5c12edff39aa92577b652fc348b030b5b97275b',
+     'manifest_sha256': 'd3598160561308160dee607ea0f80b962f58a7a42ebb01f416e947cc16307a7e',
+     'checksums_sha256': 'bce0dedee9a79e538d32b28b36ccd9721e81adc9fb4f8ed75dd12d46835573ec',
+     'policy_controls': {
+         'finddevice': {
+             'helper': '3f8885f79c72a58dadbafc60c0284dfa8e48977ea897dae5840664274120b5cb',
+             'recovery': '45ee3ab03ffaf950bf270bcffe04523c58768ad07277861d7ad64e518dd8b5d7'},
+         'vendor-ims': {
+             'helper': 'b747ec65b8bd6ca5b27182653cc1e87a6e6e7b4bffb64129df058ba6d2f5a873',
+             'recovery': 'f2c764fb6218d50757824f3acd878712e12991bded776171fa76f434370a8be2'}}},
 )
 
 

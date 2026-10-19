@@ -90,6 +90,7 @@ APEX_FRAGMENTS = {'/apex/com.android.hardware.authsecret/etc/vintf/android.hardw
 
 def capability_recipe():
     """Export offline data from the same reviewed vendor identities."""
+    import dolby_codecs
     import patch_composer
     import patch_rear_display
     rows = ['schema|1', 'root|' + VINTF_ROOT]
@@ -108,6 +109,8 @@ def capability_recipe():
                 (patch_composer.BEFORE, patch_composer.AFTER, patch_rear_display.AFTER))
     rows.extend('file|' + VINTF_ROOT + '/' + path + '|' + checksum
                 for path, checksum in sorted(VINTF_FILES.items()))
+    # This exact software service adds no physical display capability.
+    rows.append('optional-file|' + dolby_codecs.VINTF_PATH + '|' + dolby_codecs.VINTF_SHA256)
     return ('\n'.join(rows) + '\n').encode()
 
 

@@ -9,7 +9,7 @@ import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE_ID = 'hyperos_avd_native_compat'
-REVISION = 19
+REVISION = 20
 
 
 def boot_prerequisites():
@@ -62,6 +62,12 @@ def module_files(value=None, template=None):
     files.update(credential_files())
     from tcm_capability import files as tcm_files
     files.update(tcm_files())
+    from dolby_codecs import files as codec_files
+    files.update(codec_files())
+    from dolby_codecs import image_receipt as codec_receipt
+    files['audio-codecs/image.tsv'] = ('schema|1\n' + ''.join(
+        'file|' + path + '|' + checksum + '\n'
+        for path, checksum in sorted(codec_receipt()['files_sha256'].items()))).encode()
     files['skip_mount'] = b''
     files['boot-prerequisites.tsv'] = boot_prerequisites()
     from os4_defaults import display_capability_script
@@ -97,7 +103,7 @@ def module_files(value=None, template=None):
                       item['package'], item['library'])) for item in value['targets']]
     files['targets.tsv'] = ('\n'.join(rows) + '\n').encode()
     features = sorted({profile['feature'] for profile in value['profiles']} |
-                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake', 'finddevice', 'vendor-ims', 'device-credential', 'network-tcm'})
+                      {'identity', 'serial', 'thermal', 'refresh', 'boot-services', 'rear-wake', 'finddevice', 'vendor-ims', 'device-credential', 'network-tcm', 'audio-codecs'})
     files['features.tsv'] = ('\n'.join(features) + '\n').encode()
     manifest = {'schema': 1, 'id': MODULE_ID, 'revision': REVISION,
                 'catalog_sha256': hashlib.sha256(files['catalog.json']).hexdigest(),

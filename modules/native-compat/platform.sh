@@ -327,6 +327,32 @@ core_kernel() {
     native_status boot-services kernel ready verified-capability-probe
 }
 
+core_audio_codecs() {
+    # Declarations, init service and private libraries are one image component.
+    # Disabling a userdata module must never strand a declared Codec2 store.
+    core_permitted audio-codecs || return 0
+    local recipe="$MODDIR/audio-codecs/image.tsv" kind path checksum extra count=0
+    [ "$(getprop ro.product.cpu.abi)" = arm64-v8a ] &&
+        [ "$(getprop ro.boot.hardware)" = ranchu ] && core_safe_file "$recipe" || return 1
+    [ "$("$BB" head -n 1 "$recipe")" = 'schema|1' ] || return 1
+    while IFS='|' read -r kind path checksum extra; do
+        [ "$kind" != schema ] || continue
+        [ "$kind" = file ] && [ -z "$extra" ] && native_hex "$checksum" || return 1
+        case "$path" in /vendor/*) ;; *) return 1 ;; esac
+        if ! core_safe_file "$path" || [ "$(native_hash "$path")" != "$checksum" ]; then
+            native_status audio-codecs image skipped image-upgrade-required; return 0
+        fi
+        count=$((count + 1))
+    done < "$recipe"
+    [ "$count" -gt 0 ] || return 1
+    if [ "$(getprop init.svc.hyperos-audio-codecs)" = running ] &&
+        lshal -i 2>/dev/null | "$BB" grep -Fxq 'android.hardware.media.c2@1.0::IComponentStore/dolby'; then
+        native_status audio-codecs image ready verified-software-codecs
+    else
+        native_status audio-codecs image failed codec-service-unavailable
+    fi
+}
+
 core_rear_recipe() {
     # Only the complete installed package may supply executable helper bytes.
     # The legacy image contract stays immutable; the current helper lives in
@@ -525,7 +551,7 @@ core_early() {
 }
 
 core_late() {
-    core_refresh; core_kernel; core_rear; core_policies; core_device_credential
+    core_refresh; core_kernel; core_audio_codecs; core_rear; core_policies; core_device_credential
 }
 
 core_policy_restore_required() {

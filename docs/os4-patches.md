@@ -31,6 +31,7 @@ Apps 每个模块只有一个调度器，为匹配的应用维护隔离的内容
 | OEM Camera | 私有流模式、front role、I420→NV21；已审计 Phone JPEG 恢复及不同 ImageReader ABI。`apply_xiaomi_camera_fix.py`、`apply_pad_camera_native_fix.py` | Apps 联合核验 APK、JNI、runtime、HAL、libc++。provider/HWL 和出厂目录镜像在早期映射，更新后的私有库走晚期 PM 路径；基础功能不等于真机 ISP/录像算法完整支持。 |
 | 相机 ANGLE / Parrot | OEM 相机的按包 ANGLE 策略；可选 Parrot CPU AION 分配与纹理查询。`apply_pad_camera_fix.py`、`apply_camera_fix.py` | Apps 保留其他应用选项，Parrot 另核验完整 APK、调用库和 runtime；未知 workload 保留原内容。 |
 | Weather MGL / ANGLE | 私有 Vulkan EGL display、MGL 依赖重定向和已核验 ANGLE workload。`patch_weather.py` | Apps 两条内容规则，从 PM 动态发现路径，避开安装提取阶段，不重签 APK；镜像仍负责预装基线。 |
+| 杜比音轨解码 | 系统 MediaCodec 提供 AC-3、E-AC-3、E-AC-3 JOC 与 AC-4 软件解码。`dolby_codecs.py` | Core 共用离线载荷与镜像生成规则。服务、VINTF 和私有依赖一同写入 vendor，保留 ranchu 音频输出驱动。 |
 | 音频恢复 | tinyalsa 播放 `EIO` 有限重置并重试，保留其他错误和录音路径。`patch_audio.py` | Vendor 镜像，含机器码和布局变化，不能转成任意库的等长规则。 |
 | 虚拟场景相机 | rear ID、Xiaomi role、YUV 元数据、预览尺寸。`patch_camera_scene.py` | 镜像 provider + 编译后的 scene helper，核验 provider、C++ ABI 和依赖布局。 |
 | GNSS framework | 在释放 HAL monitor 后回调，避免同步回调死锁。`patch_gnss.py` | 已核验 `services.jar` 的 Java/DEX 镜像补丁。 |

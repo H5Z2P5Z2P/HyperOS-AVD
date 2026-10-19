@@ -230,8 +230,12 @@ native_privacy_eligible() {
     # Missing live Binder services do not establish missing hardware. Prove
     # the complete reviewed ranchu VINTF inventory in init's mount namespace.
     [ "$(getprop ro.boot.hardware)" = ranchu ] || return 1
-    local recipe="$MODDIR/display-privacy-capability.tsv" pins
+    local recipe="$MODDIR/display-privacy-capability.tsv" pins checksum
     [ -f "$recipe" ] && [ ! -L "$recipe" ] || return 1
+    checksum=$("$BB" awk '$2 == "display-privacy-capability.tsv" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1;
+        checksum=$1} END {if (found != 1) exit 1; print checksum}' "$MODDIR/SHA256SUMS") || return 1
+    native_hex "$checksum" && [ "$(native_hash "$recipe")" = "$checksum" ] || return 1
     pins=$(cat "$recipe") || return 1
     native_ns 1 "$BB" sh -c '
         set -f
@@ -243,7 +247,12 @@ native_privacy_eligible() {
         [ ! -L /odm ] || exit 1
         aliases=$("$bb" find "$root" ! -type d ! -type f -print) || exit 1
         [ -z "$aliases" ] || exit 1
-        expected=$(printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"file\" {print \$2}" | "$bb" sort)
+        optional=$(printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"optional-file\" {print \$2}")
+        [ "$optional" = "$root/manifest/hyperos-audio-codecs.xml" ] || exit 1
+        expected=$({
+            printf "%s\n" "$pins" | "$bb" awk -F "|" "\$1 == \"file\" {print \$2}"
+            if [ -e "$optional" ] || [ -L "$optional" ]; then printf "%s\n" "$optional"; fi
+        } | "$bb" sort)
         actual=$("$bb" find "$root" -type f -print) || exit 1
         actual=$(printf "%s\n" "$actual" | "$bb" sort) || exit 1
         [ -n "$expected" ] && [ "$actual" = "$expected" ] || exit 1
@@ -261,7 +270,7 @@ native_privacy_eligible() {
             [ -n "$expected" ] && [ "$expected" = "$actual" ]
         }
         composer=0; odm=0; vendor_legacy=0; odm_legacy=0; vendor_odm=0; compat=0
-        odm_apex=0; compat_apex=0; odm_directory=0; active_empty=0; tree_count=0
+        odm_apex=0; compat_apex=0; odm_directory=0; active_empty=0; tree_count=0; optional_count=0
         while IFS="|" read -r kind path checksum extra; do
             [ -z "$extra" ] || exit 1
             case "$kind" in
@@ -310,16 +319,21 @@ native_privacy_eligible() {
                     esac
                     verify_tree "$path" "$checksum" || exit 1
                     tree_count=$((tree_count + 1)) ;;
-                file|composer|apex-package|apex-fragment)
+                file|optional-file|composer|apex-package|apex-fragment)
                     [ "${#checksum}" = 64 ] || exit 1
                     case "$checksum" in *[!0-9a-f]*) exit 1 ;; esac
+                    if [ "$kind" = optional-file ]; then
+                        [ "$path" = "$optional" ] && [ "$optional_count" = 0 ] || exit 1
+                        optional_count=1
+                        if [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
+                    fi
                     [ -f "$path" ] && [ ! -L "$path" ] || exit 1
                     current=$("$bb" sha256sum "$path") || exit 1
                     current=${current%% *}
                     if [ "$kind" = composer ]; then
                         [ "$path" = /vendor/bin/hw/android.hardware.graphics.composer3-service.ranchu ] || exit 1
                         [ "$current" != "$checksum" ] || composer=1
-                    elif [ "$kind" = file ]; then
+                    elif [ "$kind" = file ] || [ "$kind" = optional-file ]; then
                         case "$path" in "$root"/*.xml|"$root"/manifest/*.xml) ;; *) exit 1 ;; esac
                         [ "$current" = "$checksum" ] || exit 1
                     else
@@ -335,7 +349,8 @@ native_privacy_eligible() {
 $pins
 EOF
         [ "$composer:$odm:$vendor_legacy:$odm_legacy:$vendor_odm:$compat" = 1:1:1:1:1:1 ] &&
-        [ "$odm_apex:$compat_apex:$odm_directory:$active_empty" = 1:1:1:1 ] && [ "$tree_count" = "$expected_trees" ]
+        [ "$odm_apex:$compat_apex:$odm_directory:$active_empty" = 1:1:1:1 ] &&
+        [ "$tree_count" = "$expected_trees" ] && [ "$optional_count" = 1 ]
     ' sh "$BB" "$pins"
 }
 

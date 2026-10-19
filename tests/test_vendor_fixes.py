@@ -1,5 +1,6 @@
 """Consolidated unit tests for OS4 vendor fixes: XiaoAI assistant and TinyALSA audio playback."""
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 from unittest.mock import Mock, patch, patch as mock_patch
 
 REPO = Path(__file__).resolve().parents[1]
@@ -19,6 +22,7 @@ from patch_assistant import (APK, APK_SHA256, PAD_APK_SHA256, PHONE_SOURCE, PAD_
                              patch, profile)
 import apply_assistant_fix
 from apply_assistant_fix import BOOT_SCRIPT, boot_script
+import dolby_codecs
 
 'Guard the bounded PCM recovery patch and retained vendor ELF metadata.'
 
@@ -53,8 +57,182 @@ class PlaybackGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Unsupported playback tinyalsa'):
             patch_audio(data)
 
-if __name__ == '__main__':
-    unittest.main()
+class DolbyCodecGuardTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.payload = dolby_codecs.PAYLOAD.read_bytes()
+        cls.sources, cls.manifest = dolby_codecs._read_payload(cls.payload)
+        cls.catalog = cls.sources['etc/media_codecs.xml']
+        cls.replacements = dolby_codecs.image_replacements(cls.catalog)
+
+    def test_catalog_update_is_exact_and_idempotent(self):
+        path = dolby_codecs.MAIN_CODEC_PATH.removeprefix('/vendor/')
+        updated = self.replacements[path][0]
+        self.assertEqual(dolby_codecs.image_replacements(updated), self.replacements)
+        includes = [node.attrib['href'] for node in ET.fromstring(updated).findall('Include')]
+        self.assertEqual(includes.count('media_codecs_dolby.xml'), 1)
+        for invalid in (b'unknown vendor update', self.catalog + b'\n', updated + b'\n'):
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported vendor media codec catalog'):
+                dolby_codecs.image_replacements(invalid)
+        with self.assertRaisesRegex(RuntimeError, 'Unsupported HIDL Codec2 entry'):
+            dolby_codecs.patch_service(b'unknown service')
+
+    def test_service_instance_patch_preserves_the_source_layout(self):
+        original = self.sources[dolby_codecs.SOURCE_SERVICE]
+        patched = dolby_codecs.patch_service(original)
+        self.assertEqual(hashlib.sha256(original).hexdigest(), dolby_codecs.SERVICE_BEFORE)
+        self.assertEqual(hashlib.sha256(patched).hexdigest(), dolby_codecs.SERVICE_AFTER)
+        self.assertEqual(len(patched), len(original))
+        changed = {index for index, pair in enumerate(zip(original, patched)) if pair[0] != pair[1]}
+        allowed = set(range(0x63b, 0x668)) | set(range(0x97e, 0x99a)) | set(range(0x8010, 0x82c0))
+        allowed.update(index for offset, _, _ in dolby_codecs.SERVICE_SITES
+                       for index in range(offset, offset + 4))
+        self.assertTrue(changed <= allowed)
+        immediate = lambda offset: (struct.unpack_from('<I', patched, offset)[0] >> 5) & 0xffff
+        length = immediate(0x4624) // 2
+        first = (immediate(0x4628) | immediate(0x4638) << 16).to_bytes(4, 'little')
+        second = (immediate(0x4634) | immediate(0x463c) << 16).to_bytes(4, 'little')
+        short_string = first[:3] + second
+        self.assertEqual(short_string[:length], b'dolby')
+        self.assertEqual(short_string[length], 0)
+        self.assertIn(b'_ZN7android25GetCodec2MiComponentStoreEv\0', patched)
+        self.assertNotIn(b'_ZN7android22GoldfishComponentStore6CreateEv\0', patched)
+        needed = []
+        for offset in range(0x8010, 0x82c0, 16):
+            tag, value = struct.unpack_from('<QQ', patched, offset)
+            if tag == 0:
+                break
+            if tag == 1:
+                start = 0x57c + value
+                needed.append(patched[start:patched.index(b'\0', start)].decode())
+        self.assertIn('libcodec2_store_mi.so', needed)
+        self.assertNotIn('libgoldfish_codec2_store.so', needed)
+        self.assertTrue(all('@1.1.so' not in name and '@1.2.so' not in name for name in needed))
+        self.assertEqual(dolby_codecs.patch_service(patched), patched)
+
+    def test_component_store_registers_only_the_two_bundled_decoders(self):
+        original = self.sources[dolby_codecs.STORE_SOURCE]
+        patched = dolby_codecs.patch_store(original)
+        self.assertEqual(hashlib.sha256(patched).hexdigest(), dolby_codecs.STORE_AFTER)
+        self.assertEqual(dolby_codecs.patch_store(patched), patched)
+        self.assertEqual(len(patched), len(original))
+        changed = {index for index, pair in enumerate(zip(original, patched)) if pair[0] != pair[1]}
+        allowed = {index for offset, _ in dolby_codecs.STORE_SITES for index in range(offset, offset + 4)}
+        self.assertTrue(changed <= allowed)
+        registered = []
+        for start in range(0x9ec8, 0x9fa8, 28):
+            instruction = struct.unpack_from('<I', patched, start + 24)[0]
+            if instruction == 0xd503201f:
+                continue
+            self.assertEqual(instruction & 0xfc000000, 0x94000000)
+            self.assertEqual(start + 24 + (instruction & 0x3ffffff) * 4, 0xbd1c)
+            address = 0x3000 + ((struct.unpack_from('<I', patched, start + 4)[0] >> 10) & 0xfff)
+            registered.append(patched[address:patched.index(b'\0', address)].decode())
+        self.assertEqual(registered, ['libcodec2_soft_ddpdec.so', 'libcodec2_soft_ac4dec.so'])
+        damaged = bytearray(original)
+        damaged[-1] ^= 1
+        for invalid in (b'unknown component store', damaged):
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported Dolby component store'):
+                dolby_codecs.patch_store(invalid)
+
+    def test_private_elf_inventory_and_receipt_are_complete(self):
+        def runpath(data):
+            offset = struct.unpack_from('<Q', data, 32)[0]
+            size, count = struct.unpack_from('<HH', data, 54)
+            headers = [struct.unpack_from('<IIQQQQQQ', data, offset + index * size)
+                       for index in range(count)]
+            dynamic = next(item for item in headers if item[0] == 2)
+            entries = dict(struct.unpack_from('<QQ', data, cursor)
+                           for cursor in range(dynamic[2], dynamic[2] + dynamic[5], 16))
+            address = entries[5] + entries[29]
+            segment = next(item for item in headers
+                           if item[0] == 1 and item[3] <= address < item[3] + item[5])
+            start = segment[2] + address - segment[3]
+            return data[start:data.index(b'\0', start)].decode()
+
+        def loads(data):
+            offset = struct.unpack_from('<Q', data, 32)[0]
+            size, count = struct.unpack_from('<HH', data, 54)
+            return [data[start:start + size] for index in range(count)
+                    if struct.unpack_from('<I', data, start := offset + index * size)[0] == 1]
+
+        service = dolby_codecs.SERVICE_PATH.removeprefix('/vendor/')
+        libraries = [path for path in self.replacements if path.startswith('lib64/')]
+        self.assertEqual(len(libraries), 56)
+        self.assertTrue(all(path.startswith('lib64/hyperos-audio-codecs/') for path in libraries))
+        self.assertIn('lib64/hyperos-audio-codecs/libcodec2_hidl_plugin.so', libraries)
+        self.assertNotIn('lib64/hyperos-audio-codecs/libcodec2_aidl_noisurface.so', libraries)
+        for path in [service, *libraries]:
+            body, mode, label = self.replacements[path]
+            self.assertEqual(body[:6], b'\x7fELF\x02\x01')
+            self.assertEqual(struct.unpack_from('<H', body, 18)[0], 183)
+            self.assertEqual(mode, 0o755 if path == service else 0o644)
+            self.assertEqual(label, 'u:object_r:mediacodec_exec:s0' if path == service
+                             else 'u:object_r:vendor_file:s0')
+            self.assertEqual(runpath(body), '$ORIGIN/../../lib64/hyperos-audio-codecs'
+                             if path == service else '$ORIGIN')
+            source_path = dolby_codecs.SOURCE_SERVICE if path == service else 'lib64/' + Path(path).name
+            self.assertEqual(loads(body)[:-1], loads(self.sources[source_path]))
+            self.assertEqual(struct.unpack('<IIQQQQQQ', loads(body)[-1])[-1], 16384)
+        body = self.replacements[service][0]
+        self.assertNotIn(b'_ZN7android22GoldfishComponentStore6CreateEv\0', body)
+        self.assertIn(b'_ZN7android25GetCodec2MiComponentStoreEv\0', body)
+        receipt = dolby_codecs.image_receipt()
+        self.assertEqual(receipt['abi'], 'arm64-v8a')
+        self.assertEqual(receipt['files_sha256'], {
+            '/vendor/' + path: hashlib.sha256(value[0]).hexdigest()
+            for path, value in self.replacements.items()})
+        package = dolby_codecs.files()
+        self.assertEqual(package['audio-codecs/decoder.payload'], self.payload)
+        self.assertEqual(json.loads(package['audio-codecs/image.json']), receipt)
+        for value in package.values():
+            if value.startswith(b'{'):
+                self.assertNotIn(b'emulator-', value)
+                self.assertNotIn(b'/Volumes/', value)
+
+    def test_dolby_catalog_and_startup_use_the_shared_service(self):
+        xml = ET.fromstring(dolby_codecs.CODEC_XML)
+        nodes = xml.findall('./Decoders/MediaCodec')
+        self.assertEqual({node.attrib['name'] for node in nodes},
+                         {'c2.dolby.eac3.decoder', 'c2.dolby.ac4.decoder'})
+        mimes = {node.attrib['name'] for node in xml.findall('.//Type')}
+        mimes.update(node.attrib['type'] for node in nodes if 'type' in node.attrib)
+        self.assertEqual(mimes, {'audio/ac3', 'audio/eac3', 'audio/eac3-joc', 'audio/ac4'})
+        self.assertIsNone(xml.find('Encoders'))
+        vintf = ET.fromstring(dolby_codecs.VINTF_XML)
+        self.assertEqual(vintf.findtext('./hal/name'), 'android.hardware.media.c2')
+        self.assertEqual(vintf.find('./hal').attrib['format'], 'hidl')
+        self.assertEqual(vintf.findtext('./hal/transport'), 'hwbinder')
+        self.assertEqual(vintf.findtext('./hal/version'), '1.0')
+        self.assertEqual(vintf.findtext('./hal/interface/name'), 'IComponentStore')
+        self.assertEqual(vintf.findtext('./hal/interface/instance'), 'dolby')
+        self.assertEqual(hashlib.sha256(dolby_codecs.VINTF_XML).hexdigest(),
+                         dolby_codecs.VINTF_SHA256)
+        self.assertIn(b'user mediacodec\n', dolby_codecs.INIT_RC)
+        self.assertIn(b'seclabel u:r:mediacodec:s0\n', dolby_codecs.INIT_RC)
+        self.assertIn(b'/vendor/lib64/hyperos-audio-codecs', dolby_codecs.INIT_RC)
+        runpaths = self.manifest['runpaths']
+        self.assertEqual(runpaths[dolby_codecs.SOURCE_SERVICE],
+                         '$ORIGIN/../../lib64/hyperos-audio-codecs')
+        self.assertEqual({value for name, value in runpaths.items() if name.startswith('lib64/')},
+                         {'$ORIGIN'})
+
+    def test_modified_asset_and_unsafe_archive_members_are_rejected(self):
+        changed = bytearray(self.payload)
+        changed[-1] ^= 1
+        with self.assertRaisesRegex(RuntimeError, 'asset SHA-256 mismatch'):
+            dolby_codecs._read_payload(changed)
+        for name in ('../escape.so', '/vendor/lib64/escape.so', 'lib64/nested/escape.so'):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, 'w') as archive:
+                archive.writestr('manifest.json', '{}')
+                archive.writestr(name, b'bad')
+                archive.writestr('lib64/valid.so', b'bad')
+            data = output.getvalue()
+            with mock_patch.object(dolby_codecs, 'PAYLOAD_SHA256', hashlib.sha256(data).hexdigest()):
+                with self.assertRaisesRegex(RuntimeError, 'Invalid Dolby codec asset member'):
+                    dolby_codecs._read_payload(data)
 
 'Guard the XiaoAI native patch and the unchanged signed APK boundary.'
 
