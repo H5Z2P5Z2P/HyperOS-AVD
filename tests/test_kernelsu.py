@@ -242,8 +242,24 @@ class CurrentRamdiskArtifactTests(RamdiskArtifactFixture, unittest.TestCase):
             with self.subTest(workspace=name):
                 source, stat = (path.read_bytes(), path.stat())
                 output, marker = fixes.patch_ramdisk(source, target=self.current)
-                self.assertIsNotNone(output)
-                self.assertEqual(marker['original_config']['parameters'], ['allow_shell'])
+                if output is None:
+                    self.assertTrue(marker['already_patched'])
+                else:
+                    self.assertEqual(marker['original_config']['parameters'], ['allow_shell'])
+                kind, before = fixes.unpack(source)
+                after_kind, after = fixes.unpack(source if output is None else output)
+                self.assertEqual(after_kind, kind)
+                old_entries, new_entries = fixes.parse_cpio(before), fixes.parse_cpio(after)
+                self.assertEqual([entry['name'] for entry in old_entries],
+                                 [entry['name'] for entry in new_entries])
+                self.assertIn(b'ksu_config', [entry['name'] for entry in new_entries])
+                for old, new in zip(old_entries, new_entries):
+                    if old['name'] == fixes.MEMBER:
+                        self.assertEqual(after[new['body']:new['body'] + new['size']], self.quiet_current)
+                    else:
+                        self.assertEqual(before[old['offset']:old['end']], after[new['offset']:new['end']])
+                    if new['name'] == b'ksu_config':
+                        self.assertEqual(after[new['body']:new['body'] + new['size']], b'allow_shell=1')
                 self.assertEqual(path.read_bytes(), source)
                 self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
 

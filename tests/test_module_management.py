@@ -416,7 +416,8 @@ class LifecycleTests(unittest.TestCase):
                     stack.enter_context(patch.object(module, 'official'))
                     root = stack.enter_context(patch.object(module, 'root', return_value=flag))
                     adb = stack.enter_context(patch.object(module, 'adb'))
-                    stack.enter_context(patch.object(module, 'ROOT', self.folder / 'unused'))
+                    if hasattr(module, 'ROOT'):
+                        stack.enter_context(patch.object(module, 'ROOT', self.folder / 'unused'))
                     args = ({}, self.folder / 'unsupported-payload') if module_name == 'apply_boot_service_fix' else ({},)
                     self.assertEqual(module.install(*args), {'preserved': True, 'lifecycle': [flag]})
                     self.assertEqual(root.call_count, 1)

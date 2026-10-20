@@ -2502,7 +2502,8 @@ class TcmCapabilityShellTests(unittest.TestCase):
         (self.module / 'tcm-capability.sh').write_text(script)
         self.props = self.root / 'properties.json'
         self.base = {'ro.boot.hardware': 'ranchu', 'ro.mi.os.version.incremental': 'OS4.99.TEST',
-                     'sys.boot_completed': '0', 'ro.kernel.qemu': '1', 'ro.boot.qemu': '1'}
+                     'sys.boot_completed': '0', 'ro.kernel.qemu': '1', 'ro.boot.qemu': '1',
+                     'ro.product.cpu.abi': 'arm64-v8a'}
         self.props.write_text(json.dumps(self.base))
         self.trace = self.root / 'effects'
         (self.bin / 'getprop').write_text('#!' + sys.executable + '\n' + '''import json,os,sys
