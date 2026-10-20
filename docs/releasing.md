@@ -100,8 +100,8 @@ Installer 打包前核对源码版本、生成的 `installer.json` 与 ZIP 文�
 
 ## 发布顺序
 
-发布时，先创建 Installer 1.3.1 正式 Release 并设为 Latest，再发布 Phone r6.2 与 Pad r3.2 普通正式 Release。两个镜像均使用 `--latest=false`，不设置 Pre-release，GitHub Latest 安装入口继续指向 Installer。原 r6、r3 完整包及历史修订附件全部保留。
+发布时，先创建 Installer 1.3.1 正式 Release 并设为 Latest，再发布 Phone r6.2 与 Pad r3.2。两个镜像沿用 Pre-release，均使用 `--prerelease --latest=false`，GitHub Latest 安装入口继续指向 Installer。原 r6、r3 完整包及历史修订附件全部保留。
 
-发布后检查三条 Release 元数据与公共安装入口，确认 Installer 为 Latest，两个镜像为普通 Release，菜单能列出相应版本，附件与清单中的哈希一致。
+发布后检查三条 Release 元数据与公共安装入口，确认 Installer 为 Latest，两个镜像为 Pre-release，菜单能列出相应版本，附件与清单中的哈希一致。
 
 [Phone r6.2 正文](releases/os4-r6.2.md) · [Pad r3.2 正文](releases/os4-pad-r3.2.md) · [Installer 1.3.1 正文](releases/installer-v1.3.1.md) · [安装 / 升级 / 恢复指南](installing.md)
