@@ -330,7 +330,9 @@ def prepare(source, output, variant='os4-official'):
     for path, (content, _, _) in edits.items():
         if erofs(candidate, '/' + path) != content:
             raise RuntimeError('Release preparation mismatch: ' + path)
-    clone(accepted / 'vendor.img', work / 'vendor.img')
+    from dolby_codecs import build_vendor as build_codec_vendor
+    info['audio_codecs'] = build_codec_vendor(accepted / 'vendor.img', work / 'vendor.img',
+                                              work / 'vendor-codecs')
     clone(accepted / 'system_dlkm.img', work / 'base/system_dlkm.img')
     partitions = [
         ('system', candidate), ('vendor', work / 'vendor.img'),

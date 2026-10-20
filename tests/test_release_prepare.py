@@ -66,6 +66,7 @@ class ReleasePreparationTests(unittest.TestCase):
         }
         self.cloned, self.builds, self.packs = [], [], []
         self.boot_receipt = {'schema': 1, 'targets': {'accepted-init': {'after': 'fixture'}}}
+        self.codec_receipt = {'schema': 1, 'integration': 'shared-dolby-codecs'}
         import kernelsu_release
         from patch_kernelsu import receipt
         self.ksu_receipt = receipt(kernelsu_release.ASSETS[kernelsu_release.LKM])
@@ -145,6 +146,13 @@ class ReleasePreparationTests(unittest.TestCase):
             (output / 'images/ramdisk.img').write_bytes(b'current quiet KernelSU boot image')
             return self.ksu_receipt
 
+        def codec_vendor(source, target, work):
+            self.assertEqual(source, self.output / 'work/accepted/vendor.img')
+            self.assertEqual(target, self.output / 'work/vendor.img')
+            self.assertEqual(work, self.output / 'work/vendor-codecs')
+            target.write_bytes(source.read_bytes() + b' with shared Dolby codecs')
+            return self.codec_receipt
+
         stack.enter_context(patch.object(prepare, 'clone', side_effect=clone))
         stack.enter_context(patch.object(prepare, 'unpack', side_effect=unpack))
         stack.enter_context(patch.object(prepare, 'erofs', side_effect=read))
@@ -167,6 +175,7 @@ class ReleasePreparationTests(unittest.TestCase):
             return_value=(self.input_engine_pin, {'output': digest(self.latest)})))
         self.patch_mock = stack.enter_context(patch.object(patch_flutter, 'patch', return_value=self.latest))
         self.ksu_mock = stack.enter_context(patch.object(prepare, 'prepare_release_kernelsu', side_effect=kernelsu))
+        self.codec_mock = stack.enter_context(patch('dolby_codecs.build_vendor', side_effect=codec_vendor))
         return stack
 
     def test_canonical_input_without_work_cache_preserves_source_ota_and_partitions(self):
@@ -185,8 +194,10 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertFalse((self.output / 'tools/os4-core').exists())
         inputs = dict(self.packs[0])
         self.assertEqual(inputs['system'], b'updated accepted raw system')
-        self.assertEqual({name: inputs[name] for name in self.partitions if name != 'system'},
-                         {name: content for name, content in self.partitions.items() if name != 'system'})
+        self.assertEqual(inputs['vendor'], b'accepted vendor with shared Dolby codecs')
+        self.assertEqual({name: inputs[name] for name in self.partitions if name not in ('system', 'vendor')},
+                         {name: content for name, content in self.partitions.items()
+                          if name not in ('system', 'vendor')})
         edits = self.builds[0]['edits']
         self.assertEqual(edits[prepare.SHARED_FLUTTER],
                          (self.latest, 0o644, 'u:object_r:system_lib_file:s0'))
@@ -210,6 +221,8 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(info['raw_sha256'], digest(b'updated accepted raw system'))
         self.assertEqual(info['boot_policy'], self.boot_receipt)
         self.assertEqual(info['kernelsu_marker_fix'], self.ksu_receipt)
+        self.assertEqual(info['audio_codecs'], self.codec_receipt)
+        self.codec_mock.assert_called_once()
         self.assertEqual((self.output / 'images/ramdisk.img').read_bytes(), b'current quiet KernelSU boot image')
         self.ksu_mock.assert_called_once_with(self.output)
 
