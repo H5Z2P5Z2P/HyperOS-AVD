@@ -26,6 +26,58 @@ import setup
 
 
 class BundleRuntimeTests(unittest.TestCase):
+    def test_optional_clone_uses_new_independent_files_and_cleans_only_failed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'source.img'
+            with source.open('xb') as stream:
+                stream.truncate(delta_install.CHUNK)
+            source.chmod(0o400)
+            original = common.sha256(source)
+            output = folder / 'clone.img'
+            cloned = delta_install._clone_source(source, output)
+            if cloned:
+                self.assertNotEqual(source.stat().st_ino, output.stat().st_ino)
+                self.assertEqual(common.sha256(source), common.sha256(output))
+                with output.open('r+b') as stream:
+                    stream.write(b'independent output')
+                self.assertEqual(common.sha256(source), original)
+                self.assertEqual(source.stat().st_mode & 0o777, 0o400)
+                output.unlink()
+            else:
+                self.assertFalse(output.exists())
+            def failed_clone(*args, **kwargs):
+                output.write_bytes(b'partial clone')
+                raise subprocess.CalledProcessError(1, args[0])
+            with patch.object(delta_install.sys, 'platform', 'darwin'), \
+                    patch.object(delta_install.subprocess, 'run', side_effect=failed_clone):
+                self.assertFalse(delta_install._clone_source(source, output))
+            self.assertFalse(output.exists())
+            output.write_bytes(b'foreign preexisting output')
+            with patch.object(delta_install.sys, 'platform', 'darwin'), \
+                    self.assertRaisesRegex(RuntimeError, 'unused staging path'):
+                delta_install._clone_source(source, output)
+            self.assertEqual(output.read_bytes(), b'foreign preexisting output')
+
+    def test_clone_success_with_corrupt_seed_cannot_promote_a_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path, manifest, descriptor, source, old, _ = self.delta_bundle(Path(directory))
+            target = root / 'versions' / manifest['version']
+            original = (source / 'images/system.img').read_bytes()
+            def corrupt_clone(source, destination):
+                if source.name != 'system.img':
+                    return False
+                data = source.read_bytes()
+                destination.write_bytes(b'X' + data[1:])
+                return True
+            with patch.object(delta_install, '_clone_source', side_effect=corrupt_clone), \
+                    self.assertRaisesRegex(RuntimeError, 'Seeded incremental output checksum'):
+                delta_install.stage_delta(root, target, path, manifest, descriptor, source, old)
+            self.assertFalse(target.exists())
+            self.assertEqual((source / 'images/system.img').read_bytes(), original)
+            self.assertEqual((root / 'avd/userdata-qemu.img').read_bytes(), b'personal userdata')
+            self.assertFalse(list((root / 'versions').glob('.delta-*')))
+
     def poison_cache(self, source, marker):
         """Create a valid timestamp cache which normal Python would execute."""
         code = compile(f"from pathlib import Path\nPath({str(marker)!r}).write_text('unverified bytecode')\n"
@@ -341,6 +393,16 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
     def test_delta_stages_exact_target_with_new_removed_and_unchanged_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root, path, manifest, descriptor, source, old, patches = self.delta_bundle(Path(directory))
+            blank = source / 'images/userdata.img'
+            with blank.open('xb') as stream:
+                stream.truncate(delta_install.CHUNK)
+            blank.chmod(0o400)
+            blank_info = {'size': blank.stat().st_size, 'sha256': common.sha256(blank)}
+            old['files']['images/userdata.img'] = blank_info
+            manifest['files']['images/userdata.img'] = dict(blank_info)
+            for folder in (root, source):
+                (folder / 'local/installed-release.json').write_text(json.dumps(old))
+            descriptor['from_manifest_sha256'] = protocol.manifest_digest(old)
             compressed = (path.parent / descriptor['parts'][0]['name']).read_bytes()
             descriptor['parts'] = []
             split = len(compressed) // 2
@@ -351,8 +413,23 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
             selected = delta_install.select_delta(root, manifest)
             self.assertEqual(selected, (descriptor, source, old))
             target = root / 'versions' / manifest['version']
-            delta_install.stage_delta(root, target, path, manifest, *selected)
+            clones = []
+            original_clone = delta_install._clone_source
+            def clone_blank(original, destination):
+                if original != blank:
+                    return original_clone(original, destination)
+                shutil.copyfile(original, destination)
+                destination.chmod(0o600)
+                clones.append(destination)
+                return True
+            with patch.object(delta_install, '_clone_source', side_effect=clone_blank):
+                delta_install.stage_delta(root, target, path, manifest, *selected)
             protocol.verify_staged(target, manifest)
+            self.assertEqual(len(clones), 1)
+            self.assertEqual(common.sha256(target / 'images/userdata.img'), blank_info['sha256'])
+            self.assertEqual((target / 'images/userdata.img').stat().st_mode & 0o777, 0o644)
+            self.assertEqual(common.sha256(blank), blank_info['sha256'])
+            self.assertEqual(blank.stat().st_mode & 0o777, 0o400)
             self.assertEqual((target / 'images/system.img').read_bytes(), b'new')
             self.assertEqual((target / 'tools/new.txt').read_bytes(), b'new release helper')
             self.assertFalse((target / 'tools/obsolete.txt').exists())

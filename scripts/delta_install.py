@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.parse
@@ -283,6 +285,25 @@ def _template_check(directory):
     setup.validate_memory(properties)
 
 
+def _clone_source(source, destination):
+    """Try a same-volume clone only inside the new private staging tree."""
+    if (sys.platform != 'darwin' or source.stat().st_size < CHUNK
+            or source.stat().st_dev != destination.parent.stat().st_dev):
+        return False
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError('Incremental clone requires an unused staging path.')
+    try:
+        subprocess.run(['/bin/cp', '-c', str(source), str(destination)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        bundle_runtime.regular(destination, destination.parent)
+        destination.chmod(stat.S_IMODE(destination.stat().st_mode) | stat.S_IWUSR)
+    except (OSError, subprocess.CalledProcessError):
+        # Only this new staging path may have been created by the failed clone.
+        destination.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def stage_delta(root, target, manifest_path, manifest, descriptor, source_root, old_manifest):
     """Reconstruct and verify a fresh version before publishing its directory."""
     root, requested_target = Path(root).resolve(), Path(target)
@@ -318,8 +339,11 @@ def stage_delta(root, target, manifest_path, manifest, descriptor, source_root, 
             original, destination = source / name, files / name
             _verify_file(original, root, info)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with original.open('rb') as incoming, destination.open('xb') as outgoing:
-                _copy_part(incoming, outgoing, {'name': name, **info})
+            if _clone_source(original, destination):
+                destination.chmod(0o644)
+            else:
+                with original.open('rb') as incoming, destination.open('xb') as outgoing:
+                    _copy_part(incoming, outgoing, {'name': name, **info})
             _verify_file(original, root, info)
             _verify_file(destination, files, info)
         seen = set()
@@ -339,10 +363,13 @@ def stage_delta(root, target, manifest_path, manifest, descriptor, source_root, 
                         old_size = old['files'][name]['size'] if original is not None else 0
                         if original is not None:
                             _verify_file(original, root, old['files'][name])
-                        with archive.extractfile(member) as patch, destination.open('xb') as output:
-                            incremental.apply_patch(original, patch, output, old_size, info['size'])
+                        seeded = original is not None and _clone_source(original, destination)
+                        with archive.extractfile(member) as patch, destination.open('r+b' if seeded else 'xb') as output:
+                            incremental.apply_patch(original, patch, output, old_size, info['size'], seeded=seeded)
                             if patch.read(1):
                                 raise RuntimeError('Trailing bytes in incremental patch: ' + name)
+                        if seeded:
+                            destination.chmod(0o644)
                         if original is not None:
                             _verify_file(original, root, old['files'][name])
                         _verify_file(destination, files, info)

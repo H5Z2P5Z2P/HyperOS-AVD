@@ -10,6 +10,7 @@ the streams provides compression; applying a delta needs no external binary.
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -22,6 +23,7 @@ from common import sha256
 PROTOCOL = 'block-delta-v1'
 MAGIC = b'HAVDDELTA1\0'
 BLOCK = 4 * 1024
+IO_BLOCK = 1024 * 1024
 MAX_INDEX_BLOCKS = 131072
 HEADER_SIZE = len(MAGIC) + 16
 UINT64_MAX = 2**64 - 1
@@ -141,7 +143,7 @@ def write_patch(source, target, output_stream):
             previous.close()
 
 
-def apply_patch(source, patch_stream, output_stream, source_size, target_size):
+def apply_patch(source, patch_stream, output_stream, source_size, target_size, *, seeded=False):
     """Apply a bounded patch, rejecting malformed records and trailing content."""
     source_size, target_size = _size(source_size), _size(target_size)
     if source is None:
@@ -152,14 +154,49 @@ def apply_patch(source, patch_stream, output_stream, source_size, target_size):
     header = _read_exact(patch_stream, HEADER_SIZE)
     if header[:len(MAGIC)] != MAGIC or struct.unpack('<QQ', header[len(MAGIC):]) != (source_size, target_size):
         raise RuntimeError('Incremental patch header differs from its manifest.')
+    # Never leave stale bytes by seeking over an existing output. Exclusive
+    # empty files and anonymous temporary files have no prior content.
+    sparse = False
+    try:
+        output_info = os.fstat(output_stream.fileno())
+        sparse = (stat.S_ISREG(output_info.st_mode) and output_info.st_size == 0
+                  and output_info.st_nlink in (0, 1) and output_stream.tell() == 0
+                  and output_stream.seekable()
+                  and ('x' in getattr(output_stream, 'mode', '') or output_info.st_nlink == 0))
+    except (AttributeError, OSError, ValueError):
+        pass
+    zeros = bytes(BLOCK)
+    pending_zeros = 0
     previous = Path(source).open('rb') if source is not None else io.BytesIO()
     try:
+        if seeded:
+            try:
+                source_info = os.fstat(previous.fileno())
+                output_info = os.fstat(output_stream.fileno())
+                valid_seed = (stat.S_ISREG(output_info.st_mode) and output_info.st_nlink == 1
+                    and output_info.st_size == source_size and output_stream.tell() == 0
+                    and output_stream.readable() and output_stream.writable() and output_stream.seekable()
+                    and (output_info.st_dev, output_info.st_ino) != (source_info.st_dev, source_info.st_ino))
+            except (AttributeError, OSError, ValueError):
+                valid_seed = False
+            if not valid_seed:
+                raise RuntimeError('Seeded incremental output must be an independent read-write source copy.')
+            digest = hashlib.sha256()
+            while chunk := output_stream.read(IO_BLOCK):
+                digest.update(chunk)
+            output_stream.seek(0)
+            if digest.hexdigest() != sha256(source):
+                raise RuntimeError('Seeded incremental output checksum differs from its source.')
         produced = 0
         while True:
             opcode = _read_exact(patch_stream, 1)
             if opcode == b'E':
                 if produced != target_size or patch_stream.read(1):
                     raise RuntimeError('Incremental patch has missing or trailing data.')
+                if sparse or seeded:
+                    if pending_zeros:
+                        output_stream.seek(pending_zeros, os.SEEK_CUR)
+                    output_stream.truncate(target_size)
                 return
             if opcode == b'C':
                 offset, length = struct.unpack('<QQ', _read_exact(patch_stream, 16))
@@ -175,10 +212,28 @@ def apply_patch(source, patch_stream, output_stream, source_size, target_size):
             remaining = target_size - produced
             if not min(BLOCK, remaining) <= length <= remaining or not length:
                 raise RuntimeError('Incremental record is outside its target bounds.')
+            if seeded and opcode == b'C' and offset == produced:
+                output_stream.seek(length, os.SEEK_CUR)
+                produced += length
+                continue
             count = length
             while count:
                 chunk = _read_exact(stream, min(BLOCK, count))
-                output_stream.write(chunk)
+                if sparse and chunk == zeros[:len(chunk)]:
+                    pending_zeros += len(chunk)
+                elif seeded and chunk == zeros[:len(chunk)]:
+                    position = output_stream.tell()
+                    existing = output_stream.read(len(chunk))
+                    output_stream.seek(position)
+                    if existing == zeros[:len(existing)]:
+                        output_stream.seek(len(chunk), os.SEEK_CUR)
+                    else:
+                        output_stream.write(chunk)
+                else:
+                    if pending_zeros:
+                        output_stream.seek(pending_zeros, os.SEEK_CUR)
+                        pending_zeros = 0
+                    output_stream.write(chunk)
                 count -= len(chunk)
             produced += length
     finally:

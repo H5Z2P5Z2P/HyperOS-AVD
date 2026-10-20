@@ -640,6 +640,90 @@ class IncrementalReleaseTests(unittest.TestCase):
                 incremental.apply_patch(path, io.BytesIO(header + b'E'), io.BytesIO(), 4, 4)
             path.unlink()
 
+    def test_patch_sparse_new_files_preserve_copy_data_tail_zeros_and_existing_outputs(self):
+        block = incremental.BLOCK
+        original = b'A' * block + bytes(block * 64) + b'B' * block
+        content = b'C' * block + original + bytes(block * 64 + 113)
+        source = self.root / 'sparse-source.img'
+        source.write_bytes(original)
+        for index, previous in enumerate((source, None)):
+            with self.subTest(source=previous is not None):
+                patch_data = io.BytesIO()
+                target = self.root / 'sparse-target.img'
+                target.write_bytes(content)
+                incremental.write_patch(previous, target, patch_data)
+                data = patch_data.getvalue()
+                output = self.root / ('sparse-output-' + str(index))
+                with output.open('xb') as stream:
+                    incremental.apply_patch(previous, io.BytesIO(data), stream,
+                        len(original) if previous else 0, len(content))
+                    self.assertEqual(stream.tell(), len(content))
+                self.assertEqual(output.stat().st_size, len(content))
+                self.assertEqual(digest(output.read_bytes()), digest(content))
+                self.assertLess(output.stat().st_blocks * 512, len(content) // 2)
+                self.assertEqual(source.read_bytes(), original)
+                # In-place or offset outputs keep the original write behavior:
+                # zero bytes replace old content, and no trailing bytes vanish.
+                existing = self.root / ('existing-output-' + str(index))
+                existing.write_bytes(b'X' * (len(content) + block))
+                with existing.open('r+b') as stream:
+                    incremental.apply_patch(previous, io.BytesIO(data), stream,
+                        len(original) if previous else 0, len(content))
+                self.assertEqual(existing.read_bytes(), content + b'X' * block)
+                offset = self.root / ('offset-output-' + str(index))
+                with offset.open('xb') as stream:
+                    stream.write(b'prefix')
+                    incremental.apply_patch(previous, io.BytesIO(data), stream,
+                        len(original) if previous else 0, len(content))
+                self.assertEqual(offset.read_bytes(), b'prefix' + content)
+                corrupt = self.root / ('invalid-output-' + str(index))
+                with corrupt.open('xb') as stream, self.assertRaisesRegex(RuntimeError, 'trailing data'):
+                    incremental.apply_patch(previous, io.BytesIO(data + b'extra'), stream,
+                        len(original) if previous else 0, len(content))
+
+    def test_seeded_patch_reuses_verified_source_and_rejects_unsafe_outputs(self):
+        block = incremental.BLOCK
+        original = b'A' * block + b'B' * block + bytes(block) + b'C' * block + b'D' * block
+        source, target = self.root / 'seed-source.img', self.root / 'seed-target.img'
+        source.write_bytes(original)
+        cases = (b'A' * block + bytes(block) + b'D' * block + bytes(block + 113),
+                 b'D' * block + b'A' * block + bytes(block) + b'C' * block + b'new'.ljust(block, b'!')
+                 + bytes(block + 113))
+        for index, content in enumerate(cases):
+            with self.subTest(size=len(content)):
+                target.write_bytes(content)
+                patch_data = io.BytesIO()
+                incremental.write_patch(source, target, patch_data)
+                output = self.root / ('seeded-output-' + str(index))
+                shutil.copyfile(source, output)
+                with output.open('r+b') as stream:
+                    incremental.apply_patch(source, io.BytesIO(patch_data.getvalue()), stream,
+                                            len(original), len(content), seeded=True)
+                    self.assertEqual(stream.tell(), len(content))
+                self.assertEqual(output.stat().st_size, len(content))
+                self.assertEqual(digest(output.read_bytes()), digest(content))
+                self.assertEqual(source.read_bytes(), original)
+        for failure in ('changed', 'size', 'position', 'read-only', 'same-inode'):
+            output = self.root / ('unsafe-seed-' + failure)
+            shutil.copyfile(source, output)
+            mode = 'rb' if failure == 'read-only' else 'r+b'
+            if failure == 'changed':
+                output.write_bytes(b'X' + original[1:])
+            elif failure == 'size':
+                output.write_bytes(original + b'extra')
+            elif failure == 'same-inode':
+                output = source
+            with self.subTest(failure=failure), output.open(mode) as stream:
+                if failure == 'position':
+                    stream.seek(1)
+                with self.assertRaisesRegex(RuntimeError, 'Seeded incremental output'):
+                    incremental.apply_patch(source, io.BytesIO(patch_data.getvalue()), stream,
+                                            len(original), len(cases[-1]), seeded=True)
+            self.assertEqual(source.read_bytes(), original)
+        with self.assertRaisesRegex(RuntimeError, 'independent read-write source copy'):
+            incremental.apply_patch(source, io.BytesIO(patch_data.getvalue()), io.BytesIO(original),
+                                    len(original), len(cases[-1]), seeded=True)
+
     def test_same_base_validation_rejects_provenance_and_version_changes(self):
         old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'old')
         new, _ = self.bundle(self.root / 'new', 'v1.0.1-a17-hyperos4-hongkong-r2', b'new')
