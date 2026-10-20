@@ -238,6 +238,8 @@ def main():
                         help='Include verbose Emulator and guest kernel output in the host log')
     parser.add_argument('--no-host-color-fix', action='store_true',
                         help='Disable the OS4 macOS sRGB window tag for this launch')
+    parser.add_argument('--no-host-trackpad', action='store_true',
+                        help='Disable macOS two-finger touch scrolling for this launch')
     parser.add_argument('--skip-oobe', action='store_true',
                         help='Skip Xiaomi provisioning and open the native launcher')
     args = parser.parse_args()
@@ -283,6 +285,7 @@ def main():
     launch_environment = environment(ROOT, config['name'],
                                      enabled=not (args.headless or args.no_host_color_fix),
                                      multi_display=not args.headless,
+                                     trackpad=not (args.headless or args.no_host_trackpad),
                                      emulator=Path(config['sdk']).resolve() /
                                      'emulator/qemu/darwin-aarch64/qemu-system-aarch64')
     from host_launch import start

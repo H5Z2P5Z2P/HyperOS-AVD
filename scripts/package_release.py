@@ -783,9 +783,9 @@ def main():
     paths.update(current_kernelsu_paths(root, metadata))
     if args.variant != 'os3':
         paths['config/avd.ini'] = root / 'config/avd.ini'
-        from host_color import build as build_host_color
-        for path in build_host_color(root):
-            paths['tools/' + path.name] = path
+    from host_color import build as build_host_color
+    for path in build_host_color(root):
+        paths['tools/' + path.name] = path
     if metadata['format'] == 3:
         from core_context import prepare as prepare_core_context
         from apply_app_compat import prepare_prebuilt as prepare_app_compat

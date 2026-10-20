@@ -117,6 +117,7 @@ class HostLaunchTests(unittest.TestCase):
             'DYLD_INSERT_LIBRARIES': '/tmp/owned-srgb.dylib', 'HYPEROS_AVD_SRGB': '1',
             'HYPEROS_AVD_SRGB_AVD': self.config['name'], 'HYPEROS_AVD_MULTI_DISPLAY': '1',
             'HYPEROS_AVD_DISPLAY_RECIPE': '/tmp/owned-recipe.json',
+            'HYPEROS_AVD_TRACKPAD': '1',
             'QT_SCALE_FACTOR': '0.7',
             'MVK_CONFIG_LOG_LEVEL': '0', 'VK_ICD_FILENAMES': '/tmp/driver.json',
             'GITHUB_TOKEN': 'private-token', 'OPENAI_API_KEY': 'private-key',
@@ -129,7 +130,7 @@ class HostLaunchTests(unittest.TestCase):
         selected = json.loads(request.read_text())['environment']
         self.assertEqual(set(selected), {'HOME', 'ANDROID_AVD_HOME', 'DYLD_INSERT_LIBRARIES',
             'HYPEROS_AVD_SRGB', 'HYPEROS_AVD_SRGB_AVD', 'HYPEROS_AVD_MULTI_DISPLAY', 'QT_SCALE_FACTOR',
-            'HYPEROS_AVD_DISPLAY_RECIPE',
+            'HYPEROS_AVD_DISPLAY_RECIPE', 'HYPEROS_AVD_TRACKPAD',
             'MVK_CONFIG_LOG_LEVEL', 'VK_ICD_FILENAMES'})
         for data in (self.plist.read_bytes(), self.receipt.read_bytes(), request.read_bytes()):
             for value in ('private-token', 'private-key', 'private-cloud', '/private/injected',
@@ -1011,12 +1012,13 @@ class DiagnosticCommandTests(unittest.TestCase):
             (root / 'local').mkdir()
             config = {'sdk': str(root / 'sdk'), 'name': 'Renamed_Device', 'port': 5586}
             verified = ['-append-userspace-opt', 'verified-rear-panel']
-            for metadata, flags, rear_options, color, multi_display in (
-                    (None, [], [], True, True),
-                    ({'source': 'custom'}, [], [], True, True),
-                    ({'source': 'google-apis'}, ['--no-host-color-fix'], [], False, True),
-                    ({'source': 'official-hongkong-ota'}, [], verified, True, True),
-                    ({'source': 'official-hongkong-ota'}, ['--headless'], verified, False, False)):
+            for metadata, flags, rear_options, color, multi_display, trackpad in (
+                    (None, [], [], True, True, True),
+                    ({'source': 'custom'}, [], [], True, True, True),
+                    ({'source': 'google-apis'}, ['--no-host-color-fix'], [], False, True, True),
+                    ({'source': 'custom'}, ['--no-host-trackpad'], [], True, True, False),
+                    ({'source': 'official-hongkong-ota'}, [], verified, True, True, True),
+                    ({'source': 'official-hongkong-ota'}, ['--headless'], verified, False, False, False)):
                 manifest = root / 'local/build.json'
                 if metadata is None:
                     manifest.unlink(missing_ok=True)
@@ -1041,6 +1043,7 @@ class DiagnosticCommandTests(unittest.TestCase):
                     rear.assert_called_once_with(metadata)
                 environment.assert_called_once_with(root, config['name'], enabled=color,
                                                     multi_display=multi_display,
+                                                    trackpad=trackpad,
                                                     emulator=(root / 'sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64').resolve())
                 self.assertEqual('-no-window' in start.call_args.args[2], '--headless' in flags)
 

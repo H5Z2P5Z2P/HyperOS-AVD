@@ -17,6 +17,9 @@ def package(directory, version=VERSION):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     paths = runtime_files()
+    from host_color import build as build_host_color
+    for path in build_host_color(REPO_ROOT):
+        paths['tools/' + path.name] = path
     paths['docs/installing.md'] = REPO_ROOT / 'docs/installing.md'
     files = {name: {'size': p.stat().st_size, 'sha256': sha256(p)} for name, p in paths.items()}
     archive = directory / f'HyperOS-AVD-Installer-v{version}-macos-arm64.zip'

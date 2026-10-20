@@ -49,11 +49,8 @@ def validate_library(data):
     return INSTALL_NAME
 
 
-def build(root):
-    """Reuse verified release binaries; only source builds need Command Line Tools."""
-    source = REPO_ROOT / 'native/emulator_srgb.m'
-    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    directory = Path(root) / 'tools'
+def verified_library(directory, source_digest):
+    """Accept only a portable prebuilt matching this exact runtime source."""
     library, receipt = directory / LIBRARY, directory / RECEIPT
     if library.is_symlink() or receipt.is_symlink():
         raise RuntimeError('Refused a symlink sRGB attachment.')
@@ -68,6 +65,18 @@ def build(root):
             verified = False
         if verified:
             return library, receipt
+
+
+def build(root, use_runtime_prebuilt=False):
+    """Reuse verified release binaries; only source builds need Command Line Tools."""
+    source = REPO_ROOT / 'native/emulator_srgb.m'
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    directory = Path(root) / 'tools'
+    for candidate in (directory, REPO_ROOT / 'tools') if use_runtime_prebuilt else (directory,):
+        verified = verified_library(candidate, source_digest)
+        if verified:
+            return verified
+    library, receipt = directory / LIBRARY, directory / RECEIPT
     directory.mkdir(parents=True, exist_ok=True)
     # Build and verify away from the existing inode. A failed compiler or
     # malformed output leaves the previous library and receipt untouched.
@@ -123,7 +132,7 @@ def cached_library(library, receipt):
     return cached
 
 
-def environment(root, name, enabled=True, multi_display=False, emulator=None):
+def environment(root, name, enabled=True, multi_display=False, emulator=None, trackpad=False):
     """Keep the SDK and other emulator processes unchanged."""
     result = os.environ.copy()
     # A copied opt-in from an earlier launch cannot authorize another instance
@@ -132,18 +141,19 @@ def environment(root, name, enabled=True, multi_display=False, emulator=None):
     result.pop('HYPEROS_AVD_SRGB_AVD', None)
     result.pop('HYPEROS_AVD_MULTI_DISPLAY', None)
     result.pop('HYPEROS_AVD_DISPLAY_RECIPE', None)
+    result.pop('HYPEROS_AVD_TRACKPAD', None)
     manifest = Path(root) / 'local/build.json'
     color_enabled = enabled and manifest.is_file() and json.loads(manifest.read_text()).get('source') in (
         'official-hongkong-ota', 'official-yingtian-ota')
-    if (color_enabled or multi_display) and (not isinstance(name, str) or not name):
+    if (color_enabled or multi_display or trackpad) and (not isinstance(name, str) or not name):
         raise RuntimeError('The host window hook requires the owned launch AVD name.')
     recipe = None
     if multi_display and emulator is not None:
         from host_display import prepare
         recipe = prepare(emulator)
-    if not (color_enabled or recipe):
+    if not (color_enabled or recipe or trackpad):
         return result
-    library, receipt = build(root)
+    library, receipt = build(root, use_runtime_prebuilt=True)
     cached = cached_library(library, receipt)
     injected = result.get('DYLD_INSERT_LIBRARIES', '')
     # Replace/deduplicate only our authenticated hook. User-provided libraries
@@ -156,5 +166,7 @@ def environment(root, name, enabled=True, multi_display=False, emulator=None):
     if recipe:
         result['HYPEROS_AVD_MULTI_DISPLAY'] = '1'
         result['HYPEROS_AVD_DISPLAY_RECIPE'] = str(recipe)
+    if trackpad:
+        result['HYPEROS_AVD_TRACKPAD'] = '1'
     result['HYPEROS_AVD_SRGB_AVD'] = name
     return result

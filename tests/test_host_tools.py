@@ -143,7 +143,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
         prepare = patch('host_display.prepare', return_value=self.recipe)
         self.prepare = prepare.start()
         self.addCleanup(prepare.stop)
-        inherited = {'DYLD_INSERT_LIBRARIES': '/existing/plugin.dylib', 'HYPEROS_AVD_SRGB': '1', 'HYPEROS_AVD_SRGB_AVD': 'Old_AVD', 'HYPEROS_AVD_MULTI_DISPLAY': '1', 'HYPEROS_AVD_DISPLAY_RECIPE': '/old/recipe.json', 'UNRELATED_OPTION': 'kept'}
+        inherited = {'DYLD_INSERT_LIBRARIES': '/existing/plugin.dylib', 'HYPEROS_AVD_SRGB': '1', 'HYPEROS_AVD_SRGB_AVD': 'Old_AVD', 'HYPEROS_AVD_MULTI_DISPLAY': '1', 'HYPEROS_AVD_DISPLAY_RECIPE': '/old/recipe.json', 'HYPEROS_AVD_TRACKPAD': '1', 'UNRELATED_OPTION': 'kept'}
         environment = patch.dict(os.environ, inherited, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
@@ -158,7 +158,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
                 before = dict(os.environ)
                 with patch.object(host_color, 'build', return_value=(self.library, None)) as build, patch.object(host_color, 'cached_library', return_value=self.cached) as cache:
                     result = host_color.environment(self.root, name)
-                build.assert_called_once_with(self.root)
+                build.assert_called_once_with(self.root, use_runtime_prebuilt=True)
                 self.assertEqual(result['HYPEROS_AVD_SRGB'], '1')
                 self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], name)
                 self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
@@ -182,7 +182,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
                                                     multi_display=multi_display, emulator=self.emulator)
                 self.assertNotIn('HYPEROS_AVD_SRGB', result)
                 if multi_display:
-                    build.assert_called_once_with(self.root)
+                    build.assert_called_once_with(self.root, use_runtime_prebuilt=True)
                     self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], 'Arbitrary_Owned_Device')
                     self.assertEqual(result['HYPEROS_AVD_MULTI_DISPLAY'], '1')
                     self.assertEqual(result['HYPEROS_AVD_DISPLAY_RECIPE'], str(self.recipe))
@@ -204,7 +204,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
                 result = host_color.environment(self.root, 'Renamed_Phone',
                                                 enabled=color, multi_display=multi_display,
                                                 emulator=self.emulator)
-            build.assert_called_once_with(self.root)
+            build.assert_called_once_with(self.root, use_runtime_prebuilt=True)
             self.assertEqual(result.get('HYPEROS_AVD_SRGB'), '1' if color else None)
             self.assertEqual(result.get('HYPEROS_AVD_MULTI_DISPLAY'), '1' if multi_display else None)
             self.assertEqual(result.get('HYPEROS_AVD_DISPLAY_RECIPE'), str(self.recipe) if multi_display else None)
@@ -225,8 +225,28 @@ class HostColorEnvironmentTests(unittest.TestCase):
         self.assertNotIn('HYPEROS_AVD_SRGB_AVD', result)
         self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
         self.assertNotIn('HYPEROS_AVD_DISPLAY_RECIPE', result)
+        self.assertNotIn('HYPEROS_AVD_TRACKPAD', result)
         self.assertEqual(result['DYLD_INSERT_LIBRARIES'], '/existing/plugin.dylib')
         self.assertEqual(os.environ['HYPEROS_AVD_SRGB_AVD'], 'Old_AVD')
+
+    def test_trackpad_is_independent_of_color_manifest_and_display_abi(self):
+        self.prepare.return_value = None
+        for source in ('official-hongkong-ota', 'official-yingtian-ota', 'custom'):
+            self.manifest(source)
+            with self.subTest(source=source), \
+                    patch.object(host_color, 'build', return_value=(self.library, None)) as build, \
+                    patch.object(host_color, 'cached_library', return_value=self.cached):
+                result = host_color.environment(self.root, 'Renamed_Device', enabled=False,
+                                                multi_display=True, emulator=self.emulator,
+                                                trackpad=True)
+            build.assert_called_once_with(self.root, use_runtime_prebuilt=True)
+            self.assertEqual(result['HYPEROS_AVD_TRACKPAD'], '1')
+            self.assertEqual(result['HYPEROS_AVD_SRGB_AVD'], 'Renamed_Device')
+            self.assertNotIn('HYPEROS_AVD_SRGB', result)
+            self.assertNotIn('HYPEROS_AVD_MULTI_DISPLAY', result)
+            self.assertEqual(result['DYLD_INSERT_LIBRARIES'], str(self.cached.resolve()) + ':/existing/plugin.dylib')
+        with self.assertRaisesRegex(RuntimeError, 'AVD name'):
+            host_color.environment(self.root, '', enabled=False, trackpad=True)
 
     def test_owned_launch_requires_a_nonempty_name(self):
         self.manifest('official-yingtian-ota')
@@ -253,7 +273,7 @@ class HostColorEnvironmentTests(unittest.TestCase):
             self.assertEqual(result.get('HYPEROS_AVD_SRGB'), '1' if color else None)
             self.assertEqual(result.get('HYPEROS_AVD_SRGB_AVD'), 'Owned_Device' if color else None)
             if color:
-                build.assert_called_once_with(self.root)
+                build.assert_called_once_with(self.root, use_runtime_prebuilt=True)
             else:
                 build.assert_not_called()
         self.prepare.reset_mock()
@@ -365,6 +385,30 @@ class NativeHostColorGuardTests(unittest.TestCase):
         self.assertEqual(metadata['install_name'], host_color.INSTALL_NAME)
         self.assertEqual(metadata['sha256'], hashlib.sha256(self.library.read_bytes()).hexdigest())
 
+    def test_runtime_prebuilt_works_offline_without_changing_old_instance_tools(self):
+        runtime = self.root / 'runtime-prebuilt'
+        (runtime / 'native').mkdir(parents=True)
+        (runtime / 'native/emulator_srgb.m').write_bytes((REPO / 'native/emulator_srgb.m').read_bytes())
+        (runtime / 'tools').mkdir()
+        for name in (host_color.LIBRARY, host_color.RECEIPT):
+            shutil.copy2(self.root / 'tools' / name, runtime / 'tools' / name)
+        instance = self.root / 'older-instance'
+        (instance / 'tools').mkdir(parents=True)
+        old = instance / 'tools' / host_color.LIBRARY
+        old.write_bytes(b'old attachment')
+        with patch.object(host_color, 'REPO_ROOT', runtime), \
+                patch.object(host_color.subprocess, 'run') as compiler:
+            self.assertEqual(host_color.build(instance, use_runtime_prebuilt=True),
+                             (runtime / 'tools' / host_color.LIBRARY, runtime / 'tools' / host_color.RECEIPT))
+            compiler.assert_not_called()
+            self.assertEqual(old.read_bytes(), b'old attachment')
+            (runtime / 'native/emulator_srgb.m').write_bytes(b'changed source')
+            compiler.side_effect = RuntimeError('Compiler unavailable')
+            with self.assertRaisesRegex(RuntimeError, 'Compiler unavailable'):
+                host_color.build(instance, use_runtime_prebuilt=True)
+            compiler.assert_called_once()
+            self.assertEqual(old.read_bytes(), b'old attachment')
+
     def run_probe(self, arguments, enabled='1', expected='Renamed_Pad_API_99', multi_display=None):
         environment = os.environ.copy()
         environment.pop('HYPEROS_AVD_SRGB', None)
@@ -389,6 +433,128 @@ class NativeHostColorGuardTests(unittest.TestCase):
         for arguments, enabled, expected in cases:
             with self.subTest(arguments=arguments, enabled=enabled, expected=expected):
                 self.assertNotIn('sRGB tagging enabled', self.run_probe(arguments, enabled, expected))
+
+    def test_native_trackpad_streams_preserve_axes_scope_and_touch_lifecycle(self):
+        harness = self.root / 'trackpad.m'
+        harness.write_text('#include ' + json.dumps(str(REPO / 'native/emulator_srgb.m')) + '\n' + r'''
+#include <assert.h>
+static NSMutableArray<NSEvent *> *mouseEvents;
+@interface EmuGLView : NSView @end
+@implementation EmuGLView
+- (void)mouseDown:(NSEvent *)event { [mouseEvents addObject:event]; }
+- (void)mouseDragged:(NSEvent *)event { [mouseEvents addObject:event]; }
+- (void)mouseUp:(NSEvent *)event { [mouseEvents addObject:event]; }
+@end
+@interface ScrollProbe : NSEvent
+@property NSWindow *target;
+@property NSPoint point;
+@property NSEventPhase finger, momentum;
+@property CGFloat dx, dy;
+@property BOOL precise;
+@property NSEventModifierFlags flags;
+@end
+@implementation ScrollProbe
+- (NSEventType)type { return NSEventTypeScrollWheel; }
+- (NSWindow *)window { return self.target; }
+- (NSPoint)locationInWindow { return self.point; }
+- (NSEventPhase)phase { return self.finger; }
+- (NSEventPhase)momentumPhase { return self.momentum; }
+- (CGFloat)scrollingDeltaX { return self.dx; }
+- (CGFloat)scrollingDeltaY { return self.dy; }
+- (BOOL)hasPreciseScrollingDeltas { return self.precise; }
+- (NSEventModifierFlags)modifierFlags { return self.flags; }
+- (NSTimeInterval)timestamp { return NSProcessInfo.processInfo.systemUptime; }
+@end
+int main(void) { @autoreleasepool {
+    [NSApplication sharedApplication];
+    mouseEvents = [NSMutableArray array];
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,400,600)
+        styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    EmuGLView *guest = [[EmuGLView alloc] initWithFrame:NSMakeRect(20,30,300,500)];
+    [window.contentView addSubview:guest];
+    [window orderFront:nil];
+    ScrollProbe *event = [ScrollProbe new];
+    event.target = window; event.point = NSMakePoint(100,300); event.precise = YES;
+    event.finger = NSEventPhaseBegan;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 0);
+    event.finger = NSEventPhaseChanged; event.dx = 12; event.dy = 20;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 2);
+    assert(mouseEvents[0].type == NSEventTypeLeftMouseDown);
+    assert(NSEqualPoints(mouseEvents[0].locationInWindow, event.point));
+    assert(NSEqualPoints(mouseEvents[1].locationInWindow, NSMakePoint(112,280)));
+    event.dx = -8; event.dy = -9;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 3);
+    assert(NSEqualPoints(mouseEvents[2].locationInWindow, NSMakePoint(104,289)));
+    event.finger = NSEventPhaseEnded; event.dx = event.dy = 0;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 4);
+    assert(mouseEvents.lastObject.type == NSEventTypeLeftMouseUp && !trackpadDown);
+    event.finger = NSEventPhaseNone; event.momentum = NSEventPhaseBegan; event.dy = 500;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 4);
+    event.momentum = NSEventPhaseEnded;
+    assert(trackpadScrollEvent(event) == nil && trackpadMomentumWindow == nil);
+    // An unrelated momentum stream and ordinary mouse wheel stay native.
+    event.momentum = NSEventPhaseChanged;
+    assert(trackpadScrollEvent(event) == event);
+    event.momentum = NSEventPhaseNone;
+    assert(trackpadScrollEvent(event) == event);
+    // No touch is generated for an empty or cancelled candidate.
+    event.finger = NSEventPhaseBegan; event.dy = 0;
+    assert(trackpadScrollEvent(event) == nil);
+    event.finger = NSEventPhaseCancelled; event.dy = 100;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 4);
+    event.finger = NSEventPhaseBegan; event.dy = 0;
+    assert(trackpadScrollEvent(event) == nil);
+    event.finger = NSEventPhaseEnded;
+    assert(trackpadScrollEvent(event) == nil && mouseEvents.count == 4);
+    // Precise but unphased, modified, discrete, and outside-screen input passes through.
+    event.finger = NSEventPhaseBegan; event.flags = NSEventModifierFlagControl;
+    assert(trackpadScrollEvent(event) == event);
+    event.flags = 0; event.precise = NO;
+    assert(trackpadScrollEvent(event) == event);
+    event.precise = YES; event.point = NSMakePoint(390,590);
+    assert(trackpadScrollEvent(event) == event);
+    event.point = NSMakePoint(100,300); event.dx = 10000; event.dy = -10000;
+    assert(trackpadScrollEvent(event) == nil && trackpadDown);
+    NSRect guestRect = [guest convertRect:guest.bounds toView:nil];
+    if (!NSPointInRect(trackpadPoint, guestRect))
+        fprintf(stderr, "point=%s bounds=%s guest=%s\n", NSStringFromPoint(trackpadPoint).UTF8String,
+            NSStringFromRect(trackpadBounds).UTF8String, NSStringFromRect(guestRect).UTF8String);
+    assert(NSPointInRect(trackpadPoint, guestRect));
+    // Resizing, focus loss and a new physical click each release the contact once.
+    for (int reason = 0; reason < 3; ++reason) {
+        if (reason) { event.finger = NSEventPhaseBegan; event.dx = 10; event.dy = 0;
+            assert(trackpadScrollEvent(event) == nil && trackpadDown); }
+        NSUInteger count = mouseEvents.count;
+        if (reason == 0) {
+            guest.frame = NSMakeRect(20,30,300,400); event.finger = NSEventPhaseChanged;
+            assert(trackpadScrollEvent(event) == nil);
+        } else if (reason == 1) {
+            trackpadWindowChanged([NSNotification notificationWithName:NSApplicationDidResignActiveNotification object:NSApp]);
+        } else {
+            NSEvent *click = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                location:event.point modifierFlags:0 timestamp:event.timestamp
+                windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];
+            assert(trackpadLocalEvent(click) == click);
+        }
+        assert(!trackpadTracking && !trackpadDown && mouseEvents.count == count + 1);
+        assert(mouseEvents.lastObject.type == NSEventTypeLeftMouseUp);
+        trackpadRelease(event.timestamp, true);
+        assert(mouseEvents.count == count + 1);
+    }
+    return 0;
+} }
+''')
+        executable = self.root / 'trackpad'
+        result = subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror',
+                                 '-arch', 'arm64', '-mmacosx-version-min=12.0',
+                                 '-framework', 'AppKit', '-framework', 'QuartzCore',
+                                 str(harness), '-o', str(executable)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith('HYPEROS_AVD_') and key != 'DYLD_INSERT_LIBRARIES'}
+        result = subprocess.run([str(executable)], env=environment, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_primary_rotation_uses_only_each_reviewed_independent_window_pose(self):
         harness = self.root / 'rotation.m'
@@ -1203,9 +1369,18 @@ class TransportTests(unittest.TestCase):
     def test_installer_pins_helper_and_imports_it_from_packaged_scripts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            metadata = package_installer.package(root / 'release')
+            library, receipt = root / host_color.LIBRARY, root / host_color.RECEIPT
+            library.write_bytes(macho())
+            receipt.write_text(json.dumps({'source_sha256': hashlib.sha256((REPO / 'native/emulator_srgb.m').read_bytes()).hexdigest(),
+                                          'sha256': hashlib.sha256(macho()).hexdigest(),
+                                          'install_name': host_color.INSTALL_NAME}))
+            with patch.object(host_color, 'build', return_value=(library, receipt)) as build:
+                metadata = package_installer.package(root / 'release')
+            build.assert_called_once_with(REPO)
             helper = 'scripts/https_transport.py'
             with zipfile.ZipFile(root / 'release' / metadata['archive']['name']) as archive:
+                self.assertEqual(archive.read('HyperOS-AVD/tools/' + host_color.LIBRARY), library.read_bytes())
+                self.assertEqual(archive.read('HyperOS-AVD/tools/' + host_color.RECEIPT), receipt.read_bytes())
                 data = archive.read('HyperOS-AVD/' + helper)
                 self.assertEqual(hashlib.sha256(data).hexdigest(), metadata['files'][helper]['sha256'])
                 archive.extractall(root / 'Package with spaces')

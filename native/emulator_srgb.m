@@ -1,6 +1,7 @@
-// Correct owned emulator window presentation without changing Android pixels.
+// Adapt owned emulator host windows without changing Android pixels.
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
@@ -9,6 +10,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/loader.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +18,177 @@
 #include <unistd.h>
 
 static void (*originalViewDidMoveToWindow)(id, SEL);
+
+static __weak NSView *trackpadView;
+static __weak NSResponder *trackpadReceiver;
+static __weak NSWindow *trackpadWindow, *trackpadMomentumWindow;
+static bool trackpadTracking, trackpadDown;
+static NSPoint trackpadPoint;
+static NSRect trackpadBounds;
+static NSInteger trackpadEventNumber;
+
+static NSView *trackpadDisplayView(NSEvent *event) {
+    NSView *content = event.window.contentView;
+    if (!content) return nil;
+    // hitTest takes its receiver's superview coordinates, not local coordinates.
+    NSPoint point = content.superview ?
+        [content.superview convertPoint:event.locationInWindow fromView:nil] : event.locationInWindow;
+    for (NSView *view = [content hitTest:point]; view; view = view.superview) {
+        const char *name = object_getClassName(view);
+        if (!strcmp(name, "EmuGLView") || !strcmp(name, "EmuGLViewWithMetal")) return view;
+        if (view == content) break;
+    }
+    return nil;
+}
+
+static NSRect trackpadDisplayBounds(NSView *view) {
+    if (view.hiddenOrHasHiddenAncestor) return NSZeroRect;
+    NSRect bounds = [view convertRect:NSIntersectionRect(view.bounds, view.visibleRect) toView:nil];
+    if (bounds.size.width <= 1 || bounds.size.height <= 1) return NSZeroRect;
+    // Stay inside the guest view, including at a clipped display edge.
+    return NSInsetRect(bounds, 0.5, 0.5);
+}
+
+static NSPoint trackpadClampedPoint(NSPoint point, NSRect bounds) {
+    return NSMakePoint(fmin(fmax(point.x, NSMinX(bounds)), NSMaxX(bounds)),
+                       fmin(fmax(point.y, NSMinY(bounds)), NSMaxY(bounds)));
+}
+
+static NSResponder *trackpadEventReceiver(NSView *view) {
+    Class qtView = NSClassFromString(@"QNSView");
+    NSResponder *receiver = view;
+    for (unsigned int depth = 0; receiver && depth < 64; ++depth, receiver = receiver.nextResponder)
+        if (qtView && [receiver isKindOfClass:qtView]) return receiver;
+    return view;
+}
+
+static void trackpadSend(NSResponder *receiver, NSWindow *window, NSEventType type,
+                         NSPoint point, NSTimeInterval timestamp) {
+    if (!receiver || !window) return;
+    NSEvent *mouse = [NSEvent mouseEventWithType:type location:point modifierFlags:0
+        timestamp:timestamp windowNumber:window.windowNumber context:nil
+        eventNumber:trackpadEventNumber clickCount:1 pressure:type == NSEventTypeLeftMouseUp ? 0 : 1];
+    // The existing QNSView responder owns
+    // button state, display scaling, rotation and the secondary-display map.
+    // Use the initial receiver instead of hit-testing each generated drag.
+    if (type == NSEventTypeLeftMouseDown) [receiver mouseDown:mouse];
+    else if (type == NSEventTypeLeftMouseDragged) [receiver mouseDragged:mouse];
+    else [receiver mouseUp:mouse];
+}
+
+static void trackpadRelease(NSTimeInterval timestamp, bool suppressMomentum) {
+    NSResponder *receiver = trackpadReceiver;
+    NSWindow *window = trackpadWindow;
+    bool down = trackpadDown;
+    if (suppressMomentum && trackpadTracking) trackpadMomentumWindow = window;
+    trackpadDown = trackpadTracking = false;
+    trackpadView = nil;
+    trackpadReceiver = nil;
+    trackpadWindow = nil;
+    if (down) trackpadSend(receiver, window, NSEventTypeLeftMouseUp, trackpadPoint, timestamp);
+}
+
+static NSEvent *trackpadScrollEvent(NSEvent *event) {
+    NSEventPhase phase = event.phase, momentum = event.momentumPhase;
+    NSEventModifierFlags modified = NSEventModifierFlagControl | NSEventModifierFlagOption |
+        NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    if (!event.hasPreciseScrollingDeltas || (event.modifierFlags & modified)) {
+        trackpadRelease(event.timestamp, true);
+        return event;
+    }
+    if (momentum != NSEventPhaseNone) {
+        if (trackpadTracking && event.window == trackpadWindow) trackpadRelease(event.timestamp, true);
+        bool consumed = event.window && event.window == trackpadMomentumWindow;
+        if (momentum & (NSEventPhaseEnded | NSEventPhaseCancelled)) trackpadMomentumWindow = nil;
+        return consumed ? nil : event;
+    }
+    if (phase == NSEventPhaseNone) {
+        trackpadRelease(event.timestamp, true);
+        return event; // Preserve wheel and phase-less devices.
+    }
+    if (phase & (NSEventPhaseBegan | NSEventPhaseMayBegin)) {
+        trackpadRelease(event.timestamp, false);
+        trackpadMomentumWindow = nil;
+        // A physical mouse drag and a synthetic touch must never share Qt's button state.
+        if (NSEvent.pressedMouseButtons) return event;
+        NSView *view = trackpadDisplayView(event);
+        NSRect bounds = view ? trackpadDisplayBounds(view) : NSZeroRect;
+        if (!view || NSIsEmptyRect(bounds)) return event;
+        trackpadView = view;
+        trackpadReceiver = trackpadEventReceiver(view);
+        trackpadWindow = event.window;
+        trackpadBounds = bounds;
+        trackpadPoint = trackpadClampedPoint(event.locationInWindow, bounds);
+        trackpadTracking = true;
+        ++trackpadEventNumber;
+    }
+    if (!trackpadTracking)
+        return event.window && event.window == trackpadMomentumWindow ? nil : event;
+    NSView *view = trackpadView;
+    NSWindow *window = trackpadWindow;
+    if (!view || !window || event.window != window || view.window != window ||
+        !NSEqualRects(trackpadBounds, trackpadDisplayBounds(view))) {
+        bool consumed = window && event.window == window;
+        trackpadRelease(event.timestamp, true);
+        return consumed ? nil : event;
+    }
+    if (phase & NSEventPhaseCancelled) {
+        // Cancellation deltas can contain an undo jump. Never turn one into a tap.
+        trackpadRelease(event.timestamp, true);
+        return nil;
+    }
+    if (phase & NSEventPhaseMayBegin) return nil;
+    CGFloat dx = event.scrollingDeltaX, dy = event.scrollingDeltaY;
+    if (isfinite(dx) && isfinite(dy)) {
+        // AppKit already applies the user's natural-scrolling preference. Its
+        // content deltas use down-positive Y; window base coordinates use Y up.
+        NSPoint next = trackpadClampedPoint(NSMakePoint(trackpadPoint.x + dx,
+                                                       trackpadPoint.y - dy), trackpadBounds);
+        if (!NSEqualPoints(next, trackpadPoint)) {
+            if (!trackpadDown) {
+                trackpadDown = true;
+                trackpadSend(trackpadReceiver, window, NSEventTypeLeftMouseDown, trackpadPoint, event.timestamp);
+                if (!trackpadTracking || trackpadView != view || trackpadWindow != window) return nil;
+            }
+            trackpadPoint = next;
+            trackpadSend(trackpadReceiver, window, NSEventTypeLeftMouseDragged, next, event.timestamp);
+        }
+    }
+    if (phase & NSEventPhaseEnded) trackpadRelease(event.timestamp, true);
+    return nil;
+}
+
+static NSEvent *trackpadLocalEvent(NSEvent *event) {
+    if (event.type == NSEventTypeScrollWheel) return trackpadScrollEvent(event);
+    if (event.type != NSEventTypeFlagsChanged ||
+        (event.modifierFlags & (NSEventModifierFlagControl | NSEventModifierFlagOption |
+                               NSEventModifierFlagCommand | NSEventModifierFlagShift)))
+        trackpadRelease(event.timestamp, true);
+    return event;
+}
+
+static void trackpadWindowChanged(NSNotification *notification) {
+    if ([notification.name isEqualToString:NSApplicationDidResignActiveNotification] ||
+        notification.object == trackpadWindow)
+        trackpadRelease(NSProcessInfo.processInfo.systemUptime, true);
+}
+
+static void installTrackpadGestures(void) {
+    static id monitor;
+    static NSMutableArray *observers;
+    if (!NSApp || monitor) return;
+    monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel |
+        NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown |
+        NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *event) { return trackpadLocalEvent(event); }];
+    observers = [NSMutableArray array];
+    for (NSNotificationName name in @[NSApplicationDidResignActiveNotification,
+        NSWindowDidResignKeyNotification, NSWindowWillCloseNotification,
+        NSWindowWillStartLiveResizeNotification, NSWindowDidResizeNotification]) {
+        [observers addObject:[NSNotificationCenter.defaultCenter addObserverForName:name object:nil
+            queue:nil usingBlock:^(NSNotification *notification) { trackpadWindowChanged(notification); }]];
+    }
+    fprintf(stderr, "HyperOSAVDTrackpad: two-finger touch scrolling enabled\n");
+}
 
 static void (*originalCombinedSize)(uint32_t *, uint32_t *);
 static int (*primaryDisplayPose)(uint32_t, int32_t *, int32_t *, uint32_t *, uint32_t *);
@@ -353,9 +526,11 @@ static void srgbViewDidMoveToWindow(id object, SEL selector) {
 __attribute__((constructor)) static void installSrgbTag(void) {
     const char *enabled = getenv("HYPEROS_AVD_SRGB");
     const char *multiDisplay = getenv("HYPEROS_AVD_MULTI_DISPLAY");
+    const char *trackpad = getenv("HYPEROS_AVD_TRACKPAD");
     bool colorEnabled = enabled && !strcmp(enabled, "1");
     bool displayEnabled = multiDisplay && !strcmp(multiDisplay, "1");
-    if (!colorEnabled && !displayEnabled) return;
+    bool trackpadEnabled = trackpad && !strcmp(trackpad, "1");
+    if (!colorEnabled && !displayEnabled && !trackpadEnabled) return;
     const char *expected = getenv("HYPEROS_AVD_SRGB_AVD");
     if (!expected || !*expected) return;
     NSString *expectedName = [NSString stringWithUTF8String:expected];
@@ -364,6 +539,23 @@ __attribute__((constructor)) static void installSrgbTag(void) {
     NSUInteger index = [arguments indexOfObject:@"-avd"];
     if (index == NSNotFound || index + 1 >= arguments.count ||
         ![arguments[index + 1] isEqualToString:expectedName]) return;
+    if (trackpadEnabled) {
+        // DYLD constructors precede Qt's NSApplication setup. Install on the
+        // first main-loop turn, or at launch if the host has not created NSApp.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (NSApp) installTrackpadGestures();
+            else {
+                static id launchObserver;
+                launchObserver = [NSNotificationCenter.defaultCenter
+                    addObserverForName:NSApplicationDidFinishLaunchingNotification object:nil queue:nil
+                    usingBlock:^(__unused NSNotification *notification) {
+                        [NSNotificationCenter.defaultCenter removeObserver:launchObserver];
+                        launchObserver = nil;
+                        installTrackpadGestures();
+                    }];
+            }
+        });
+    }
     if (displayEnabled) installPrimaryRotationSize();
     if (!colorEnabled) return;
     Method method = class_getInstanceMethod(NSView.class, @selector(viewDidMoveToWindow));
