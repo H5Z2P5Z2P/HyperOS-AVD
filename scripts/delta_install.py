@@ -68,13 +68,15 @@ def _verify_file(path, root, info):
 def _source_context(root, manifest, descriptor):
     """Authenticate the active source or the pinned full base for delta-only releases."""
     pinned = bundle_runtime.delta_base(manifest)
-    old = pinned if pinned is not None else _read_manifest(root / 'local/installed-release.json', root)
+    use_base = (pinned is not None and descriptor['from_version'] == pinned['version']
+                and descriptor['from_manifest_sha256'] == bundle_runtime.manifest_digest(pinned))
+    old = pinned if use_base else _read_manifest(root / 'local/installed-release.json', root)
     if (old.get('version') != descriptor['from_version']
             or bundle_runtime.manifest_digest(old) != descriptor['from_manifest_sha256']):
         raise RuntimeError('Release does not match the incremental source.')
     incremental.validate_sources(old, manifest)
     source = root / 'versions' / old['version']
-    if pinned is not None:
+    if use_base:
         try:
             bundle_runtime.verify_staged(source, old)
         except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
@@ -98,12 +100,27 @@ def select_delta(root, manifest):
     # source independently of the active manifest, including on fresh installs.
     pinned = bundle_runtime.delta_base(manifest)
     if pinned is not None:
+        if manifest['distribution'] == bundle_runtime.HISTORY_DISTRIBUTION:
+            # A current repair user takes its own direct patch, even if the
+            # original full base is cached or its patch happens to be smaller.
+            try:
+                active = _read_manifest(root / 'local/installed-release.json', root)
+                descriptor = next((value for value in manifest['deltas']
+                    if value['from_version'] == active.get('version')
+                    and value['from_manifest_sha256'] == bundle_runtime.manifest_digest(active)), None)
+                if descriptor is not None:
+                    source, old = _source_context(root, manifest, descriptor)
+                    return descriptor, source, old
+            except (RuntimeError, OSError, ValueError, TypeError, KeyError):
+                pass
         source = root / 'versions' / pinned['version']
         if (root / 'versions').is_symlink():
             raise RuntimeError('Invalid release versions directory.')
         if not source.exists() and not source.is_symlink():
             return None
-        descriptor = min(manifest['deltas'], key=lambda item: sum(part['size'] for part in item['parts']))
+        descriptor = next(value for value in manifest['deltas']
+                          if value['from_version'] == pinned['version']
+                          and value['from_manifest_sha256'] == bundle_runtime.manifest_digest(pinned))
         source, old = _source_context(root, manifest, descriptor)
         return descriptor, source, old
     values = manifest.get('deltas', [])

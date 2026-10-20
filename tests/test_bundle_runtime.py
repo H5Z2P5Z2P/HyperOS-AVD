@@ -170,6 +170,97 @@ Path(a.report).write_text(json.dumps({'schema': 1, 'protocol': r['protocol'], 'b
         path.write_text(json.dumps(manifest))
         return root, path, manifest, descriptor, source, old, base_path
 
+    def history_bundle(self, directory, variant='os4-official'):
+        """Build real base, repair and direct history archives for both families."""
+        import package_release
+        base_path, base = self.bundle(directory / 'base', variant)
+        base['version'] = base['version'].replace('-r999', '-r6' if variant == 'os4-official' else '-r3')
+        base['build']['archive_sha256'] = 'a' * 64
+        base_path.write_text(json.dumps(base))
+        root = (directory / 'instance').resolve()
+        source = root / 'versions' / base['version']; source.mkdir(parents=True)
+        with manage.scope(source):
+            setup.stage_bundle(str(base_path))
+        paths = {name: source / name for name in base['files']}
+        changed = directory / 'first-system.img'; changed.write_bytes(b'first repaired system')
+        paths['images/system.img'] = changed
+        repair_path = directory / 'repair/manifest.json'
+        with patch('sys.stdout', new_callable=io.StringIO):
+            repair = package_release.write_bundle(repair_path.parent, base['version'] + '.1', base, paths, 1,
+                delta_from=[source / 'local/installed-release.json'], delta_only=True)
+        repair_source = root / 'versions' / repair['version']
+        selection = delta_install.select_delta(root, repair)
+        delta_install.stage_delta(root, repair_source, repair_path, repair, *selection)
+        (root / 'local').mkdir()
+        (root / 'local/installed-release.json').write_text(json.dumps(repair))
+        personal = root / 'avd/Custom_Name.avd/userdata-qemu.img'
+        personal.parent.mkdir(parents=True); personal.write_bytes(b'personal data remains untouched')
+        paths = {name: repair_source / name for name in repair['files']}
+        changed = directory / 'second-system.img'; changed.write_bytes(b'second repaired system')
+        paths['images/system.img'] = changed
+        target_path = directory / 'history/manifest.json'
+        with patch('sys.stdout', new_callable=io.StringIO):
+            target = package_release.write_bundle(target_path.parent, base['version'] + '.2', repair, paths, 1,
+                delta_from=[repair_source / 'local/installed-release.json', source / 'local/installed-release.json'],
+                delta_only=True)
+        return root, target_path, target, base, repair, base_path
+
+    def test_history_direct_reconstruction_for_phone_and_pad_from_both_installed_versions(self):
+        for variant in protocol.FAMILIES:
+            for revision in (0, 1):
+                with self.subTest(variant=variant, revision=revision), tempfile.TemporaryDirectory() as directory:
+                    root, path, manifest, base, repair, _ = self.history_bundle(Path(directory), variant)
+                    active = repair if revision else base
+                    (root / 'local/installed-release.json').write_text(json.dumps(active))
+                    if revision:
+                        shutil.rmtree(root / 'versions' / base['version'])
+                    else:
+                        shutil.rmtree(root / 'versions' / repair['version'])
+                    selected = delta_install.select_delta(root, manifest)
+                    self.assertEqual(selected[0]['from_version'], active['version'])
+                    target = root / 'versions' / manifest['version']
+                    delta_install.stage_delta(root, target, path, manifest, *selected)
+                    protocol.verify_staged(target, manifest)
+                    self.assertEqual((target / 'images/system.img').read_bytes(), b'second repaired system')
+                    self.assertEqual(json.loads((root / 'local/installed-release.json').read_text()), active)
+                    self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                                     b'personal data remains untouched')
+
+    def test_history_envelope_and_source_corruption_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path, manifest, base, repair, _ = self.history_bundle(Path(directory))
+            for failure in ('gap', 'duplicate-version', 'duplicate-digest', 'duplicate-part', 'old-installer',
+                            'wrong-base', 'legacy-multiple', 'wrong-series'):
+                changed = copy.deepcopy(manifest)
+                if failure == 'gap':
+                    changed['deltas'].pop(0)
+                elif failure == 'duplicate-version':
+                    changed['deltas'].append(copy.deepcopy(changed['deltas'][0]))
+                elif failure == 'duplicate-digest':
+                    changed['deltas'][0]['from_manifest_sha256'] = changed['deltas'][1]['from_manifest_sha256']
+                elif failure == 'duplicate-part':
+                    changed['deltas'][0]['parts'][0]['name'] = changed['deltas'][1]['parts'][0]['name']
+                elif failure == 'old-installer':
+                    changed['compatibility']['minimum_installer'] = protocol.DELTA_MINIMUM
+                elif failure == 'wrong-base':
+                    changed['deltas'][1]['from_manifest_sha256'] = 'c' * 64
+                elif failure == 'legacy-multiple':
+                    changed['distribution'] = protocol.DELTA_DISTRIBUTION
+                else:
+                    changed['deltas'][0]['from_version'] = repair['version'].replace('-r6', '-r7')
+                with self.subTest(failure=failure), self.assertRaises(RuntimeError):
+                    protocol.validate_envelope(changed)
+            selected = delta_install.select_delta(root, manifest)
+            self.assertEqual(selected[0]['from_version'], repair['version'])
+            # A source altered after selection cannot promote any target.
+            (selected[1] / 'images/system.img').write_bytes(b'corrupt immutable repair')
+            target = root / 'versions' / manifest['version']
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                delta_install.stage_delta(root, target, path, manifest, *selected)
+            self.assertFalse(target.exists())
+            self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                             b'personal data remains untouched')
+
     def test_delta_only_stages_full_base_then_patch_without_activating_base(self):
         for active in (False, True):
             with self.subTest(active=active), tempfile.TemporaryDirectory() as directory:

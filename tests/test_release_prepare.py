@@ -788,9 +788,9 @@ class IncrementalReleaseTests(unittest.TestCase):
         old, paths = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r6', b'accepted image')
         version = 'v1.0.0-a17-hyperos4-hongkong-r6.1'
         previous = self.root / 'old/manifest.json'
-        for sources in ([], [previous, previous]):
+        for sources, error in (([], 'exactly one'), ([previous, previous], 'Duplicate')):
             output = self.root / 'invalid-count'
-            with self.subTest(sources=sources), self.assertRaisesRegex(RuntimeError, 'exactly one'):
+            with self.subTest(sources=sources), self.assertRaisesRegex(RuntimeError, error):
                 package_release.write_bundle(output, version, old, paths,
                     delta_from=sources, delta_only=True)
             self.assertFalse(output.exists())
@@ -811,6 +811,67 @@ class IncrementalReleaseTests(unittest.TestCase):
                 delta_from=[previous], delta_only=True)
         self.assertFalse((output / 'manifest.json').exists())
         self.assertEqual(list(output.iterdir()), [])
+
+    def test_history_delta_packages_every_direct_source_and_rejects_gaps_before_hashing(self):
+        import bundle_runtime
+        import package_release
+        for location in ('manifest.json', 'local/installed-release.json'):
+            with self.subTest(location=location):
+                folder = self.root / location.replace('/', '-')
+                old, old_paths = self.bundle(folder / 'base', 'v1.0.0-a17-hyperos4-hongkong-r6', b'base image')
+                repair_files = dict(old_paths)
+                replacement = folder / 'repair-system.img'; replacement.write_bytes(b'first repair')
+                repair_files['images/system.img'] = replacement
+                with patch('sys.stdout', new_callable=io.StringIO):
+                    repair = package_release.write_bundle(folder / 'repair', old['version'] + '.1', old,
+                        repair_files, 1, delta_from=[folder / 'base/manifest.json'], delta_only=True)
+                # Materialize the exact immutable repair tree, without changing
+                # its published delta-only manifest into a fictional full one.
+                for name, source in repair_files.items():
+                    target = folder / 'repair' / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                sources = []
+                for name, manifest in (('base', old), ('repair', repair)):
+                    path = folder / name / location
+                    path.parent.mkdir(exist_ok=True)
+                    path.write_text(json.dumps(manifest))
+                    sources.append(path)
+                paths = {name: folder / 'repair' / name for name in repair['files']}
+                final = folder / 'final-system.img'; final.write_bytes(b'second repair image')
+                paths['images/system.img'] = final
+                version = old['version'] + '.2'
+                with patch('sys.stdout', new_callable=io.StringIO):
+                    manifest = package_release.write_bundle(folder / 'release', version, repair, paths, 1,
+                        delta_from=list(reversed(sources)), delta_only=True)
+                self.assertEqual(manifest['distribution'], bundle_runtime.HISTORY_DISTRIBUTION)
+                self.assertEqual(manifest['compatibility']['minimum_installer'], bundle_runtime.HISTORY_MINIMUM)
+                self.assertEqual(manifest['parts'], [])
+                self.assertEqual(manifest['base_release']['manifest'], old)
+                self.assertEqual({d['from_version'] for d in manifest['deltas']}, {old['version'], repair['version']})
+                for descriptor in manifest['deltas']:
+                    source = old if descriptor['from_version'] == old['version'] else repair
+                    source_root = folder / ('base' if source == old else 'repair')
+                    self.assertEqual(descriptor['from_manifest_sha256'], bundle_runtime.manifest_digest(source))
+                    data = b''.join((folder / 'release' / part['name']).read_bytes() for part in descriptor['parts'])
+                    with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+                        for entry in archive:
+                            result = io.BytesIO()
+                            incremental.apply_patch(source_root / entry.name, archive.extractfile(entry), result,
+                                source['files'][entry.name]['size'], manifest['files'][entry.name]['size'])
+                            self.assertEqual(result.getvalue(), paths[entry.name].read_bytes())
+                for index, (target_version, invalid_sources, error) in enumerate((
+                        (version, sources[:1], 'Missing direct'),
+                        (version, sources + sources[:1], 'Duplicate'),
+                        (old['version'] + '.3', sources, 'Missing direct'),
+                        (old['version'].replace('-r6', '-r7') + '.2', sources, 'same rN'))):
+                    output = folder / ('invalid-' + str(index))
+                    with self.subTest(error=error), patch.object(package_release, 'sha256') as hashes, \
+                            self.assertRaisesRegex(RuntimeError, error):
+                        package_release.write_bundle(output, target_version, repair, paths, 1,
+                            delta_from=invalid_sources, delta_only=True)
+                    hashes.assert_not_called()
+                    self.assertFalse(output.exists())
 
     def test_unhelpful_or_invalid_delta_cleans_only_created_assets(self):
         old, _ = self.bundle(self.root / 'old', 'v1.0.0-a17-hyperos4-hongkong-r1', b'old')

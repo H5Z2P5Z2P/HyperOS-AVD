@@ -649,7 +649,7 @@ class PadReleaseTests(unittest.TestCase):
             payload = root / 'system.img'
             payload.write_bytes(b'fixture')
             version = package_release.default_release_version('os4-pad', {'hyperos': PROFILE['hyperos']})
-            self.assertEqual(version, 'pad-v0.1.2-a17-hyperos4-yingtian-r3.1')
+            self.assertEqual(version, 'pad-v0.1.2-a17-hyperos4-yingtian-r3.2')
             result = package_release.write_bundle(root / 'bundle', version, {'format': 3, 'variant': 'os4-pad', 'build': {}}, {'images/system.img': payload}, 1)
             self.assertEqual(result['version'], version)
 

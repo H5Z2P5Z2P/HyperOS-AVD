@@ -13,6 +13,9 @@ INSTALL_PROTOCOL = 'verified-bundle-runtime-v1'
 PROTOCOL_MINIMUM = '1.2.3'
 DELTA_DISTRIBUTION = 'delta-only-v1'
 DELTA_MINIMUM = '1.3.0'
+HISTORY_DISTRIBUTION = 'delta-only-v2'
+HISTORY_MINIMUM = '1.3.1'
+DELTA_DISTRIBUTIONS = (DELTA_DISTRIBUTION, HISTORY_DISTRIBUTION)
 REVISION_PATTERN = r'(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*'
 ENTRYPOINT = 'runtime/scripts/bundle_runtime.py'
 FAMILIES = {
@@ -59,6 +62,28 @@ def file_entries(manifest):
     return files
 
 
+def history_coverage(version, sources):
+    """Require one direct source for every published revision of this base."""
+    def identity(value):
+        match = re.fullmatch(r'(.+-r)(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?', value)
+        if match is None:
+            raise RuntimeError('Historical deltas require an rN.k release version.')
+        return match[1], int(match[2]), int(match[3] or 0)
+    prefix, major, revision = identity(version)
+    if revision < 1:
+        raise RuntimeError('Historical deltas require a repair release rN.k.')
+    found = set()
+    for source in sources:
+        source_prefix, source_major, source_revision = identity(source)
+        if (source_prefix, source_major) != (prefix, major) or source_revision >= revision:
+            raise RuntimeError('Incremental sources must belong to the same rN release history.')
+        if source_revision in found:
+            raise RuntimeError('Duplicate incremental source version.')
+        found.add(source_revision)
+    if len(found) != revision:
+        raise RuntimeError('Missing direct incremental sources for the complete rN.0 through rN.(k-1) history.')
+
+
 def delta_base(manifest):
     """Authenticate one complete base without permitting dependency chains."""
     distribution = manifest.get('distribution')
@@ -66,7 +91,7 @@ def delta_base(manifest):
         if 'base_release' in manifest:
             raise RuntimeError('A base release requires delta-only distribution.')
         return None
-    if distribution != DELTA_DISTRIBUTION:
+    if distribution not in DELTA_DISTRIBUTIONS:
         raise RuntimeError('Unsupported release distribution; update the installer.')
     reference = manifest.get('base_release')
     if (not isinstance(reference, dict) or set(reference) != {'manifest', 'manifest_sha256'}
@@ -77,10 +102,11 @@ def delta_base(manifest):
     base = validate_envelope(reference['manifest'])
     if reference['manifest_sha256'] != manifest_digest(base):
         raise RuntimeError('Delta-only base manifest checksum mismatch.')
+    required = HISTORY_MINIMUM if distribution == HISTORY_DISTRIBUTION else DELTA_MINIMUM
     minimum = manifest.get('compatibility', {}).get('minimum_installer', '')
     if (not re.fullmatch(r'\d+\.\d+\.\d+', minimum)
-            or tuple(map(int, minimum.split('.'))) < tuple(map(int, DELTA_MINIMUM.split('.')))):
-        raise RuntimeError('Delta-only distribution requires Installer ' + DELTA_MINIMUM + ' or newer.')
+            or tuple(map(int, minimum.split('.'))) < tuple(map(int, required.split('.')))):
+        raise RuntimeError('Delta-only distribution requires Installer ' + required + ' or newer.')
     from incremental import validate_sources
     projected = {key: value for key, value in manifest.items()
                  if key not in ('distribution', 'base_release', 'deltas')}
@@ -88,12 +114,29 @@ def delta_base(manifest):
     validate_sources(base, projected)
     from delta_install import validate_descriptor
     deltas = manifest.get('deltas')
-    if not isinstance(deltas, list) or len(deltas) != 1:
+    if (not isinstance(deltas, list) or not deltas
+            or distribution == DELTA_DISTRIBUTION and len(deltas) != 1):
         raise RuntimeError('Delta-only releases require one matching base patch.')
-    descriptor = validate_descriptor(deltas[0], manifest)
-    if (descriptor['from_version'] != base['version']
-            or descriptor['from_manifest_sha256'] != manifest_digest(base)):
+    versions, digests, names, matches = set(), set(), set(), 0
+    for value in deltas:
+        descriptor = validate_descriptor(value, manifest)
+        if descriptor['from_version'] in versions or descriptor['from_manifest_sha256'] in digests:
+            raise RuntimeError('Duplicate incremental source manifest.')
+        versions.add(descriptor['from_version'])
+        digests.add(descriptor['from_manifest_sha256'])
+        for part in descriptor['parts']:
+            if part['name'] in names:
+                raise RuntimeError('Duplicate incremental archive part name.')
+            names.add(part['name'])
+        if (descriptor['from_version'] == base['version']
+                and descriptor['from_manifest_sha256'] == manifest_digest(base)):
+            matches += 1
+    if matches != 1:
         raise RuntimeError('Incremental patch does not match the complete base release.')
+    if distribution == HISTORY_DISTRIBUTION:
+        history_coverage(manifest['version'], versions)
+        if not re.search(r'-r\d+(?:\.0)?$', base['version']):
+            raise RuntimeError('The complete base must be the rN.0 release.')
     return base
 
 
@@ -134,7 +177,7 @@ def validate_envelope(manifest):
     if not required <= set(files):
         raise RuntimeError('Verified bundle is missing its runtime or encryption template.')
     parts = manifest.get('parts')
-    delta_only = manifest.get('distribution') == DELTA_DISTRIBUTION
+    delta_only = manifest.get('distribution') in DELTA_DISTRIBUTIONS
     if not isinstance(parts, list) or (not parts and not delta_only) or (parts and delta_only):
         raise RuntimeError('Missing release archive parts.')
     seen = set()

@@ -211,7 +211,7 @@ class _PatchMember(tarfile.TarInfo):
 
 def write_delta(directory, manifest, paths, previous_manifest_path, part_mib=1536):
     """Archive changed target files as patches; unchanged files reuse the source."""
-    from bundle_runtime import DELTA_DISTRIBUTION, manifest_digest, regular
+    from bundle_runtime import DELTA_DISTRIBUTIONS, manifest_digest, regular
     from package_release import PartsWriter
     directory, previous_manifest_path = Path(directory), Path(previous_manifest_path)
     if not 1 <= part_mib < 2048:
@@ -227,15 +227,12 @@ def write_delta(directory, manifest, paths, previous_manifest_path, part_mib=153
         raise RuntimeError('Oversized incremental source manifest.')
     old = json.loads(previous_manifest_path.read_text())
     validation_target = manifest
-    if manifest.get('distribution') == DELTA_DISTRIBUTION:
-        if old.get('distribution') is not None or manifest.get('base_release') != {
-                'manifest': old, 'manifest_sha256': manifest_digest(old)}:
-            raise RuntimeError('A delta-only release requires its exact full base manifest.')
+    if manifest.get('distribution') in DELTA_DISTRIBUTIONS:
         # The complete delta descriptor is produced below. Validate the target
         # firmware envelope against the already authenticated full transport.
         validation_target = {key: value for key, value in manifest.items()
                              if key not in ('distribution', 'base_release', 'deltas')}
-        validation_target['parts'] = old['parts']
+        validation_target['parts'] = manifest['base_release']['manifest']['parts']
     validate_sources(old, validation_target)
     if set(paths) != set(manifest['files']):
         raise RuntimeError('Incremental target inventory differs from its manifest.')
@@ -277,7 +274,7 @@ def write_delta(directory, manifest, paths, previous_manifest_path, part_mib=153
         regular(previous_manifest_path, source_root)
         if json.loads(previous_manifest_path.read_text()) != old:
             raise RuntimeError('Incremental source manifest changed while packaging.')
-        if (manifest.get('distribution') != DELTA_DISTRIBUTION
+        if (manifest.get('distribution') not in DELTA_DISTRIBUTIONS
                 and sum(item['size'] for item in writer.parts) >= sum(item['size'] for item in manifest['parts'])):
             for part in writer.parts:
                 (directory / part['name']).unlink()

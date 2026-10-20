@@ -152,7 +152,7 @@ class PhoneUpgradeTests(unittest.TestCase):
             from bundle_runtime import PROTOCOL_MINIMUM
             self.assertEqual(metadata['compatibility']['minimum_installer'], PROTOCOL_MINIMUM)
             self.assertNotIn('upgrade_from', metadata['compatibility'])
-            self.assertEqual(package_release.default_release_version('os4-official', metadata), R6 + '.1')
+            self.assertEqual(package_release.default_release_version('os4-official', metadata), R6 + '.2')
             del build['boot_service_fix']
             file.write_text(json.dumps(build))
             with self.assertRaisesRegex(RuntimeError, 'boot-service repairs'):

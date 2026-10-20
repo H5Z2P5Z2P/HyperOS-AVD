@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import io
 import json
+import shutil
 from pathlib import Path
 import socket
 import sys
@@ -866,6 +867,59 @@ class ManagerTests(unittest.TestCase):
                     remote.assert_not_called()
                     self.assertEqual(downloaded, ['manifest.json', manifest['deltas'][0]['parts'][0]['name']])
                     self.assertEqual(json.loads((root / 'local/installed-release.json').read_text()), base)
+
+    def test_history_online_and_offline_use_current_direct_patch_without_requiring_full_base(self):
+        import bundle_runtime
+        from test_bundle_runtime import BundleRuntimeTests
+        for online in (False, True):
+            for fresh in (False, True):
+                with self.subTest(online=online, fresh=fresh), tempfile.TemporaryDirectory() as directory:
+                    folder = Path(directory)
+                    fixture = BundleRuntimeTests()
+                    existing, path, manifest, base, repair, base_path = fixture.history_bundle(folder)
+                    root = folder / 'fresh' if fresh else existing
+                    if not fresh:
+                        shutil.rmtree(root / 'versions' / base['version'])
+                    def assets(directory):
+                        return {item.name: {'name': item.name, 'size': item.stat().st_size,
+                            'digest': 'sha256:' + common.sha256(item), 'browser_download_url': item.as_uri()}
+                            for item in directory.iterdir() if item.is_file()}
+                    expected = base if fresh else repair
+                    descriptor = next(item for item in manifest['deltas']
+                                      if item['from_version'] == expected['version'])
+                    if online:
+                        release = {'tag_name': manifest['version'], 'asset_map': assets(path.parent)}
+                        base_release = {'tag_name': base['version'], 'assets': list(assets(base_path.parent).values())}
+                        # Keep the complete base outside the offline sibling lookup.
+                        with patch('sys.stdout', new_callable=io.StringIO), \
+                                patch.object(manage, 'remote_json', return_value=base_release) as remote, \
+                                patch.object(manage, 'download', wraps=manage.download) as transfer:
+                            manage.fetch_release(release, folder / 'cache', root=root)
+                        downloaded = [call.args[1].name for call in transfer.call_args_list]
+                        self.assertIn(descriptor['parts'][0]['name'], downloaded)
+                        other = next(item for item in manifest['deltas'] if item is not descriptor)
+                        self.assertNotIn(other['parts'][0]['name'], downloaded)
+                        if fresh:
+                            remote.assert_called_once()
+                            self.assertIn(base['parts'][0]['name'], downloaded)
+                        else:
+                            remote.assert_not_called()
+                            self.assertEqual(downloaded, ['manifest.json', descriptor['parts'][0]['name']])
+                    else:
+                        if fresh:
+                            base_path.parent.rename(folder / base['version'])
+                        with patch.object(manage, 'validate_userdata'), \
+                                patch.object(manage, 'data_size', return_value={'virtual-size': 32 * 1024**3}), \
+                                patch('sys.stdout', new_callable=io.StringIO):
+                            fixture.install(root, path)
+                        self.assertEqual((root / 'executed').read_text(), 'verified bundle entrypoint')
+                    bundle_runtime.verify_staged(root / 'versions' / manifest['version'], manifest)
+                    if not fresh:
+                        self.assertFalse((root / 'versions' / base['version']).exists())
+                        self.assertEqual((root / 'avd/Custom_Name.avd/userdata-qemu.img').read_bytes(),
+                                         b'personal data remains untouched')
+                    else:
+                        self.assertFalse((root / 'avd').exists())
 
     def test_delta_only_rejects_changed_remote_base_before_downloading_its_full_parts(self):
         with tempfile.TemporaryDirectory() as directory:

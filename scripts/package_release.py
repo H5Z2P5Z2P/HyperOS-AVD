@@ -575,13 +575,13 @@ def default_release_version(variant, metadata):
         from phone_profile import profile
         selected = profile(metadata['hyperos'])
         if selected['hyperos'] == '4.0.24.0.XFRCNXM':
-            return 'v0.2.5-a17-hyperos4-hongkong-r6.1'
+            return 'v0.2.5-a17-hyperos4-hongkong-r6.2'
         if metadata.get('build', {}).get('boot_service_fix') is not None:
             return 'v0.2.4-a17-hyperos4-hongkong-r5'
         if metadata['hyperos'] == '4.0.18.0.XFRCNXM':
             return 'v0.2.2-a17-hyperos4-hongkong-r3'
         return 'v0.2.1-a17-hyperos4-hongkong-r2'
-    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.2-a17-hyperos4-yingtian-r3.1'}[variant]
+    return {'os3': 'v0.1.0', 'os4-pad': 'pad-v0.1.2-a17-hyperos4-yingtian-r3.2'}[variant]
 
 
 def runtime_files():
@@ -617,6 +617,46 @@ def runtime_files():
     return paths
 
 
+def delta_sources(version, delta_from):
+    """Audit complete direct history before building or hashing image payloads."""
+    from bundle_runtime import history_coverage, manifest_digest, regular, validate_envelope
+    from incremental import validate_sources
+    if not delta_from:
+        raise RuntimeError('A delta-only release requires exactly one full --delta-from source.')
+    complete, versions, digests, manifests = [], set(), set(), []
+    for value in delta_from:
+        previous = Path(value)
+        if previous.name == 'installed-release.json' and previous.parent.name == 'local':
+            source_root = previous.parent.parent
+        elif previous.name == 'manifest.json':
+            source_root = previous.parent
+        else:
+            raise RuntimeError('Use a source manifest beside unpacked release files.')
+        regular(previous, source_root)
+        if previous.stat().st_size > 16 * 1024**2:
+            raise RuntimeError('Oversized incremental source manifest.')
+        source = json.loads(previous.read_text())
+        validate_envelope(source)
+        identity = manifest_digest(source)
+        if source['version'] in versions or identity in digests:
+            raise RuntimeError('Duplicate incremental source manifest.')
+        versions.add(source['version'])
+        digests.add(identity)
+        manifests.append(source)
+        if source.get('distribution') is None:
+            complete.append((source, source_root))
+    if len(complete) != 1:
+        raise RuntimeError('A delta-only release requires exactly one full base release.')
+    base, base_root = complete[0]
+    history_coverage(version, versions)
+    if not re.search(r'-r\d+(?:\.0)?$', base['version']):
+        raise RuntimeError('The complete base must be the rN.0 release.')
+    for source in manifests:
+        if source is not base:
+            validate_sources(base, source)
+    return base, base_root
+
+
 def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_from=(), delta_only=False):
     """Archive only explicit portable files; publish the manifest last."""
     if not re.fullmatch(r'(?:pad-)?v[0-9A-Za-z_.-]+', version):
@@ -640,23 +680,10 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
     base = base_root = None
     delta_from = tuple(delta_from)
     if delta_only:
-        from bundle_runtime import DELTA_DISTRIBUTION, DELTA_MINIMUM, manifest_digest, regular, validate_envelope
-        if len(delta_from) != 1:
-            raise RuntimeError('A delta-only release requires exactly one full --delta-from source.')
-        previous = Path(delta_from[0])
-        if previous.name == 'installed-release.json' and previous.parent.name == 'local':
-            base_root = previous.parent.parent
-        elif previous.name == 'manifest.json':
-            base_root = previous.parent
-        else:
-            raise RuntimeError('Use a source manifest beside unpacked release files.')
-        regular(previous, base_root)
-        if previous.stat().st_size > 16 * 1024**2:
-            raise RuntimeError('Oversized incremental source manifest.')
-        base = json.loads(previous.read_text())
-        validate_envelope(base)
-        if base.get('distribution') is not None:
-            raise RuntimeError('A delta-only release requires a full base release, without incremental chains.')
+        from bundle_runtime import (DELTA_DISTRIBUTION, DELTA_MINIMUM, HISTORY_DISTRIBUTION,
+                                    HISTORY_MINIMUM, manifest_digest, regular,
+                                    validate_envelope)
+        base, base_root = delta_sources(version, delta_from)
         if metadata.get('format') != 3:
             raise RuntimeError('A delta-only release requires a verified format3 runtime.')
     files = {}
@@ -692,11 +719,12 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
     if manifest['format'] in (2, 3):
         manifest['build']['system_sha256'] = files['images/system.img']['sha256']
     if delta_only:
-        manifest['distribution'] = DELTA_DISTRIBUTION
+        manifest['distribution'] = HISTORY_DISTRIBUTION if len(delta_from) > 1 else DELTA_DISTRIBUTION
         manifest['base_release'] = {'manifest': base, 'manifest_sha256': manifest_digest(base)}
+        required = HISTORY_MINIMUM if len(delta_from) > 1 else DELTA_MINIMUM
         minimum = manifest['compatibility']['minimum_installer']
-        if tuple(map(int, minimum.split('.'))) < tuple(map(int, DELTA_MINIMUM.split('.'))):
-            manifest['compatibility']['minimum_installer'] = DELTA_MINIMUM
+        if tuple(map(int, minimum.split('.'))) < tuple(map(int, required.split('.'))):
+            manifest['compatibility']['minimum_installer'] = required
         from incremental import validate_sources
         validation_target = {key: value for key, value in manifest.items()
                              if key not in ('distribution', 'base_release')}
@@ -757,23 +785,25 @@ def main():
     parser.add_argument('--delta-from', type=Path, action='append', default=[],
                         help='Previous unpacked release manifest with the same base OTA; repeat for multiple versions')
     parser.add_argument('--delta-only', action='store_true',
-                        help='Publish only patches against exactly one complete --delta-from release')
+                        help='Publish direct patches from every earlier rN revision, including one complete base')
     parser.add_argument('--compat-cache-root', type=Path, action='append', default=[],
                         help='Verified producer cache for the complete common app recipe union')
     args = parser.parse_args()
-    if args.delta_only and len(args.delta_from) != 1:
-        parser.error('--delta-only requires exactly one full --delta-from source')
+    if args.delta_only and not args.delta_from:
+        parser.error('--delta-only requires every earlier --delta-from source, including one full base')
     root = ROOT
     if args.variant != 'os3' and 'HYPEROS_AVD_WORKSPACE' not in os.environ:
         root = REPO_ROOT / 'work' / args.variant
     common.ROOT = root
     metadata = release_metadata(root, args.variant)
+    version = args.version or default_release_version(args.variant, metadata)
+    if args.delta_only:
+        delta_sources(version, args.delta_from)
     if args.variant == 'os4-official':
         verify_os4_image(root, metadata)
     elif args.variant == 'os4-pad':
         from release_pad import verify_image
         verify_image(root, metadata)
-    version = args.version or default_release_version(args.variant, metadata)
     fetch_ksu(KSU_FILES)
     paths = {'images/' + name: root / 'images' / name for name in IMAGE_FILES}
     for relative in ('data/misc/modem_simulator', 'data/misc/emulator'):

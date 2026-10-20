@@ -307,9 +307,10 @@ def stage_bundle(value):
 
 
 def extract_bundle(manifest, base):
-    from bundle_runtime import DELTA_MINIMUM, delta_base
+    from bundle_runtime import delta_base
     if delta_base(manifest) is not None:
-        raise RuntimeError('Use Installer ' + DELTA_MINIMUM + ' or newer to reconstruct this delta-only release.')
+        minimum = manifest['compatibility']['minimum_installer']
+        raise RuntimeError('Use Installer ' + minimum + ' or newer to reconstruct this delta-only release.')
     validate_memory()
     cache = ROOT / 'downloads' / manifest['version']
     cache.mkdir(parents=True, exist_ok=True)

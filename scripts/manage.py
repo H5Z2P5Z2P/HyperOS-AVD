@@ -27,7 +27,7 @@ import setup
 from https_transport import secure_urlopen
 from common import REPO_ROOT, avd_home, host_check, port_free, sdk_path, sha256
 
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 MODULE_UPGRADE_PREFLIGHT = 'phone-owned-module-guards-v1'
 FORWARD_UPGRADE_POLICY = 'same-family-forward-v1'
 REPOSITORY = 'NEORUAA/HyperOS-AVD'
@@ -320,8 +320,10 @@ def fetch_release(release, cache, root=None, *, expected_manifest=None):
                 say('目标版本已在本地，直接使用。', 'Using the verified local target version.')
                 return manifest_path
             if base is not None:
-                prepare_delta_base(root, manifest_path, manifest, cache=cache.parent)
                 selection = select_delta(root, manifest)
+                if selection is None:
+                    prepare_delta_base(root, manifest_path, manifest, cache=cache.parent)
+                    selection = select_delta(root, manifest)
                 if selection is None:
                     raise RuntimeError('The complete base could not be prepared for this delta-only release.')
                 descriptor, source, old = selection
@@ -1314,7 +1316,7 @@ def install_via_runtime(root, manifest_path, manifest, name, port, sdk, options,
             from delta_install import select_delta, stage_delta
             from bundle_runtime import delta_base
             delta_only = delta_base(manifest) is not None
-            if delta_only:
+            if delta_only and select_delta(root, manifest) is None:
                 # Already holding the instance lock; stage_base never activates
                 # a dependency or obtains the lock recursively.
                 from delta_install import stage_base
