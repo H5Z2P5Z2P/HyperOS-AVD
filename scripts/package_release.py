@@ -734,7 +734,7 @@ def write_bundle(directory, version, metadata, paths, part_mib=1536, *, delta_fr
     if not delta_only:
         writer = PartsWriter(directory, 'HyperOS-AVD-' + version + '-macos-arm64', part_mib * 1024**2)
         try:
-            with tarfile.open(fileobj=writer, mode='w|gz', compresslevel=6) as archive:
+            with tarfile.open(fileobj=writer, mode='w|gz') as archive:
                 for relative, path in sorted(paths.items()):
                     print('Packaging: ' + relative, flush=True)
                     entry = archive.gettarinfo(str(path), arcname=relative)

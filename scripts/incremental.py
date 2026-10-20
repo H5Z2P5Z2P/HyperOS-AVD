@@ -295,7 +295,7 @@ def write_delta(directory, manifest, paths, previous_manifest_path, part_mib=153
         'HyperOS-AVD-' + manifest['version'] + '-from-' + old['version'] + '-delta', part_mib * 1024**2)
     try:
         with tempfile.TemporaryFile() as patch_file:
-            with tarfile.open(fileobj=writer, mode='w|gz', compresslevel=6,
+            with tarfile.open(fileobj=writer, mode='w|gz',
                               format=tarfile.USTAR_FORMAT) as archive:
                 for name, info in sorted(manifest['files'].items()):
                     target = Path(paths[name])
