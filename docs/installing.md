@@ -12,7 +12,7 @@
 
 ## 启动安装器
 
-正式版本发布后，在 macOS 终端中运行以下命令即可自动下载并启动安装器：
+在 macOS 终端中运行以下命令即可自动下载并启动安装器：
 
 ```sh
 curl -fsSL https://github.com/NEORUAA/HyperOS-AVD/releases/latest/download/install.sh | bash
@@ -30,12 +30,12 @@ chmod +x Install.command
 ### 版本要求与注意事项
 - **安装器版本**：Phone r6 与 Pad r3 运行包采用 format 3 协议，需要 **Installer 1.2.3 或更高版本**。后续只要协议保持兼容，即可直接使用该安装器安装或升级，无需每次都单独更新安装器。
 - **增量更新**：Installer 1.3.0 起支持同底包增量更新。发布版本提供匹配的增量包时，安装器只下载变更内容，并在本地还原完整目标版本。旧版安装器继续使用完整包。
-- **仅增量修复版**：Phone r6.1、Pad r3.1 需要 **Installer 1.3.0 或更新版本**。首次安装时会自动下载它依赖的完整包，再应用修复包，无需先手动安装旧版。
+- **仅增量修复版**：Phone r6.2、Pad r3.2 使用多来源直达增量，需要 **Installer 1.3.1 或更新版本**。首次安装自动下载所需完整基包，再应用到最新版的一条增量，无需先手动安装旧版。历史 r6.1 / r3.1 仍可使用 Installer 1.3.0。
 - **证书错误排查**：若在下载阶段遇到 Python 环境引起的 `CERTIFICATE_VERIFY_FAILED` 证书报错，安装器已内置 macOS 系统原生证书信任链回退机制，同时严格核验域名与文件 SHA-256 哈希；若手动指定了自定义 CA，仍会优先遵循用户配置。
 
 ```text
 +------------------------------------------------------------------+
-| H Y P E R O S - A V D   /   INSTALLER 1.3.0                      |
+| H Y P E R O S - A V D   /   INSTALLER 1.3.1                      |
 +------------------------------------------------------------------+
 | [1] Install a new AVD       [2] Upgrade / keep data              |
 | [3] Start an instance       [4] RAM / storage / CPU              |
@@ -46,8 +46,8 @@ chmod +x Install.command
 
 | 系统版本 | 推荐默认资源 | 数据系列 | 升级路径 |
 | --- | --- | --- | --- |
-| 手机 OS4 | 6 GiB RAM / 4 核 / 32 GiB 存储 | `hongkong` | 支持同系列平滑升级至 r6 |
-| 平板 OS4 | 4 GiB RAM / 4 核 / 32 GiB 存储 | `yingtian` | 支持同系列平滑升级至 r3，与手机版独立 |
+| 手机 OS4 | 6 GiB RAM / 4 核 / 32 GiB 存储 | `hongkong` | 支持同系列平滑升级至 r6.2 |
+| 平板 OS4 | 4 GiB RAM / 4 核 / 32 GiB 存储 | `yingtian` | 支持同系列平滑升级至 r3.2，与手机版独立 |
 | 基础体验 OS3 | 2.5 GiB RAM / 2 核 / 32 GiB 存储 | `fuxi` | 基础 GSI 体验，与 OS4 系列独立 |
 
 ### 实例配置与启动
@@ -60,10 +60,10 @@ chmod +x Install.command
 
 ### 触控板手势
 
-使用包含此适配的项目启动器启动 AVD，将指针放在模拟器屏幕内，即可通过 Magic Trackpad 或 Mac 内置触控板操作：
+Installer 1.3.1、Phone r6.2 和 Pad r3.2 均附带预编译触控板适配，OS3 也可通过更新后的 Installer 使用，无需自行编译。通过项目启动器启动 AVD，将指针放在模拟器屏幕内，即可通过 Magic Trackpad 或 Mac 内置触控板操作：
 
-- 双指上下滑动：拖动列表、网页等内容。
-- 双指左右滑动：切换桌面页面，或操作应用内的横向内容。
+- 双指上下滑动：连续拖动列表、网页等内容。
+- 双指左右滑动：连续拖动桌面页面，或操作应用内的横向内容。
 - 松开双指：结束拖动，由 Android 处理惯性滚动。
 
 滑动方向遵循 macOS 的滚动方向设置。手机、平板和独立背屏窗口均使用各自的屏幕位置与比例。普通鼠标滚轮继续使用模拟器原有的滚动方式。
@@ -76,13 +76,20 @@ chmod +x Install.command
 
 ### 同底包增量更新
 
-**r6.1 / r3.1 仅增量修复版**：使用 Installer 1.3.0，直接选择目标修复版即可。已有对应完整包的实例只下载修复包。首次安装或缺少完整包时，安装器会自动下载 Phone r6 / Pad r3，再合成为修复后的完整版本。下载的旧完整包只作为还原素材，安装器不会先安装或启动旧版。
+**r6.2 / r3.2**：使用 Installer 1.3.1 或更新版本。已有 r6.1 / r3.1 的实例优先下载对应的直达增量，直接还原最新版，无需重新下载原始完整包。r6 / r3 用户也有各自的直达增量。新用户直接选择最新版，安装器自动下载 r6 / r3 完整包和到最新版的一条增量，直接安装最新版，无需安装或启动中间版本。
 
-使用 Installer 1.3.0 或更新版本，照常选择 `[2] 保数据升级`。当目标版本提供与你当前版本匹配的增量包，而且官方底包没有变化时，安装器会自动显示增量包与完整包大小，只下载增量包。
+| 当前版本 | 使用的增量 |
+| --- | --- |
+| Phone r6 | r6 → r6.2 |
+| Phone r6.1 | r6.1 → r6.2 |
+| Pad r3 | r3 → r3.2 |
+| Pad r3.1 | r3.1 → r3.2 |
+
+使用 Installer 1.3.1 或更新版本，照常选择 `[2] 保数据升级`。当目标版本提供与你当前版本匹配的增量包，而且官方底包没有变化时，安装器会自动显示增量包与完整包大小，只下载增量包。
 
 安装器从实例中保存的旧版本文件还原新版本，逐文件校验完成后再备份数据、切换版本。应用、账号、设备标识和设置沿用原有升级流程。请保留实例目录中的 `versions` 文件夹，其中的旧版发行文件用于还原增量更新。
 
-首次安装、更换底包、没有对应增量包，或者旧版本文件缺失、被修改时，安装器会自动下载完整包。增量包下载或还原失败时也会改用完整包。下载体积会减少，本地仍需预留完整版本和数据备份的磁盘空间。
+源版本文件缺失或被修改时，安装器会寻找可用的完整基包，必要时下载后再应用到目标版本的直达增量。提供完整目标包的版本也可回退到完整目标包。仅增量版本没有完整目标包，下载或还原失败时可保留缓存后重试。下载体积会减少，本地仍需预留完整版本和数据备份的磁盘空间。
 
 ### Phone r5 → r6 保数据升级
 1. **先关闭当前运行中的手机 AVD**，然后运行 Installer 1.2.3 或更新版本。
@@ -122,14 +129,14 @@ chmod +x Install.command
 ## CLI / 离线安装
 
 ```sh
-# Create a new Phone r6 instance.
+# Create a new Phone r6.2 instance.
 python3 scripts/manage.py install --variant os4-official \
   --root "$HOME/HyperOS-AVD/instances/My_OS4" --name My_OS4 \
-  --release v0.2.5-a17-hyperos4-hongkong-r6 --ram 6 --storage 32 --cores 4 --start
+  --release v0.2.5-a17-hyperos4-hongkong-r6.2 --ram 6 --storage 32 --cores 4 --start
 
 # Offline install or upgrade: keep the existing root, name and port.
 python3 scripts/manage.py install --root /path/to/instance \
-  --name My_OS4 --bundle /path/to/r6/manifest.json \
+  --name My_OS4 --bundle /path/to/r6.2/manifest.json \
   --ram 6 --storage 32 --cores 4
 
 python3 scripts/manage.py releases --variant os4-official
@@ -141,13 +148,13 @@ python3 scripts/manage.py start --root /path/to/instance
 # Pad defaults to 4 GiB RAM / 32 GiB storage / 4 cores.
 python3 scripts/manage.py install --variant os4-pad \
   --root "$HOME/HyperOS-AVD/instances/My_Pad" --name My_Pad \
-  --release pad-v0.1.2-a17-hyperos4-yingtian-r3 --start
+  --release pad-v0.1.2-a17-hyperos4-yingtian-r3.2 --start
 ```
 
 **离线安装说明**：如需离线安装，请将同一 Release 的所有分卷文件与 `manifest.json` 存放在同一目录下并保持原始文件名不变，安装器会自动校验 SHA-256 并完成解包安装。下载过程中若因网络波动或 GitHub API 限流中断，已下载的分卷缓存会自动保留，稍后重新运行即可断点续传。
 
 **离线增量升级**：已有匹配旧版本的实例，只需保存目标 Release 的 `manifest.json` 与对应旧版本的全部增量分卷，再使用同一条 `--bundle` 命令升级。全新安装仍需完整包。旧文件校验失败时，离线升级需要补齐完整包，或联网重新运行升级。
 
-**离线安装仅增量修复版**：将完整包和修复包放在相邻的两个目录，完整包目录名需与其 Release Tag 一致，例如 `v0.2.5-a17-hyperos4-hongkong-r6/` 与 `v0.2.5-a17-hyperos4-hongkong-r6.1/`。前者包含 r6 的完整分卷和 `manifest.json`，后者包含 r6.1 的增量分卷和 `manifest.json`。将 `--bundle` 指向 r6.1 的清单即可。已缓存匹配完整包的实例无需再次提供该目录。
+**离线安装仅增量修复版**：将完整包和修复包放在相邻的两个目录，完整包目录名需与其 Release Tag 一致。例如 `v0.2.5-a17-hyperos4-hongkong-r6/` 与 `v0.2.5-a17-hyperos4-hongkong-r6.2/`。前者包含 r6 的完整分卷和 `manifest.json`，后者包含 r6 → r6.2 的增量分卷和 `manifest.json`。将 `--bundle` 指向 r6.2 的清单即可。已有 r6.1 且发行文件完整的实例只需 r6.1 → r6.2 增量。Pad 对应使用 r3 / r3.1 → r3.2。
 
 **高级提示**：在 Android Studio 的 Device Manager 中修改 AVD 的显示名称（Display Name）是安全的；但请勿在文件管理器中直接重命名实例文件夹或底层 AVD ID，如需迁移路径请配合 `local/runtime.json` 保持配置同步。

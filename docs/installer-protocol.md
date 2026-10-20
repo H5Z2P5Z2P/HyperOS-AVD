@@ -87,6 +87,8 @@ target manifest and `SHA256SUMS` are written. Packaging does not publish assets.
 
 ## Delta-only repair releases
 
+### Single-source compatibility
+
 Installer 1.3.0 supports `distribution: delta-only-v1`. These releases contain
 no full target archive: `parts` is empty and `deltas` contains one patch from
 a full release. `base_release` embeds the exact full base `manifest` and its
@@ -110,3 +112,57 @@ components, so `r6 < r6.1 < r6.2 < r7` and downgrade protection remains active.
 Use `--delta-only --delta-from /path/to/full-base/manifest.json` during image
 packaging. This mode writes only patch parts, the manifest, and checksums. It
 never creates a full target archive as an intermediate artifact.
+
+
+### Complete revision history
+
+Installer 1.3.1 adds `distribution: delta-only-v2` for direct updates from every
+published revision of one official base. The image runtime protocol remains
+`verified-bundle-runtime-v1`; complete releases retain its 1.2.3 baseline, and
+legacy `delta-only-v1` releases retain their 1.3.0 minimum. A v2 target requires
+`minimum_installer` of at least 1.3.1.
+
+A v2 target still has empty full archive `parts`, a complete target `files`
+inventory, and exactly one `base_release` containing the original complete
+rN.0 manifest and its canonical digest. Its `deltas` list must include one
+source-specific `block-delta-v1` descriptor for every rN.0 through rN.(k-1)
+source. An original tag `rN` is equivalent to rN.0 and retains its published
+name. Source versions, source manifest digests, and archive part names must
+be unique. Every descriptor binds its exact source manifest digest and hashed
+parts; the target inventory binds each reconstructed file size and SHA-256.
+
+For r6.2 and r3.2 releases, package both historical sources:
+
+```sh
+python3 scripts/package_release.py --variant os4-official \
+  --version v0.2.5-a17-hyperos4-hongkong-r6.2 \
+  --output /path/to/new-phone-release --delta-only \
+  --delta-from /path/to/unpacked/v0.2.5-a17-hyperos4-hongkong-r6/manifest.json \
+  --delta-from /path/to/unpacked/v0.2.5-a17-hyperos4-hongkong-r6.1/manifest.json
+
+python3 scripts/package_release.py --variant os4-pad \
+  --version pad-v0.1.2-a17-hyperos4-yingtian-r3.2 \
+  --output /path/to/new-pad-release --delta-only \
+  --delta-from /path/to/unpacked/pad-v0.1.2-a17-hyperos4-yingtian-r3/manifest.json \
+  --delta-from /path/to/unpacked/pad-v0.1.2-a17-hyperos4-yingtian-r3.1/manifest.json
+```
+
+Each source manifest must be beside its intact unpacked release files. Rebuild
+a historical delta-only source in an isolated release directory before using
+it for packaging. Do not substitute a rewritten manifest or live guest image.
+The packager rejects missing historical revisions and verifies reconstruction
+against the complete target inventory for every generated direct delta.
+
+The installer first matches the current installed manifest exactly, including
+its canonical digest, and verifies the immutable source files. A current r6.1
+or r3.1 installation therefore takes its own direct patch without fetching the
+original complete base. If no usable current source is available, the installer
+reuses or stages the pinned full rN.0 base and applies its direct-to-target
+patch. A fresh installation follows that same base path. It never activates
+or boots the base or any intermediate repair release. No chained repair
+updates or full target fallback are introduced.
+
+Offline upgrades from an intact current revision need only the target manifest
+and that revision's direct patch parts. Fresh offline installs need the pinned
+complete base and the base-to-target patch. All release reconstruction and
+installation integrity checks above apply unchanged.

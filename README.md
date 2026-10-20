@@ -12,15 +12,13 @@
 | 来源 | 小米 13（fuxi）MysticGSI | 小米 18 Pro（hongkong）官方 OTA | Xiaomi Pad 9 Pro Max（yingtian）官方 OTA |
 | 显示 | 手机布局 | 主屏 1120×2436 / 480 dpi，背屏 912×596 / 450 dpi | 横屏 3408×2272 / 400 dpi |
 | 默认资源 | 2 核 / 2.5 GiB | 4 核 / 6 GiB RAM / 32 GiB 存储（负一屏完整模糊建议 8 GiB RAM） | 4 核 / 4 GiB RAM / 32 GiB 存储 |
-| 发布说明 | [兼容范围](docs/compatibility.md) | [r5](docs/releases/os4-r5.md) · [v0.2.5 / r6](docs/releases/os4-r6.md) | [r2](docs/releases/os4-pad-r2.md) · [v0.1.2 / r3](docs/releases/os4-pad-r3.md) |
+| 发布说明 | [兼容范围](docs/compatibility.md) | [r6 完整包](docs/releases/os4-r6.md) · [r6.2](docs/releases/os4-r6.2.md) | [r3 完整包](docs/releases/os4-pad-r3.md) · [r3.2](docs/releases/os4-pad-r3.2.md) |
 
 Pad 采用独立的 `pad-v*` 版本号，手机与 OS3 沿用 `v*` 版本号。各版本镜像与用户数据完全独立，支持多实例共存。发布镜像均在 [GitHub Releases](https://github.com/NEORUAA/HyperOS-AVD/releases) 提供分卷下载，请不要混用不同 Release 的分卷文件。
 
-Phone r6 与 Pad r3 均搭载 **Core 18 / Apps 7** 自适应 KernelSU 模块与离线状态页。运行包采用 format 3 协议，只需使用 [Installer 1.2.3](docs/releases/installer-v1.2.3.md) 或更高版本即可安装（后续镜像只要协议保持兼容，无需重复升级安装器）。虚拟机的 CPU、内存与存储空间均可自由调整（平板默认的 4 GiB 内存仅为推荐起步配置，并非上限）。
+[Phone r6.2](docs/releases/os4-r6.2.md) 与 [Pad r3.2](docs/releases/os4-pad-r3.2.md) 搭载 **Core 20 / Apps 8** 自适应 KernelSU 模块与离线状态页，支持 Magic Trackpad 双指滑动。Phone 同时加入系统 AC-3 / E-AC-3 解码支持。虚拟机的 CPU、内存与存储空间均可自由调整，平板默认 4 GiB 内存为推荐起步配置。
 
-小修复采用仅增量版本：[Phone r6.1](docs/releases/os4-r6.1.md) / [Pad r3.1](docs/releases/os4-pad-r3.1.md) 更新至 **Core 19 / Apps 8**，需要 [Installer 1.3.0](docs/releases/installer-v1.3.0.md)。已有用户只需下载修复包，新用户直接选择修复版，安装器会自动下载它依赖的完整包并完成安装。
-
-完整的发布附件校验与运行验证记录请参考 [Phone r6 / Pad r3 验证报告](docs/releases/os4-r6-pad-r3-validation.md)。
+本次使用仅增量发行，需要 [Installer 1.3.1](docs/releases/installer-v1.3.1.md)。Phone r6、r6.1 可分别直达 r6.2，Pad r3、r3.1 可分别直达 r3.2。已有用户只下载当前版本对应的增量，新用户直接选择最新版，安装器自动使用原 r6 / r3 完整包和到最新版的一条增量完成安装，无需安装或启动中间版本。原始完整包及历史修订继续保留。
 
 ## Pad OS4 截图
 
@@ -96,8 +94,7 @@ chmod +x Install.command
 安装器提供了交互式终端菜单，支持自动下载并校验 OS3、手机 OS4 与平板 OS4 镜像，支持自定义 **AVD 名称、内存大小、存储空间及 CPU 核心数**，并支持实例管理、硬件配置修改、备份升级与一键回滚。
 
 ### 升级现有实例
-- **Phone r5 → r6**：先关闭当前手机 AVD，运行 Installer 1.2.3 或更高版本，选择“升级”并选中当前 `hongkong` 实例与 r6 镜像。
-- **Pad r2 → r3**：流程同上，选择对应的 `yingtian` 平板实例与 r3 镜像。
+- **Phone / Pad**：先关闭目标 AVD，使用 Installer 1.3.1 或更新版本，在“升级”中选中当前实例与 Phone r6.2 / Pad r3.2，即可从同一 r 大版本下的任一旧修订直接升级。
 - **安全保障**：升级前安装器会自动对完整用户数据（userdata）、磁盘覆盖层（QCOW2）、加密密钥及配置进行快照备份，验证兼容性后再行切换，发生异常可随时恢复。
 - **注意**：手机和平板属于不同设备系列，不支持互相覆盖升级；同时不支持保留用户数据的降级操作。历史版本的升级说明请查阅 [安装与升级指南](docs/installing.md)。
 
@@ -105,9 +102,10 @@ chmod +x Install.command
 
 ## 兼容性与已知限制
 
-- **触控板手势**：通过项目启动器打开 AVD 后，Magic Trackpad 和 Mac 内置触控板支持双指上下滚动、左右滑动切页。滑动从指针所在的屏幕位置开始，方向遵循 macOS 的滚动设置。
+- **触控板手势**：通过项目启动器打开 AVD 后，Magic Trackpad 和 Mac 内置触控板支持双指上下滚动、左右滑动切页。滑动从指针所在的屏幕位置开始，方向遵循 macOS 的滚动设置，松手后由 Android 处理惯性。Phone、Pad、背屏与 OS3 共用该适配，安装器已附带预编译文件。
 - **手机 OS4**：完整保留原厂开机引导、官方系统应用（天气、相册等）、全局 HWUI Vulkan 与 Flutter 玻璃模糊效果；已适配 60 Hz 刷新率、macOS 色彩与音频输出；支持小米 18 Pro 独特的副屏（妙享背屏）独立窗口、双击息屏/唤醒与侧滑手势，默认启用全天候息屏（AOD）与常亮支持。
 - **平板 OS4**：保留原版横屏平板桌面布局与原厂设备特性，独立调校了显示与 Vulkan 渲染参数。内存推荐 4 GiB 起步且支持自由调大；原机硬件不支持的 AOD 功能保持关闭。
+- **Phone r6.2 音频适配**：系统 MediaCodec 支持 AC-3 / E-AC-3 立体声及 5.1 声道音源，5.1 输出会下混为立体声。E-AC-3 JOC 与 AC-4 目前仅完成解码器注册，暂不提供完整 Atmos 支持。Pad 本次不包含该音频适配。
 - **已知限制**：
   - 相机目前仅支持虚拟场景基础预览与普通拍照，高级夜景、人像、变焦算法及高质量录像尚未完整适配；
   - 蓝牙、小米云服务、Google 登录以及 Play 完整性认证（Play Integrity）暂未完成兼容；
